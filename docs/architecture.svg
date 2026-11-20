@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 436" width="920" height="436" role="img"
+     aria-label="Oscar's four mechanisms: the event-driven engine over sealed and paged layers, elastic memory management, routing-aware expert prefetching and self-drafting of experts"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12">
+  <defs>
+    <path id="tip" d="M0 0L10 5L0 10z"/>
+    <marker id="grey" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><use href="#tip" fill="#59636e"/></marker>
+    <marker id="orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><use href="#tip" fill="#bc4c00"/></marker>
+    <marker id="pink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><use href="#tip" fill="#bf3989"/></marker>
+    <marker id="purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><use href="#tip" fill="#8250df"/></marker>
+    <marker id="purple3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse"><use href="#tip" fill="#8250df"/></marker>
+    <marker id="blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="3.5" markerHeight="3.5" orient="auto-start-reverse"><use href="#tip" fill="#0969da"/></marker>
+  </defs>
+  <rect width="920" height="436" rx="10" fill="#ffffff"/>
+
+  <!-- top left: the engine, one token's layers on the GPU -->
+  <rect x="20" y="12" width="520" height="126" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="36" y="34" font-size="15" font-weight="700" fill="#1f2328">Event-driven unified memory engine</text>
+  <g fill="#dafbe1" stroke="#1a7f37">
+    <rect x="44" y="56" width="52" height="36" rx="4"/><rect x="104" y="56" width="52" height="36" rx="4"/>
+    <rect x="164" y="56" width="52" height="36" rx="4"/><rect x="224" y="56" width="52" height="36" rx="4"/>
+    <rect x="284" y="56" width="52" height="36" rx="4"/>
+  </g>
+  <g fill="#fff1e5" stroke="#bc4c00">
+    <rect x="344" y="56" width="52" height="36" rx="4"/><rect x="404" y="56" width="52" height="36" rx="4"/>
+    <rect x="464" y="56" width="52" height="36" rx="4"/>
+  </g>
+  <line x1="320" y1="47" x2="360" y2="47" stroke="#0969da" stroke-width="3" marker-start="url(#blue)" marker-end="url(#blue)"/>
+  <text x="372" y="51" font-size="11" fill="#0969da">moves with memory</text>
+  <g text-anchor="middle">
+    <text x="190" y="111" font-size="14" font-weight="700" fill="#1a7f37">Sealed layers</text>
+    <text x="190" y="127" fill="#59636e">experts in memory, no waiting</text>
+    <text x="430" y="111" font-size="14" font-weight="700" fill="#bc4c00">Paged layers</text>
+    <text x="430" y="127" fill="#59636e">wait only for missing experts</text>
+  </g>
+
+  <!-- top right: self-drafting, the same layers on a second GPU stream -->
+  <rect x="570" y="12" width="330" height="126" rx="8" fill="#fff5fa" stroke="#bf3989"/>
+  <text x="586" y="34" font-size="15" font-weight="700" fill="#bf3989">Opportunistic self-drafting of experts</text>
+  <g fill="#ffffff" stroke="#bf3989" stroke-dasharray="3 2">
+    <rect x="595" y="56" width="28" height="24" rx="3"/><rect x="631" y="56" width="28" height="24" rx="3"/>
+    <rect x="667" y="56" width="28" height="24" rx="3"/><rect x="703" y="56" width="28" height="24" rx="3"/>
+    <rect x="739" y="56" width="28" height="24" rx="3"/><rect x="775" y="56" width="28" height="24" rx="3"/>
+    <rect x="811" y="56" width="28" height="24" rx="3"/><rect x="847" y="56" width="28" height="24" rx="3"/>
+  </g>
+  <g text-anchor="middle" fill="#59636e">
+    <text x="735" y="103">second GPU stream drafts the next tokens,</text>
+    <text x="735" y="119">using only the experts in memory</text>
+  </g>
+
+  <!-- bottom left: the same unified memory at two moments -->
+  <rect x="20" y="186" width="520" height="160" rx="8" fill="#f1f8ff" stroke="#0969da" stroke-width="2"/>
+  <text x="36" y="209" font-size="15" font-weight="700" fill="#0969da">Elastic memory management</text>
+  <g fill="#ffffff" stroke="#59636e">
+    <rect x="36" y="222" width="76" height="40"/><rect x="112" y="222" width="76" height="40"/>
+    <rect x="188" y="222" width="76" height="40"/>
+    <rect x="36" y="296" width="76" height="34"/><rect x="112" y="296" width="76" height="34"/>
+    <rect x="188" y="296" width="76" height="34"/>
+  </g>
+  <rect x="264" y="222" width="180" height="40" fill="#dafbe1" stroke="#1a7f37"/>
+  <rect x="264" y="296" width="96" height="34" fill="#dafbe1" stroke="#1a7f37"/>
+  <g fill="#eaeef2" stroke="#8c959f" stroke-dasharray="5 3">
+    <rect x="444" y="222" width="80" height="40"/><rect x="360" y="296" width="164" height="34"/>
+  </g>
+  <rect x="360" y="262" width="84" height="34" fill="#b6e3ff"/>
+  <line x1="360" y1="262" x2="360" y2="296" stroke="#0969da" stroke-dasharray="3 2"/>
+  <line x1="444" y1="262" x2="444" y2="296" stroke="#0969da" stroke-dasharray="3 2"/>
+  <line x1="369" y1="279" x2="435" y2="279" stroke="#0969da" stroke-width="4" marker-start="url(#blue)" marker-end="url(#blue)"/>
+  <text x="36" y="276" fill="#0969da">sheds when other apps need memory,</text>
+  <text x="36" y="291" fill="#0969da">regrows when it is free</text>
+  <g text-anchor="middle" fill="#1f2328">
+    <text x="74" y="239">Resident</text><text x="74" y="254">weights</text>
+    <text x="150" y="239">Session</text><text x="150" y="254">state</text>
+    <text x="226" y="239">Working</text><text x="226" y="254">memory</text>
+    <text x="354" y="247" font-size="14" font-weight="700">Expert weights</text>
+    <text x="484" y="239" fill="#59636e">Other</text><text x="484" y="254" fill="#59636e">apps</text>
+    <text x="312" y="317">Expert weights</text>
+    <text x="442" y="317" fill="#59636e">Other apps</text>
+  </g>
+
+  <!-- bottom right: prefetching, predictions in and disk reads out -->
+  <rect x="570" y="186" width="330" height="160" rx="8" fill="#faf5ff" stroke="#8250df"/>
+  <text x="586" y="209" font-size="15" font-weight="700" fill="#8250df">Routing-aware expert prefetching</text>
+  <text x="735" y="247" text-anchor="middle" fill="#59636e">predicts the activated experts</text>
+  <g stroke="#8250df">
+    <rect x="612" y="262" width="30" height="24" rx="3" fill="#8250df" fill-opacity="0.55"/>
+    <rect x="648" y="262" width="30" height="24" rx="3" fill="#8250df" fill-opacity="0.45"/>
+    <rect x="684" y="262" width="30" height="24" rx="3" fill="#8250df" fill-opacity="0.35"/>
+    <rect x="720" y="262" width="30" height="24" rx="3" fill="#8250df" fill-opacity="0.26"/>
+    <rect x="756" y="262" width="30" height="24" rx="3" fill="#8250df" fill-opacity="0.18"/>
+    <rect x="792" y="262" width="30" height="24" rx="3" fill="#8250df" fill-opacity="0.11"/>
+    <rect x="828" y="262" width="30" height="24" rx="3" fill="#8250df" fill-opacity="0.05"/>
+  </g>
+  <text x="735" y="309" text-anchor="middle" fill="#59636e">read queue, ordered by deadline</text>
+
+  <!-- between the rows: the engine and memory, the two prediction sources -->
+  <line x1="300" y1="220" x2="300" y2="141" stroke="#59636e" marker-start="url(#grey)" marker-end="url(#grey)"/>
+  <text x="291" y="167" text-anchor="end" fill="#59636e">GPU computes in place</text>
+  <line x1="420" y1="220" x2="420" y2="141" stroke="#bc4c00" stroke-width="1.5" marker-end="url(#orange)"/>
+  <text x="429" y="160" fill="#bc4c00">event:</text><text x="429" y="175" fill="#bc4c00">experts loaded</text>
+  <polyline points="540,74 555,74 555,163 650,163 650,184" fill="none" stroke="#8250df" stroke-width="1.5" marker-end="url(#purple)"/>
+  <text x="562" y="157" fill="#8250df">router lookahead</text>
+  <line x1="800" y1="138" x2="800" y2="184" stroke="#bf3989" stroke-width="1.5" marker-end="url(#pink)"/>
+  <text x="791" y="167" text-anchor="end" fill="#bf3989">drafted experts</text>
+
+  <!-- the SSD -->
+  <line x1="150" y1="333" x2="150" y2="387" stroke="#59636e" marker-start="url(#grey)" marker-end="url(#grey)"/>
+  <text x="159" y="373" fill="#59636e">completed turns</text>
+  <line x1="312" y1="386" x2="312" y2="334" stroke="#8250df" stroke-width="3" marker-end="url(#purple3)"/>
+  <text x="323" y="373" fill="#8250df">prefetched experts</text>
+  <line x1="735" y1="346" x2="735" y2="388" stroke="#8250df" stroke-width="1.5" marker-end="url(#purple)"/>
+  <text x="744" y="373" fill="#8250df">disk reads</text>
+  <rect x="20" y="390" width="880" height="36" rx="8" fill="#f6f8fa" stroke="#59636e"/>
+  <text x="460" y="413" text-anchor="middle" font-size="15" font-weight="700" fill="#1f2328">SSD</text>
+</svg>

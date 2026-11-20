@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/oscar-kernels",
+    "crates/oscar-offload",
+    "crates/oscar-models",
+    "crates/oscar-runtime",
+    "crates/oscar-app",
+]
+# The vendored forks under `third_party/` are pinned submodules, each with its
+# own workspace root. Exclude them so Cargo does not try to claim their
+# packages as members of this workspace.
+exclude = ["third_party"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["prp <prp@imperial.ac.uk>"]
+repository = "https://github.com/prp/oscar"
+
+[workspace.dependencies]
+# Path dep into the vendored fork. Oscar's own crates pull these in as needed.
+mistralrs-core = { path = "third_party/oscar-mistral.rs/mistralrs-core" }
+# default-features off: swagger-ui pulls utoipa-swagger-ui + vendored assets
+# the API-only `serve` endpoint doesn't need.
+mistralrs-server-core = { path = "third_party/oscar-mistral.rs/mistralrs-server-core", default-features = false }
+mistralrs = { path = "third_party/oscar-mistral.rs/mistralrs" }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+debug = false
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true

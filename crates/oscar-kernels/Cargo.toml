@@ -1,0 +1,17 @@
+[package]
+name = "oscar-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+candle-core = { path = "../../third_party/oscar-candle/candle-core", features = ["metal"] }
+candle-metal-kernels = { path = "../../third_party/oscar-candle/candle-metal-kernels" }
+objc2-metal = { version = "0.3.1", features = ["MTLBuffer", "MTLResource", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLDevice", "MTLLibrary", "MTLComputePipeline"] }
+dispatch2 = "0.3"
+
+[dev-dependencies]
+candle-nn = { path = "../../third_party/oscar-candle/candle-nn", features = ["metal"] }
+oscar-offload = { path = "../oscar-offload" }
+half = "2"

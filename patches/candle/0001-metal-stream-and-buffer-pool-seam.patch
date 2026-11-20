@@ -1,0 +1,2080 @@
+Subject: [candle] metal-stream-and-buffer-pool-seam
+
+  The stream machinery OSCAR drives its own encoder scopes through, the command-buffer observer, and THE SEAM EVERY METAL BUFFER COMES THROUGH: candle asks an installed pool for every allocation and has no path to the driver beside it, naming which pool a request belongs to, the queue whose free lists serve it, the fence a buffer the CPU writes into is reused behind, the fence a freed buffer's PAGES go back to the OS on (which an idle queue can only ever meet the second way), the LINE OF CODE a host fill came from — the tensor constructors are `#[track_caller]` down to the seam, so the pool holds the caller's own location as the buffer's label where there is no kernel to name it — and the one call a model build places a weight it KEEPS through — the floor, from host bytes, refusing a device source.
+
+Applies to: 0.10.2
+Files: 18
+
+---
+diff --git c/candle-metal-kernels/src/metal/command_buffer.rs w/candle-metal-kernels/src/metal/command_buffer.rs
+index d6defda9..cf390ed1 100644
+--- c/candle-metal-kernels/src/metal/command_buffer.rs
++++ w/candle-metal-kernels/src/metal/command_buffer.rs
+@@ -3,7 +3,41 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
+ use objc2_foundation::NSString;
+ use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus};
+ use std::borrow::Cow;
+-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
++use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
++
++/// What a completed command buffer reported: times in the host clock Metal stamps, `error` only for a failed buffer.
++pub struct Completion<'a> {
++    pub token: u64,
++    pub gpu_start: f64,
++    pub gpu_end: f64,
++    pub kernel_start: f64,
++    pub error: Option<&'a str>,
++}
++
++/// Lets a host watch command-buffer traffic; every method defaulted, so no observer costs one load per commit.
++pub trait CommandBufferObserver: Send + Sync {
++    fn note_commit(&self) {}
++    /// A compute encoder opened on a pool buffer.
++    fn note_encoder(&self) {}
++    fn note_pipeline(&self, _name: &Arc<str>) {}
++    fn note_resource(&self, _ptr: usize) {}
++    fn arm_completion(&self) -> Option<u64> {
++        None
++    }
++    fn note_completion(&self, _completion: Completion<'_>) {}
++}
++
++static OBSERVER: OnceLock<Arc<dyn CommandBufferObserver>> = OnceLock::new();
++
++/// Install the process-wide observer. The first call wins.
++pub fn set_command_buffer_observer(observer: Arc<dyn CommandBufferObserver>) {
++    let _ = OBSERVER.set(observer);
++}
++
++#[inline]
++pub(crate) fn observer() -> Option<&'static Arc<dyn CommandBufferObserver>> {
++    OBSERVER.get()
++}
+ 
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum CommandStatus {
+@@ -75,6 +109,9 @@ impl CommandBuffer {
+     }
+ 
+     pub fn compute_command_encoder(&self) -> ComputeCommandEncoder {
++        if let Some(obs) = observer() {
++            obs.note_encoder();
++        }
+         self.as_ref()
+             .computeCommandEncoder()
+             .map(|raw| ComputeCommandEncoder::new(raw, Arc::clone(&self.semaphore)))
+@@ -89,7 +126,37 @@ impl CommandBuffer {
+     }
+ 
+     pub fn commit(&self) {
+-        self.raw.commit()
++        if let Some(obs) = observer() {
++            obs.note_commit();
++            // Armed on the committing thread, where the host's per-thread state
++            // is visible; the handler runs on a Metal thread.
++            if let Some(token) = obs.arm_completion() {
++                use std::ptr::NonNull;
++                let obs = Arc::clone(obs);
++                let handler = block2::RcBlock::new(
++                    move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
++                        let cb = unsafe { cb.as_ref() };
++                        let error = (cb.status() == MTLCommandBufferStatus::Error)
++                            .then(|| cb.error())
++                            .flatten()
++                            .map(|e| e.localizedDescription().to_string());
++                        obs.note_completion(Completion {
++                            token,
++                            gpu_start: cb.GPUStartTime(),
++                            gpu_end: cb.GPUEndTime(),
++                            kernel_start: cb.kernelStartTime(),
++                            error: error.as_deref(),
++                        });
++                    },
++                );
++                // SAFETY: Metal copies the block; `handler` may drop after the call.
++                unsafe {
++                    self.raw
++                        .addCompletedHandler(&*handler as *const _ as *mut _);
++                }
++            }
++        }
++        self.raw.commit();
+     }
+ 
+     pub fn enqueue(&self) {
+diff --git c/candle-core/src/metal_backend/device.rs w/candle-core/src/metal_backend/device.rs
+index 03627b45..d539af6f 100644
+--- c/candle-core/src/metal_backend/device.rs
++++ w/candle-core/src/metal_backend/device.rs
+@@ -4,24 +4,46 @@ use crate::{DType, Result};
+ use candle_metal_kernels::metal::ComputePipeline;
+ use candle_metal_kernels::{
+     metal::{
+-        BlitCommandEncoder, Buffer, BufferMap, Commands, ComputeCommandEncoder, Device,
+-        MTLResourceOptions,
++        BlitCommandEncoder, Buffer, BufferMap, Commands, ComputeCommandEncoder, Device, Fences,
++        MTLResourceOptions, Use,
+     },
+     Kernels,
+ };
++use candle_metal_kernels::metal::{ProtocolObject, Retained};
+ use objc2_foundation::NSURL;
+-use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
++use objc2_metal::{
++    MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager, MTLSharedEvent,
++};
+ 
++use std::collections::BTreeMap;
++use std::panic::Location;
+ use std::path::Path;
+ use std::sync::{Arc, Mutex, RwLock};
+ 
+ use super::MetalError;
++use super::thread_stream::thread_stream;
++
++/// The line of code that built a host tensor, as the label a pool holds: a host fill has no kernel to name it, so
++/// the seam is `#[track_caller]` up from the tensor constructors and the caller's `file:line` is the label. Interned.
++pub(crate) fn site(at: &'static Location<'static>) -> &'static str {
++    static SITES: Mutex<BTreeMap<(&'static str, u32), &'static str>> = Mutex::new(BTreeMap::new());
++    let file = at.file().rsplit('/').next().unwrap_or(at.file());
++    let mut sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
++    *sites
++        .entry((file, at.line()))
++        .or_insert_with(|| Box::leak(format!("{file}:{}", at.line()).into_boxed_str()))
++}
+ 
+ /// Unique identifier for metal devices.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+ pub struct DeviceId(usize);
+ 
+ impl DeviceId {
++    /// The free-list key for buffers this device's own queue uses.
++    pub(crate) fn key(&self) -> usize {
++        self.0
++    }
++
+     pub(crate) fn new() -> Self {
+         // https://users.rust-lang.org/t/idiomatic-rust-way-to-generate-unique-id/33805
+         use std::sync::atomic;
+@@ -41,24 +63,8 @@ pub struct MetalDevice {
+ 
+     pub(crate) commands: Arc<RwLock<Commands>>,
+ 
+-    /// Simple allocator struct.
+-    /// The buffers are stored in size buckets since ML tends to use similar shapes over and over.
+-    /// We store the buffers in [`Arc`] because it's much faster than Obj-c internal ref counting
+-    /// (could be linked to FFI communication overhead).
+-    ///
+-    /// Whenever a buffer has a strong_count==1, we can reuse it, it means it was dropped in the
+-    /// graph calculation, and only we the allocator kept a reference to it, therefore it's free
+-    /// to be reused. However, in order for this to work, we need to guarantee the order of
+-    /// operation, so that this buffer is not being used by another kernel at the same time.
+-    /// Arc is the CPU reference count, it doesn't mean anything on the GPU side of things.
+-    ///
+-    /// Whenever we actually allocate a new buffer, we make a full sweep to clean up unused buffers
+-    /// (strong_count = 1).
+-    pub(crate) buffers: Arc<RwLock<BufferMap>>,
+-
+-    /// Same as `buffers` but uses `PRIVATE_RESOURCE_OPTIONS` (StorageModePrivate on macOS).
+-    /// Intermediate compute buffers don't need CPU access so Private avoids coherency overhead.
+-    pub(crate) private_buffers: Arc<RwLock<BufferMap>>,
++    /// This device's queue progress, for the pool's staged-reuse fence.
++    pub(crate) fences: Fences,
+ 
+     /// Simple keeper struct to keep track of the already compiled kernels so we can reuse them.
+     /// Heavily used by [`candle_metal_kernels`]
+@@ -69,16 +75,16 @@ pub struct MetalDevice {
+     pub(crate) seed_value: Arc<RwLock<u64>>,
+ }
+ 
+-// Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
++#[allow(dead_code)]
+ pub const RESOURCE_OPTIONS: MTLResourceOptions =
+     objc2_metal::MTLResourceOptions(MTLResourceOptions::StorageModeShared.bits());
+-//| MTLResourceOptions::HazardTrackingModeUntracked.bits(),
+-//);
+ 
+-// Resource options used for `new_private_buffer`. This uses `private` where supported.
+ #[cfg(target_os = "ios")]
++#[allow(dead_code)]
+ pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
++
+ #[cfg(not(target_os = "ios"))]
++#[allow(dead_code)]
+ pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = MTLResourceOptions::StorageModePrivate;
+ 
+ impl std::fmt::Debug for MetalDevice {
+@@ -127,43 +133,123 @@ impl MetalDevice {
+         &self.device
+     }
+ 
+-    fn drop_unused_buffers(&self) -> Result<()> {
+-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
+-        for subbuffers in buffers.values_mut() {
+-            let newbuffers = subbuffers
+-                .iter()
+-                .filter(|s| Arc::strong_count(*s) > 1)
+-                .map(Arc::clone)
+-                .collect();
+-            *subbuffers = newbuffers;
+-        }
+-        Ok(())
++    /// The working region this thread cuts from: its own stream's where it has one, else this
++    /// device instance's. The key is the queue, because a run reused on another queue is a
++    /// hazard Metal does not track, and two `MetalDevice`s are two queues.
++    pub fn queue_key(&self) -> usize {
++        thread_stream().map_or(self.id.key(), |s| s.queue_key)
++    }
++
++    /// The progress of the queue this thread's buffers are used on.
++    pub fn fences(&self) -> Fences {
++        thread_stream().map_or_else(|| self.fences.clone(), |s| s.fences.clone())
++    }
++
++    /// The command pool the calling thread encodes into: its own stream's where it has one, else this device
++    /// instance's. Every command-pool call here goes through it, so a thread never commits or discards another's work.
++    fn commands(&self) -> Arc<RwLock<Commands>> {
++        thread_stream().map_or_else(|| Arc::clone(&self.commands), |s| Arc::clone(&s.commands))
+     }
+ 
+     pub fn command_encoder(&self) -> Result<ComputeCommandEncoder> {
+-        let commands = self.commands.write().map_err(MetalError::from)?;
+-        let (flush, command_encoder) = commands.command_encoder().map_err(MetalError::from)?;
+-        if flush {
+-            self.drop_unused_buffers()?
+-        }
++        let commands = self.commands();
++        let commands = commands.write().map_err(MetalError::from)?;
++        let (_flush, command_encoder) = commands.command_encoder().map_err(MetalError::from)?;
+         Ok(command_encoder)
+     }
+ 
+     pub fn blit_command_encoder(&self) -> Result<BlitCommandEncoder> {
+-        let commands = self.commands.write().map_err(MetalError::from)?;
+-        let (flush, command_encoder) = commands.blit_command_encoder().map_err(MetalError::from)?;
+-        if flush {
+-            self.drop_unused_buffers()?
+-        }
++        let commands = self.commands();
++        let commands = commands.write().map_err(MetalError::from)?;
++        let (_flush, command_encoder) = commands.blit_command_encoder().map_err(MetalError::from)?;
+         Ok(command_encoder)
+     }
+ 
+     pub fn wait_until_completed(&self) -> Result<()> {
+-        let commands = self.commands.write().map_err(MetalError::from)?;
++        let commands = self.commands();
++        let commands = commands.write().map_err(MetalError::from)?;
+         commands.wait_until_completed().map_err(MetalError::from)?;
+         Ok(())
+     }
+ 
++    /// Abandon work encoded and never submitted, on the thread that encoded it.
++    pub fn discard_commands(&self) -> Result<()> {
++        let commands = self.commands();
++        let commands = commands.write().map_err(MetalError::from)?;
++        commands.discard_encoded().map_err(MetalError::from)?;
++        Ok(())
++    }
++
++    /// Commits pending pool CBs without waiting, so a caller-owned CB can be ordered behind candle's work on the queue.
++    pub fn flush_commands(&self) -> Result<()> {
++        let commands = self.commands();
++        let commands = commands.write().map_err(MetalError::from)?;
++        commands.flush().map_err(MetalError::from)?;
++        Ok(())
++    }
++
++    /// The generation the current pool CB will signal, for a caller that needs to wait on its completion.
++    pub fn next_completion_generation(&self) -> Result<u64> {
++        let commands = self.commands.read().map_err(MetalError::from)?;
++        Ok(commands.next_completion_generation())
++    }
++
++    /// The generation whose completion covers all encoded so far: a waiter's fence at a boundary, met on an idle queue.
++    pub fn fence_generation(&self) -> Result<u64> {
++        let commands = self.commands.read().map_err(MetalError::from)?;
++        Ok(commands.fence_generation())
++    }
++
++    /// Shared handle to candle's monotonic CB-completion counter (lock-free reads in hot paths).
++    pub fn completion_counter(&self) -> Result<Arc<std::sync::atomic::AtomicU64>> {
++        let commands = self.commands.read().map_err(MetalError::from)?;
++        Ok(commands.completion_counter())
++    }
++
++    /// Queue-wide CB-completion event handle for cross-crate CPU waiters (oscar-offload slot-eviction safety).
++    pub fn completion_event(&self) -> Result<Retained<ProtocolObject<dyn MTLSharedEvent>>> {
++        let commands = self.commands.read().map_err(MetalError::from)?;
++        Ok(commands.completion_event())
++    }
++
++    /// The queue the calling thread's command buffers commit on (its own stream's when it has one, else the
++    /// device's), for a residency set another crate attaches to it (oscar-offload's segment pools).
++    pub fn command_queue(&self) -> Result<candle_metal_kernels::metal::CommandQueue> {
++        let commands = self.commands();
++        let commands = commands.read().map_err(MetalError::from)?;
++        Ok(commands.command_queue())
++    }
++    /// The generation the last committed pool CB signals: after a `flush_commands`, all the work encoded before it.
++    pub fn completion_generation(&self) -> Result<u64> {
++        Ok(self.completion_counter()?.load(std::sync::atomic::Ordering::SeqCst))
++    }
++    /// Block until the pool's completion event reaches `generation`: one buffer's completion, not the queue's drain.
++    pub fn wait_for_completion(&self, generation: u64) -> Result<()> {
++        let event = self.completion_event()?;
++        if event.signaledValue() >= generation {
++            return Ok(());
++        }
++        while !event.waitUntilSignaledValue_timeoutMS(generation, 10_000) {
++            if event.signaledValue() >= generation {
++                break;
++            }
++        }
++        Ok(())
++    }
++
++    /// Makes the next encoder wait on `event`, so a kernel is gated on another thread's work without a CPU sync.
++    /// Arms this thread's stream, never the engine's: gating the engine on a helper's event deadlocks it.
++    pub fn set_pending_wait_event(
++        &self,
++        event: &Retained<ProtocolObject<dyn MTLSharedEvent>>,
++        value: u64,
++    ) -> Result<()> {
++        let commands = self.commands();
++        let commands = commands.read().map_err(MetalError::from)?;
++        commands.set_pending_wait_event(event, value);
++        Ok(())
++    }
++
+     pub fn kernels(&self) -> &Kernels {
+         &self.kernels
+     }
+@@ -172,95 +258,109 @@ impl MetalDevice {
+         &self.device
+     }
+ 
+-    /// Creates a new buffer (not necessarily zeroed).
+-    ///
+-    /// Uses StorageModePrivate on macOS for faster GPU access (no CPU coherency overhead).
+-    /// Falls back to StorageModeShared on iOS where Private is not always available.
++    /// Uninitialised working memory from the process's pool, the scratch a forward makes and drops; `name` labels it.
+     pub fn new_buffer(
+         &self,
+         element_count: usize,
+         dtype: DType,
+-        _name: &str,
++        name: &'static str,
+     ) -> Result<Arc<Buffer>> {
+-        let size = element_count * dtype.size_in_bytes();
+-        let mut buffers = self.private_buffers.write().map_err(MetalError::from)?;
+-        if let Some(b) = find_available_buffer(size, &buffers) {
+-            return Ok(b.clone());
+-        }
+-        let size = buf_size(size);
+-        let subbuffers = buffers.entry(size).or_insert(vec![]);
+-
+-        let new_buffer = self
+-            .device
+-            .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
+-            .map_err(MetalError::from)?;
+-        let new_buffer = Arc::new(new_buffer);
+-        subbuffers.push(new_buffer.clone());
+-        Ok(new_buffer)
++        self.pooled(element_count * dtype.size_in_bytes(), Use::Scratch, name)
+     }
+ 
+-    /// Creates a new private buffer (not necessarily zeroed).
+-    ///
+-    /// This is intentionally not in the Metal buffer pool to allow the efficient implementation of persistent buffers.
+-    pub fn new_private_buffer(
+-        &self,
+-        element_count: usize,
+-        dtype: DType,
+-        _name: &str,
+-    ) -> Result<Arc<Buffer>> {
+-        let size = element_count * dtype.size_in_bytes();
++    /// Working memory the CPU fills itself, cut as a host fill's from pages the queue passed (`Use::Staged`), unfilled.
++    pub fn new_staged_buffer(&self, element_count: usize, dtype: DType, name: &'static str) -> Result<Arc<Buffer>> {
++        self.pooled(element_count * dtype.size_in_bytes(), Use::Staged, name)
++    }
++
++    /// The floor, uninitialised: a buffer the process holds for its life and fills itself.
++    pub fn new_fixed_buffer(&self, element_count: usize, dtype: DType, name: &'static str) -> Result<Arc<Buffer>> {
++        self.pooled(element_count * dtype.size_in_bytes(), Use::Fixed, name)
++    }
++
++    /// `size` bytes from the pool `r#use` names, on this thread's queue.
++    fn pooled(&self, size: usize, r#use: Use, name: &'static str) -> Result<Arc<Buffer>> {
+         let buffer = self
+             .device
+-            .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
+-            .map_err(MetalError::from)?;
++            .new_buffer(size, r#use, self.queue_key(), &self.fences(), name)
++            .map_err(|e| MetalError::allocating(name, e))?;
+         Ok(Arc::new(buffer))
+     }
+ 
+-    /// Creates a new buffer from data.
+-    ///
+-    /// Does not require synchronization, as [newBufferWithBytes](https://developer.apple.com/documentation/metal/mtldevice/1433429-newbufferwithbytes)
+-    /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
++    /// Working memory filled from host data: block tables, positions, the small per-forward tensors. Shared
++    /// storage, so the fill is a memcpy and the buffer is usable at once.
++    #[track_caller]
+     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
++        self.buffer_with_data(data, Use::Staged)
++    }
++
++    /// The floor, filled from host data: a model weight at its load site. It comes from the pool that never gives
++    /// memory back, so a caller that asks for one per process is right and one that rebuilds leaks.
++    #[track_caller]
++    pub fn new_fixed_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
++        self.buffer_with_data(data, Use::Fixed)
++    }
++
++    #[track_caller]
++    fn buffer_with_data<T>(&self, data: &[T], r#use: Use) -> Result<Arc<Buffer>> {
+         let size = core::mem::size_of_val(data);
+-        let new_buffer = self
+-            .device
+-            .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
+-            .map_err(MetalError::from)?;
+-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
+-
+-        let subbuffers = buffers.entry(size).or_insert(vec![]);
+-
+-        let new_buffer = Arc::new(new_buffer);
+-        subbuffers.push(new_buffer.clone());
+-        Ok(new_buffer)
+-    }
+-
+-    pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<Buffer>> {
+-        let buffer = self.allocate_buffer(size_in_bytes)?;
+-        let blit = self.blit_command_encoder()?;
+-        blit.set_label("zeros");
+-        blit.fill_buffer(&buffer, (0, buffer.length()), 0);
+-        blit.end_encoding();
+-        Ok(buffer)
+-    }
+-
+-    /// The critical allocator algorithm
+-    pub fn allocate_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
+-        let mut buffers = self.buffers.write().map_err(MetalError::from)?;
+-        if let Some(b) = find_available_buffer(size, &buffers) {
+-            // Cloning also ensures we increment the strong count
+-            return Ok(b.clone());
++        let name = site(Location::caller());
++        // SAFETY: `data` is a live slice of `size` bytes.
++        // The CPU fills it here, so its reuse is fenced: `Use::Staged`.
++        let buffer = unsafe {
++            self.device.new_buffer_with_data(
++                data.as_ptr().cast(),
++                size,
++                r#use,
++                self.queue_key(),
++                &self.fences(),
++                name,
++            )
+         }
+-        let size = buf_size(size);
+-        let subbuffers = buffers.entry(size).or_insert(vec![]);
++        .map_err(MetalError::from)?;
++        Ok(Arc::new(buffer))
++    }
+ 
+-        let new_buffer = self
+-            .device
+-            .new_buffer(size, RESOURCE_OPTIONS)
+-            .map_err(MetalError::from)?;
+-        let new_buffer = Arc::new(new_buffer);
+-        subbuffers.push(new_buffer.clone());
+-        Ok(new_buffer)
++    /// The floor, from host bytes: a weight the model keeps, placed once. The dense twin of `QTensor::quantize_onto`,
++    /// and with it the whole of what reaches the floor from a model build.
++    #[track_caller]
++    pub fn kept_storage_from_cpu(&self, storage: &crate::CpuStorage) -> Result<super::MetalStorage> {
++        self.upload(storage, Use::Fixed)
++    }
++
++    /// The one upload path from host bytes, `r#use` picking the pool: working memory for what a forward makes,
++    /// the floor for a weight the model keeps ([`crate::Tensor::to_device_kept`]).
++    #[track_caller]
++    pub fn upload(&self, storage: &crate::CpuStorage, r#use: Use) -> Result<super::MetalStorage> {
++        use crate::backend::BackendStorage as _;
++        use crate::CpuStorage as C;
++        let (count, buffer) = match storage {
++            C::U8(s) => (s.len(), self.buffer_with_data(s, r#use)),
++            C::U32(s) => (s.len(), self.buffer_with_data(s, r#use)),
++            C::I16(s) => (s.len(), self.buffer_with_data(s, r#use)),
++            C::I32(s) => (s.len(), self.buffer_with_data(s, r#use)),
++            C::I64(s) => (s.len(), self.buffer_with_data(s, r#use)),
++            C::BF16(s) => (s.len(), self.buffer_with_data(s, r#use)),
++            C::F16(s) => (s.len(), self.buffer_with_data(s, r#use)),
++            C::F32(s) => (s.len(), self.buffer_with_data(s, r#use)),
++            C::F64(s) => (s.len(), self.buffer_with_data(s, r#use)),
++            C::F8E4M3(s) => (s.len(), self.buffer_with_data(s, r#use)),
++            C::F6E2M3(_) | C::F6E3M2(_) | C::F4(_) | C::F8E8M0(_) => {
++                return Err(crate::Error::UnsupportedDTypeForOp(storage.dtype(), "to_dtype").bt())
++            }
++        };
++        Ok(super::MetalStorage::new(buffer?, self.clone(), count, storage.dtype()))
++    }
++
++    /// Working memory zeroed by the CPU: a reused run carries the last user's bytes, and a
++    /// device-side zero could not be ordered against a launch that reaches the memory by raw
++    /// GPU address. So a `Staged` allocation, fenced like every buffer the CPU writes into.
++    pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<Buffer>> {
++        let buffer = self.new_staged_buffer(size_in_bytes, DType::U8, "zeros")?;
++        // SAFETY: the pool's buffer is at least `size_in_bytes` long, shared,
++        // and this handle is its only one.
++        unsafe { std::ptr::write_bytes(buffer.contents(), 0, size_in_bytes) };
++        Ok(buffer)
+     }
+ 
+     /// Create a metal GPU capture trace on [`path`].
+@@ -286,6 +386,7 @@ impl MetalDevice {
+     }
+ }
+ 
++#[allow(dead_code)]
+ fn buf_size(size: usize) -> usize {
+     size.next_power_of_two()
+ }
+@@ -323,6 +424,7 @@ mod tests {
+     }
+ }
+ 
++#[allow(dead_code)]
+ fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
+     let mut best_buffer: Option<&Arc<Buffer>> = None;
+     let mut best_buffer_size = usize::MAX;
+diff --git c/candle-core/src/metal_backend/thread_stream.rs w/candle-core/src/metal_backend/thread_stream.rs
+new file mode 100644
+index 00000000..2d710143
+--- /dev/null
++++ w/candle-core/src/metal_backend/thread_stream.rs
+@@ -0,0 +1,63 @@
++//! Per-thread Metal streams, kept out of `device.rs` so the file candle maintains does not carry them.
++
++use std::cell::RefCell;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, RwLock};
++
++use candle_metal_kernels::metal::{Commands, Fences, STREAM_QUEUE_KEYS};
++
++use crate::Result;
++
++use super::device::MetalDevice;
++use super::MetalError;
++
++/// Queue keys for the streams, from where the pool says a stream's begin, so no stream's key is a device's.
++pub(super) static NEXT_QUEUE: AtomicUsize = AtomicUsize::new(STREAM_QUEUE_KEYS);
++
++/// A private queue and CB pool, so a background thread submits GPU work without perturbing the main thread's ordering.
++/// Its buffers are cut from a working region of the stream's own, so one is never reused on the other's queue.
++pub struct ThreadStream {
++    pub(super) commands: Arc<RwLock<Commands>>,
++    /// The key its working region is kept under: its own queue.
++    pub(super) queue_key: usize,
++    /// Its own queue's progress, for the pool's staged-reuse fence.
++    pub(super) fences: Fences,
++}
++
++thread_local! {
++    /// Installed private stream for this thread; `None` = shared pool (default).
++    static THREAD_STREAM: RefCell<Option<Arc<ThreadStream>>> = const { RefCell::new(None) };
++}
++
++pub(super) fn thread_stream() -> Option<Arc<ThreadStream>> {
++    THREAD_STREAM.with(|cell| cell.borrow().as_ref().map(Arc::clone))
++}
++
++impl MetalDevice {
++    /// Give this thread its own stream, at the start of a long-lived worker, so its Metal work stops sharing the main
++    /// thread's; a thread that has one keeps it. `compute_per_buffer` is the stream's encoders a command buffer, `None`
++    /// the default.
++    pub fn install_thread_stream(&self, compute_per_buffer: Option<usize>) -> Result<()> {
++        if thread_stream().is_some() {
++            return Ok(());
++        }
++        let queue = self.device.new_command_queue().map_err(MetalError::from)?;
++        let key = NEXT_QUEUE.fetch_add(1, Ordering::Relaxed);
++        let commands = Commands::new(queue, key, compute_per_buffer).map_err(MetalError::from)?;
++        // Its own queue means its own working region from here on: a run is never reused across queues,
++        // where Metal's hazard tracking does not reach.
++        let fences = Fences::new(
++            commands.completion_counter(),
++            commands.completion_event(),
++            commands.inflight_bound(),
++            commands.encoded_counts(),
++        );
++        let stream = Arc::new(ThreadStream {
++            commands: Arc::new(RwLock::new(commands)),
++            queue_key: key,
++            fences,
++        });
++        THREAD_STREAM.with(|cell| *cell.borrow_mut() = Some(stream));
++        Ok(())
++    }
++}
+diff --git c/candle-metal-kernels/src/kernels/sort.rs w/candle-metal-kernels/src/kernels/sort.rs
+index efc72c97..91a68f28 100644
+--- c/candle-metal-kernels/src/kernels/sort.rs
++++ w/candle-metal-kernels/src/kernels/sort.rs
+@@ -1,6 +1,7 @@
+ use crate::utils::{BufferOffset, EncoderProvider};
+ use crate::{set_params, DType, Kernels, MetalKernelError, Source};
+-use crate::{Buffer, ComputeCommandEncoder, Device, MTLSize, RESOURCE_OPTIONS};
++use crate::metal::{Fences, Use};
++use crate::{Buffer, ComputeCommandEncoder, Device, MTLSize};
+ use objc2_metal::MTLResourceUsage;
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -64,16 +65,18 @@ fn multi_block_sort(
+     ncols: usize,
+     src: BufferOffset,
+     dst: &Buffer,
++    queue: usize,
++    fences: &Fences,
+ ) -> Result<(), MetalKernelError> {
+     let dtype_str = mlx_dtype_str(dtype);
+     // Do allocations
+     let el_count = nrows * ncols;
+     let bytes_len = el_count * dtype.size_in_bytes();
+-    let mut dev_vals_0 = device.new_buffer(bytes_len, RESOURCE_OPTIONS)?;
+-    let mut dev_vals_1 = device.new_buffer(bytes_len, RESOURCE_OPTIONS)?;
+-    let mut dev_idxs_0 = device.new_buffer(el_count * 4, RESOURCE_OPTIONS)?;
+-    let mut dev_idxs_1 = device.new_buffer(el_count * 4, RESOURCE_OPTIONS)?;
+-    let mut block_partitions = device.new_buffer((nrows * (nblocks + 1)) * 4, RESOURCE_OPTIONS)?;
++    let mut dev_vals_0 = device.new_buffer(bytes_len, Use::Scratch, queue, fences, "sort-vals-0")?;
++    let mut dev_vals_1 = device.new_buffer(bytes_len, Use::Scratch, queue, fences, "sort-vals-1")?;
++    let mut dev_idxs_0 = device.new_buffer(el_count * 4, Use::Scratch, queue, fences, "sort-idxs-0")?;
++    let mut dev_idxs_1 = device.new_buffer(el_count * 4, Use::Scratch, queue, fences, "sort-idxs-1")?;
++    let mut block_partitions = device.new_buffer((nrows * (nblocks + 1)) * 4, Use::Scratch, queue, fences, "sort-block-partitions")?;
+     // Prepare command encoder
+     let encoder = ep.encoder();
+     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+@@ -272,6 +275,8 @@ pub fn call_mlx_arg_sort(
+     ncols: usize,
+     src: BufferOffset,
+     dst: &Buffer,
++    queue: usize,
++    fences: &Fences,
+ ) -> Result<(), MetalKernelError> {
+     let tn = 8;
+     let bn = match ncols.div_ceil(tn) {
+@@ -283,7 +288,7 @@ pub fn call_mlx_arg_sort(
+     let n_blocks = ncols.div_ceil(n_per_block);
+     if n_blocks > 1 {
+         multi_block_sort(
+-            device, ep, kernels, dtype, bn, tn, n_blocks, nrows, ncols, src, dst,
++            device, ep, kernels, dtype, bn, tn, n_blocks, nrows, ncols, src, dst, queue, fences,
+         )?
+     } else {
+         block_sort(device, ep, kernels, dtype, bn, tn, nrows, ncols, src, dst)?
+diff --git c/candle-metal-kernels/src/metal/pool.rs w/candle-metal-kernels/src/metal/pool.rs
+new file mode 100644
+index 00000000..ed92adf0
+--- /dev/null
++++ w/candle-metal-kernels/src/metal/pool.rs
+@@ -0,0 +1,144 @@
++//! Where every Metal buffer comes from: the host installs one pool ([`set_buffer_pool`]) and
++//! every allocation in this crate and in `candle-core` goes through it, no path to the driver
++//! beside it and no fallback. The pool owns its pages, so a released buffer's memory returns at once.
++
++use super::{Buffer, CommandQueue, Device};
++use crate::MetalKernelError;
++use objc2::rc::Retained;
++use objc2::runtime::ProtocolObject;
++use objc2_metal::{MTLCommandBuffer, MTLSharedEvent};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::{Arc, OnceLock};
++
++/// What a pooled buffer keeps alive for as long as it exists: the pool's
++/// hold on its pages. The last handle's drop is what gives them back.
++pub trait Held: Send + Sync + std::fmt::Debug {}
++
++/// Which pool a request belongs to: the two differ in whether their memory can ever be given back, what a pool is.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Use {
++    /// Working memory the GPU writes: a run given back inside a forward is cut again at once.
++    Scratch,
++    /// Working memory the CPU writes into at the allocation: a block table, a position row, a
++    /// weight's bytes at load. Its reuse needs a fence, since Metal's hazard tracking says
++    /// nothing about a CPU write into a buffer whose last command buffer is still in flight.
++    Staged,
++    /// The floor: taken once and held for the process's life (the dense weights, the address tables, the mailbox).
++    Fixed,
++}
++
++/// A queue's progress, as a pool reads it: the generation the last commit took, the generation the GPU has
++/// finished, and whether the queue still has work to commit.
++#[derive(Clone)]
++pub struct Fences {
++    committed: Arc<AtomicU64>,
++    completed: Retained<ProtocolObject<dyn MTLSharedEvent>>,
++    inflight: u64,
++    /// The pool entries' encoded-work counts ([`super::Commands::encoded_counts`]).
++    encoded: Arc<Vec<Arc<std::sync::atomic::AtomicUsize>>>,
++}
++
++// SAFETY: an atomic and a Metal event, both safe to read from any thread.
++unsafe impl Send for Fences {}
++unsafe impl Sync for Fences {}
++
++impl Fences {
++    pub fn new(
++        committed: Arc<AtomicU64>,
++        completed: Retained<ProtocolObject<dyn MTLSharedEvent>>,
++        inflight: u64,
++        encoded: Arc<Vec<Arc<std::sync::atomic::AtomicUsize>>>,
++    ) -> Self {
++        Self { committed, completed, inflight, encoded }
++    }
++
++    /// The generation a buffer freed now must wait for: not the committed count, since an open
++    /// command buffer already reading the buffer commits later and any of the other in-flight
++    /// entries may commit first, so the work's generation is up to the pool's depth past it.
++    pub fn fence(&self) -> u64 {
++        self.committed.load(Ordering::SeqCst) + self.inflight
++    }
++
++    /// The generation the GPU has finished.
++    pub fn completed(&self) -> u64 {
++        self.completed.signaledValue()
++    }
++
++    /// The generation the queue has passed, read once for any number of stamps: a buffer freed
++    /// at or below it may be unmapped or written. Either the GPU passed `committed + inflight`,
++    /// or the queue has nothing encoded and finished all it committed, which an idle queue meets.
++    pub fn pass(&self) -> u64 {
++        let completed = self.completed();
++        let encoding = self
++            .encoded
++            .iter()
++            .any(|c| c.load(std::sync::atomic::Ordering::Acquire) > 0);
++        if !encoding && completed >= self.committed.load(Ordering::SeqCst) {
++            u64::MAX
++        } else {
++            completed
++        }
++    }
++
++}
++
++/// Where a thread stream's queue keys begin: a device instance's queue is keyed by its id from 1, a stream's from
++/// here up, so a pool tells the two apart (a device's working memory is the plan's, a stream's sized from its forward).
++pub const STREAM_QUEUE_KEYS: usize = 1 << 32;
++
++/// The one allocator. Sizing and reuse are the pool's business; this crate asks for bytes and which use they are for.
++pub trait BufferPool: Send + Sync {
++    /// A buffer of at least `bytes` for `queue`'s working memory. The key is the queue the buffer
++    /// will be used on: a run is never reused across queues, where Metal's hazard tracking does
++    /// not reach. `name` is the caller's label for the diagnostics, never part of the placement.
++    fn allocate(
++        &self,
++        device: &Device,
++        bytes: usize,
++        r#use: Use,
++        queue: usize,
++        fences: &Fences,
++        name: &'static str,
++    ) -> Result<Buffer, MetalKernelError>;
++
++    /// Put the pool's residency sets on `queue`, whose working region is kept under `key`: the floor's set, which every
++    /// queue reads, and this queue's own region's, never another's (nothing is read there; a queue takes at most 32).
++    fn attach(&self, queue: &CommandQueue, key: usize);
++
++    /// Declare the pools reachable from `queue` on a command buffer just minted from it, so a
++    /// launch may reach one by raw GPU address: attaching a set to a queue only requests
++    /// residency, while a command buffer's own declaration is honoured for its execution.
++    fn declare(&self, command_buffer: &ProtocolObject<dyn MTLCommandBuffer>, queue: &CommandQueue);
++}
++
++/// Encode, never submit: armed while the host runs a forward to record what it asks the pools for, the command buffers
++/// dropped uncommitted. The completion side is then advanced from the CPU ([`super::Commands`]), or every fence waits.
++static CENSUS: AtomicBool = AtomicBool::new(false);
++
++/// Whether command buffers are being encoded and dropped rather than run.
++#[inline]
++pub fn census() -> bool {
++    CENSUS.load(Ordering::Relaxed)
++}
++
++/// Arm or disarm it; the host owns both edges and disarms before the load
++/// ends, so nothing a request runs is ever left unsubmitted.
++pub fn set_census(on: bool) {
++    CENSUS.store(on, Ordering::Relaxed);
++}
++
++static POOL: OnceLock<Arc<dyn BufferPool>> = OnceLock::new();
++
++/// Install the process's buffer pool. The first call wins.
++pub fn set_buffer_pool(pool: Arc<dyn BufferPool>) {
++    let _ = POOL.set(pool);
++}
++
++/// The installed pool. Every allocation goes through it, so its absence is a startup order bug, not a case to handle.
++pub fn buffer_pool() -> Result<&'static Arc<dyn BufferPool>, MetalKernelError> {
++    POOL.get().ok_or_else(|| {
++        MetalKernelError::FailedToCreateResource(
++            "no buffer pool installed — every Metal allocation comes from one".to_string(),
++        )
++    })
++}
+diff --git c/candle-metal-kernels/src/metal/commands.rs w/candle-metal-kernels/src/metal/commands.rs
+index 48cfb2dc..c563e98d 100644
+--- c/candle-metal-kernels/src/metal/commands.rs
++++ w/candle-metal-kernels/src/metal/commands.rs
+@@ -3,8 +3,10 @@ use crate::metal::{
+ };
+ use crate::MetalKernelError;
+ use objc2::{rc::Retained, runtime::ProtocolObject};
+-use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
+-use std::sync::atomic::{AtomicUsize, Ordering};
++use objc2_metal::{
++    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue, MTLDevice, MTLEvent, MTLSharedEvent,
++};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+ use std::sync::{Arc, Mutex};
+ 
+ // Use Retained when appropriate. Gives us a more elegant way of handling memory (peaks) than autoreleasepool.
+@@ -13,23 +15,63 @@ pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
+ 
+ const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
+ const DEFAULT_CANDLE_METAL_COMMAND_POOL_SIZE: usize = 5;
++/// Wall-clock bound on an open CB, so a large encoder budget cannot grow one into the ~5 s IOGPU watchdog.
++const CB_MAX_OPEN: std::time::Duration = std::time::Duration::from_millis(2_000);
+ 
+ /// Creates a new command buffer from the queue with an attached semaphore for tracking its state.
+ pub fn create_command_buffer(
+     command_queue: &CommandQueue,
+     semaphore: Arc<CommandSemaphore>,
+ ) -> Result<CommandBuffer, MetalKernelError> {
+-    command_queue
++    let raw = command_queue
+         .commandBuffer()
+-        .map(|raw| CommandBuffer::new(raw, semaphore))
+-        .ok_or(MetalKernelError::FailedToCreateResource(
+-            "CommandBuffer".to_string(),
+-        ))
++        .ok_or(MetalKernelError::FailedToCreateResource("CommandBuffer".to_string()))?;
++    // The pools this queue reads, declared on the buffer before anything is encoded into it: a launch may reach
++    // a pool by raw GPU address, which the queue's residency request alone does not make safe.
++    if let Ok(pool) = super::pool::buffer_pool() {
++        pool.declare(&raw, command_queue);
++    }
++    Ok(CommandBuffer::new(raw, semaphore))
+ }
+ 
+ struct EntryState {
+     current: CommandBuffer,
+     in_flight: Vec<CommandBuffer>,
++    /// When `current` was minted — the wall-clock commit bound's anchor.
++    opened_at: std::time::Instant,
++    /// Under a census: the autorelease pool the encoders since the last rotation were made in, drained at the next.
++    census: Option<Rotation>,
++}
++
++/// An autorelease pool spanning one rotation of a census: Metal autoreleases every command buffer and encoder, so a
++/// dropped buffer frees nothing until the pool drains. Pushed when a rotation mints its buffer, popped at the next.
++struct Rotation {
++    token: *mut std::ffi::c_void,
++    thread: std::thread::ThreadId,
++}
++
++// SAFETY: the token is only handed back to the runtime on the thread that pushed it, which `Drop` checks.
++unsafe impl Send for Rotation {}
++
++extern "C" {
++    fn objc_autoreleasePoolPush() -> *mut std::ffi::c_void;
++    fn objc_autoreleasePoolPop(token: *mut std::ffi::c_void);
++}
++
++impl Rotation {
++    fn open() -> Self {
++        // SAFETY: a push has no preconditions; its token is popped once, in `Drop`.
++        Self { token: unsafe { objc_autoreleasePoolPush() }, thread: std::thread::current().id() }
++    }
++}
++
++impl Drop for Rotation {
++    fn drop(&mut self) {
++        if std::thread::current().id() == self.thread {
++            // SAFETY: the token this thread pushed, popped once.
++            unsafe { objc_autoreleasePoolPop(self.token) };
++        }
++    }
+ }
+ 
+ /// A pool entry containing a command buffer, its usage count, and synchronization primitives.
+@@ -37,7 +79,9 @@ struct EntryState {
+ /// `compute_count` and `semaphore` remain accessible without locking for selection/coordination.
+ pub struct CommandBufferEntry {
+     state: Mutex<EntryState>,
+-    compute_count: AtomicUsize,
++    /// Shared, so a holder of [`Fences`] can tell a queue with work still to
++    /// commit from one that has none left: the two need different fences.
++    compute_count: Arc<AtomicUsize>,
+     semaphore: Arc<CommandSemaphore>,
+ }
+ 
+@@ -50,19 +94,39 @@ pub struct Commands {
+     command_queue: CommandQueue,
+     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc) per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
+     compute_per_buffer: usize,
++    /// Signalled last by every committed buffer, so a CPU waiter can tell when
++    /// the GPU is done with something it wants to overwrite.
++    completion_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
++    /// Monotonic counter paired with `completion_event`; each commit signals
++    /// `fetch_add(1) + 1`. Shared so other crates read it lock-free.
++    completion_value: Arc<AtomicU64>,
++    /// One-shot wait the next encoder encodes on its CB before any work; the pool
++    /// owns it because the wait is only legal between encoders.
++    pending_wait: Mutex<Option<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>>,
++    /// Mirrors `pending_wait.is_some()` so the per-encoder path pays one relaxed
++    /// load rather than a mutex when nothing is armed.
++    pending_wait_armed: AtomicBool,
+ }
+ 
+ unsafe impl Send for Commands {}
+ unsafe impl Sync for Commands {}
+ 
+ impl Commands {
+-    pub fn new(command_queue: CommandQueue) -> Result<Self, MetalKernelError> {
+-        let compute_per_buffer = match std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER") {
+-            Ok(val) => val
+-                .parse()
+-                .unwrap_or(DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER),
+-            _ => DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
+-        };
++    /// `residency_key` names this queue's working region and its residency set. The pool's sets go on the queue before
++    /// its command buffers are made: a buffer created earlier carries no set, and a kernel reaching a pool by raw GPU
++    /// address reads undeclared memory. `compute_per_buffer` is the encoders a buffer holds before commit; `None` takes
++    /// CANDLE_METAL_COMPUTE_PER_BUFFER.
++    pub fn new(
++        command_queue: CommandQueue,
++        residency_key: usize,
++        compute_per_buffer: Option<usize>,
++    ) -> Result<Self, MetalKernelError> {
++        let compute_per_buffer = compute_per_buffer.unwrap_or_else(|| {
++            std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER")
++                .ok()
++                .and_then(|val| val.parse().ok())
++                .unwrap_or(DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER)
++        });
+ 
+         let pool_size = match std::env::var("CANDLE_METAL_COMMAND_POOL_SIZE") {
+             Ok(val) => val
+@@ -71,6 +135,15 @@ impl Commands {
+             _ => DEFAULT_CANDLE_METAL_COMMAND_POOL_SIZE,
+         };
+ 
++        let completion_event = command_queue
++            .device()
++            .newSharedEvent()
++            .expect("MTLDevice::newSharedEvent failed");
++
++        if let Ok(pool) = super::pool::buffer_pool() {
++            pool.attach(&command_queue, residency_key);
++        }
++
+         let pool = (0..pool_size)
+             .map(|_| Self::create_pool_entry(&command_queue))
+             .collect::<Result<Vec<_>, _>>()?;
+@@ -79,9 +152,47 @@ impl Commands {
+             pool,
+             command_queue,
+             compute_per_buffer,
++            completion_event,
++            completion_value: Arc::new(AtomicU64::new(0)),
++            pending_wait: Mutex::new(None),
++            pending_wait_armed: AtomicBool::new(false),
+         })
+     }
+ 
++    /// Gates the next encoder on `event`, so a kernel can wait for another thread's
++    /// work without a CPU sync. Arming twice without encoding replaces the wait.
++    pub fn set_pending_wait_event(
++        &self,
++        event: &Retained<ProtocolObject<dyn MTLSharedEvent>>,
++        value: u64,
++    ) {
++        let mut pending = self.pending_wait.lock().expect("pending_wait poisoned");
++        *pending = Some((Retained::clone(event), value));
++        self.pending_wait_armed.store(true, Ordering::Release);
++    }
++
++    /// Encodes an armed wait, with the entry lock held, before a new encoder is minted: `encodeWaitForEvent` is only
++    /// legal between encoders, and the encoders are ended by their wrappers before the pool hands out the next.
++    fn take_pending_wait_and_encode(&self, state: &mut EntryState) {
++        if !self.pending_wait_armed.load(Ordering::Acquire) {
++            return;
++        }
++        let taken = self
++            .pending_wait
++            .lock()
++            .expect("pending_wait poisoned")
++            .take();
++        self.pending_wait_armed.store(false, Ordering::Release);
++        let Some((event, value)) = taken else {
++            return;
++        };
++        let event_super: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*event);
++        state
++            .current
++            .as_ref()
++            .encodeWaitForEvent_value(event_super, value);
++    }
++
+     fn create_pool_entry(
+         command_queue: &CommandQueue,
+     ) -> Result<Arc<CommandBufferEntry>, MetalKernelError> {
+@@ -92,8 +203,10 @@ impl Commands {
+             state: Mutex::new(EntryState {
+                 current: cb,
+                 in_flight: Vec::new(),
++                opened_at: std::time::Instant::now(),
++                census: None,
+             }),
+-            compute_count: AtomicUsize::new(0),
++            compute_count: Arc::new(AtomicUsize::new(0)),
+             semaphore,
+         }))
+     }
+@@ -112,6 +225,46 @@ impl Commands {
+         self.flush_and_wait()
+     }
+ 
++    /// The completion generation the *current* (uncommitted) CB will signal when it next commits. Tag a slot with this at encode time; the slot is GPU-safe to overwrite once [`Self::completion_event`] reaches the returned value. Exact only while one pool entry is in flight (single-threaded decode); with concurrent entries the kernel's CB may commit at a *higher* value, so the waiter blocks until a later CB — conservative (never early), never a race.
++    pub fn next_completion_generation(&self) -> u64 {
++        self.completion_value.load(Ordering::SeqCst) + 1
++    }
++
++    /// The generation whose completion covers everything encoded so far: the last committed buffer's when no pool entry holds encoded work, else [`Self::next_completion_generation`]. The fence a CPU waiter takes at a boundary — an idle pool commits nothing, so the next generation would never be signaled there.
++    pub fn fence_generation(&self) -> u64 {
++        let committed = self.completion_value.load(Ordering::SeqCst);
++        let encoded = self.pool.iter().any(|e| e.compute_count.load(Ordering::Acquire) > 0);
++        committed + u64::from(encoded)
++    }
++
++    /// How many command buffers of this pool can be in flight at once, and so how far past the committed count a
++    /// generation an entry is still encoding into can land: every other entry may commit first.
++    pub fn inflight_bound(&self) -> u64 {
++        self.pool.len() as u64
++    }
++
++    /// The pool entries' encoded-work counts, shared: a queue with nothing encoded has nothing
++    /// left to commit, so its committed count is the generation covering all it could still
++    /// run, where a holder of [`Fences`] would otherwise wait for `committed + inflight` for ever.
++    pub fn encoded_counts(&self) -> Arc<Vec<Arc<AtomicUsize>>> {
++        Arc::new(self.pool.iter().map(|e| Arc::clone(&e.compute_count)).collect())
++    }
++
++    /// Shared handle to the monotonic CB-completion counter for lock-free reads in hot paths.
++    pub fn completion_counter(&self) -> Arc<AtomicU64> {
++        Arc::clone(&self.completion_value)
++    }
++
++    /// Clone of the queue-wide CB-completion event for cross-crate CPU waiters.
++    pub fn completion_event(&self) -> Retained<ProtocolObject<dyn MTLSharedEvent>> {
++        Retained::clone(&self.completion_event)
++    }
++
++    /// The device's one command queue, for a residency set another crate attaches (oscar-offload's segment pools).
++    pub fn command_queue(&self) -> CommandQueue {
++        Retained::clone(&self.command_queue)
++    }
++
+     // Selects an entry from the pool using a two-phase strategy:
+     /// 1. Try non-blocking: find any available buffer without waiting
+     /// 2. Fallback: select the least-loaded buffer and wait for availability
+@@ -148,6 +301,7 @@ impl Commands {
+ 
+     /// Creates an encoder from the selected entry, recycling the buffer if needed.
+     /// When recycling, the old committed buffer is moved to `in_flight` so we can later wait on it.
++    /// Returns whether this acquisition committed the entry's previous buffer, plus the new encoder.
+     fn finalize_entry<F, E>(
+         &self,
+         entry: Arc<CommandBufferEntry>,
+@@ -159,11 +313,14 @@ impl Commands {
+         let mut state = entry.state.lock()?;
+ 
+         let count = entry.compute_count.fetch_add(1, Ordering::Relaxed);
+-        let flush = count >= self.compute_per_buffer;
++        // Whichever trips first; `count > 0` keeps an idle-open CB from churning commits on the time bound alone.
++        let flush = count >= self.compute_per_buffer
++            || (count > 0 && state.opened_at.elapsed() >= CB_MAX_OPEN);
+ 
+         if flush {
+             self.commit_swap_locked(&entry, &mut state, 1)?;
+         }
++        self.take_pending_wait_and_encode(&mut state);
+ 
+         let encoder = create_encoder(&mut state.current);
+ 
+@@ -219,6 +376,27 @@ impl Commands {
+         Ok(())
+     }
+ 
++    /// Abandon what is encoded and never submitted, and say nothing ran. Correct only for the
++    /// census, which commits none of its forward: until then an entry still holding an encoder
++    /// counts as encoding, and no segment the census freed could ever be unmapped.
++    pub fn discard_encoded(&self) -> Result<(), MetalKernelError> {
++        for entry in &self.pool {
++            let _guard = entry
++                .semaphore
++                .wait_until(|s| matches!(s, CommandStatus::Available));
++            let mut state = entry.state.lock()?;
++            let fresh = create_command_buffer(&self.command_queue, Arc::clone(&entry.semaphore))?;
++            // The old buffer was never committed, so dropping it runs nothing and releases what it had encoded,
++            // once the rotation's pool, which still holds it and its encoders, has drained.
++            state.current = fresh;
++            state.census = None;
++            state.in_flight.clear();
++            state.opened_at = std::time::Instant::now();
++            entry.compute_count.store(0, Ordering::Release);
++        }
++        Ok(())
++    }
++
+     /// Commit the current command buffer, swap in a fresh one, push the old into `in_flight`,
+     /// and reset `compute_count` to `reset_to`.
+     fn commit_swap_locked(
+@@ -227,16 +405,60 @@ impl Commands {
+         state: &mut EntryState,
+         reset_to: usize,
+     ) -> Result<(), MetalKernelError> {
+-        state.current.commit();
++        // Always-on: signal the queue-wide completion event as this CB's last action, so CPU waiters see it finish.
++        let completion_gen = self.completion_value.fetch_add(1, Ordering::SeqCst) + 1;
++        if super::pool::census() {
++            // Encoded and never submitted, so nothing signals the event on the GPU: committed and completed advance
++            // together here, or every fence waits for work that never runs.
++            self.completion_event.setSignaledValue(completion_gen);
++            // The encoded work goes as a run's does: the buffer is rotated uncommitted and the
++            // census keeps the last `inflight_bound`, since what the driver takes for an encoded
++            // kernel returns only with its buffer, handle released and autorelease pool drained.
++            let fresh = {
++                let _mint = Rotation::open();
++                create_command_buffer(&self.command_queue, Arc::clone(&entry.semaphore))?
++            };
++            let rotated = std::mem::replace(&mut state.current, fresh);
++            state.in_flight.push(rotated);
++            let keep = self.inflight_bound().max(1) as usize;
++            if state.in_flight.len() > keep {
++                let gone = state.in_flight.len() - keep;
++                state.in_flight.drain(..gone);
++            }
++            state.census = None;
++            state.census = Some(Rotation::open());
++            state.opened_at = std::time::Instant::now();
++            entry.compute_count.store(reset_to, Ordering::Release);
++            return Ok(());
++        }
++        {
++            let completion_super: &ProtocolObject<dyn MTLEvent> =
++                ProtocolObject::from_ref(&*self.completion_event);
++            state
++                .current
++                .as_ref()
++                .encodeSignalEvent_value(completion_super, completion_gen);
++            state.current.commit();
++        }
+         let new_cb = create_command_buffer(&self.command_queue, Arc::clone(&entry.semaphore))?;
+         let old_cb = std::mem::replace(&mut state.current, new_cb);
++        // What has completed leaves the list at the rotation: `flush_and_wait` waits on buffers
++        // still running, and holding a completed one holds the driver's object and its pooled
++        // resources. An errored one stays, its error what the next wait reports.
++        state.in_flight.retain(|cb| cb.status() != MTLCommandBufferStatus::Completed);
+         state.in_flight.push(old_cb);
++        state.opened_at = std::time::Instant::now();
+         entry.compute_count.store(reset_to, Ordering::Release);
+ 
+         Ok(())
+     }
+ 
+     fn ensure_completed(cb: &CommandBuffer) -> Result<(), MetalKernelError> {
++        if super::pool::census() {
++            // Nothing was submitted, so there is nothing to wait for; the uncommitted arm below would commit it,
++            // the one thing the census may not do.
++            return Ok(());
++        }
+         match cb.status() {
+             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
+                 cb.commit();
+diff --git c/candle-metal-kernels/src/metal/encoder.rs w/candle-metal-kernels/src/metal/encoder.rs
+index 81bcf2c2..f1f06c4f 100644
+--- c/candle-metal-kernels/src/metal/encoder.rs
++++ w/candle-metal-kernels/src/metal/encoder.rs
+@@ -2,13 +2,18 @@ use crate::metal::{Buffer, CommandSemaphore, CommandStatus, ComputePipeline, Met
+ use objc2::{rc::Retained, runtime::ProtocolObject};
+ use objc2_foundation::{NSRange, NSString};
+ use objc2_metal::{
+-    MTLBlitCommandEncoder, MTLCommandEncoder, MTLComputeCommandEncoder, MTLResourceUsage, MTLSize,
++    MTLBlitCommandEncoder, MTLCommandEncoder, MTLComputeCommandEncoder, MTLDevice, MTLResourceUsage, MTLSize,
+ };
+ use std::{ffi::c_void, ptr, sync::Arc};
+ 
+ pub struct ComputeCommandEncoder {
+     raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+     semaphore: Arc<CommandSemaphore>,
++    /// `endEncoding` is non-idempotent in Metal (asserts on second call); this flag makes `end_encoding()` safe to call from both helper paths and `Drop`.
++    ended: std::cell::Cell<bool>,
++    /// The pipeline set last: its name and the most threads a threadgroup may hold on this GPU, which every dispatch is
++    /// checked against (a dispatch past it is undefined, a hang among its outcomes).
++    pipeline: std::cell::RefCell<Option<(Arc<str>, usize)>>,
+ }
+ 
+ impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
+@@ -21,7 +26,24 @@ impl ComputeCommandEncoder {
+         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+         semaphore: Arc<CommandSemaphore>,
+     ) -> ComputeCommandEncoder {
+-        ComputeCommandEncoder { raw, semaphore }
++        ComputeCommandEncoder {
++            raw,
++            semaphore,
++            ended: std::cell::Cell::new(false),
++            pipeline: std::cell::RefCell::new(None),
++        }
++    }
++
++    /// Stops the process where a dispatch could not run as asked: the alternative is the GPU's timeout, five
++    /// seconds later and nameless.
++    fn check_threadgroup(&self, threads_per_threadgroup: MTLSize) {
++        let n = threads_per_threadgroup.width * threads_per_threadgroup.height * threads_per_threadgroup.depth;
++        if let Some((name, limit)) = self.pipeline.borrow().as_ref() {
++            assert!(
++                n <= *limit,
++                "{name}: {n} threads per threadgroup, this GPU's pipeline allows {limit}"
++            );
++        }
+     }
+ 
+     pub(crate) fn signal_encoding_ended(&self) {
+@@ -29,12 +51,19 @@ impl ComputeCommandEncoder {
+     }
+ 
+     pub fn set_threadgroup_memory_length(&self, index: usize, length: usize) {
++        let most = self.raw.device().maxThreadgroupMemoryLength();
++        assert!(
++            length <= most,
++            "{}: {length} bytes of threadgroup memory, this GPU allows {most}",
++            self.pipeline.borrow().as_ref().map_or("?", |(name, _)| name)
++        );
+         unsafe { self.raw.setThreadgroupMemoryLength_atIndex(length, index) }
+     }
+ 
+     pub fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize) {
++        self.check_threadgroup(threads_per_threadgroup);
+         self.raw
+-            .dispatchThreads_threadsPerThreadgroup(threads_per_grid, threads_per_threadgroup)
++            .dispatchThreads_threadsPerThreadgroup(threads_per_grid, threads_per_threadgroup);
+     }
+ 
+     pub fn dispatch_thread_groups(
+@@ -42,13 +71,19 @@ impl ComputeCommandEncoder {
+         threadgroups_per_grid: MTLSize,
+         threads_per_threadgroup: MTLSize,
+     ) {
++        self.check_threadgroup(threads_per_threadgroup);
+         self.raw.dispatchThreadgroups_threadsPerThreadgroup(
+             threadgroups_per_grid,
+             threads_per_threadgroup,
+-        )
++        );
+     }
+ 
++    /// Bind `buffer` at `offset` into its run: the run's base is added here, the one seam every binding goes through.
+     pub fn set_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
++        if let (Some(obs), Some(b)) = (super::command_buffer::observer(), buffer) {
++            obs.note_resource(b.as_ref() as *const _ as *const () as usize);
++        }
++        let offset = offset + buffer.map_or(0, Buffer::base);
+         unsafe {
+             self.raw
+                 .setBuffer_offset_atIndex(buffer.map(|b| b.as_ref()), offset, index)
+@@ -67,6 +102,11 @@ impl ComputeCommandEncoder {
+     }
+ 
+     pub fn set_compute_pipeline_state(&self, pipeline: &ComputePipeline) {
++        if let Some(obs) = super::command_buffer::observer() {
++            obs.note_pipeline(pipeline.name_arc());
++        }
++        *self.pipeline.borrow_mut() =
++            Some((Arc::clone(pipeline.name_arc()), pipeline.max_total_threads_per_threadgroup()));
+         self.raw.setComputePipelineState(pipeline.as_ref());
+     }
+ 
+@@ -75,17 +115,51 @@ impl ComputeCommandEncoder {
+         resource: impl Into<&'a MetalResource>,
+         resource_usage: MTLResourceUsage,
+     ) {
+-        self.raw.useResource_usage(resource.into(), resource_usage)
++        let resource_ref: &MetalResource = resource.into();
++        if let Some(obs) = super::command_buffer::observer() {
++            obs.note_resource(resource_ref as *const _ as *const () as usize);
++        }
++        self.raw.useResource_usage(resource_ref, resource_usage)
++    }
++
++    /// Declare resources the encoder's kernels read through addresses they resolve themselves: a residency set
++    /// holds them resident, and the declaration is what the driver prepares a read on.
++    pub fn use_resources(&self, resources: &[&MetalResource], resource_usage: MTLResourceUsage) {
++        if resources.is_empty() {
++            return;
++        }
++        if let Some(obs) = super::command_buffer::observer() {
++            for r in resources {
++                obs.note_resource(*r as *const _ as *const () as usize);
++            }
++        }
++        let ptrs: Vec<std::ptr::NonNull<MetalResource>> =
++            resources.iter().map(|r| std::ptr::NonNull::from(*r)).collect();
++        // SAFETY: `ptrs` holds `resources.len()` valid resource pointers for the duration of the call.
++        unsafe {
++            self.raw.useResources_count_usage(
++                std::ptr::NonNull::new_unchecked(ptrs.as_ptr() as *mut _),
++                ptrs.len(),
++                resource_usage,
++            )
++        };
+     }
+ 
+     pub fn end_encoding(&self) {
+         use objc2_metal::MTLCommandEncoder as _;
++        if self.ended.get() {
++            return;
++        }
+         self.raw.endEncoding();
++        self.ended.set(true);
+         self.signal_encoding_ended();
+     }
+ 
+     pub fn encode_pipeline(&mut self, pipeline: &ComputePipeline) {
+         use MTLComputeCommandEncoder as _;
++        if let Some(obs) = super::command_buffer::observer() {
++            obs.note_pipeline(pipeline.name_arc());
++        }
+         self.raw.setComputePipelineState(pipeline.as_ref());
+     }
+ 
+@@ -146,9 +220,9 @@ impl BlitCommandEncoder {
+             self.raw
+                 .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                     src_buffer.as_ref(),
+-                    src_offset,
++                    src_offset + src_buffer.base(),
+                     dst_buffer.as_ref(),
+-                    dst_offset,
++                    dst_offset + dst_buffer.base(),
+                     size,
+                 )
+         }
+@@ -158,7 +232,7 @@ impl BlitCommandEncoder {
+         self.raw.fillBuffer_range_value(
+             buffer.as_ref(),
+             NSRange {
+-                location: range.0,
++                location: range.0 + buffer.base(),
+                 length: range.1,
+             },
+             value,
+diff --git c/candle-metal-kernels/src/metal/device.rs w/candle-metal-kernels/src/metal/device.rs
+index d413eada..8ac5a670 100644
+--- c/candle-metal-kernels/src/metal/device.rs
++++ w/candle-metal-kernels/src/metal/device.rs
+@@ -1,9 +1,8 @@
+-use crate::{
+-    Buffer, CommandQueue, ComputePipeline, Function, Library, MTLResourceOptions, MetalKernelError,
+-};
++use super::pool::{Fences, Use};
++use crate::{Buffer, CommandQueue, ComputePipeline, Function, Library, MetalKernelError};
+ use objc2::{rc::Retained, runtime::AnyObject, runtime::ProtocolObject};
+ use objc2_foundation::NSString;
+-use objc2_metal::{MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice};
++use objc2_metal::{MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily};
+ use std::{ffi::c_void, ptr};
+ 
+ /// Metal device type classification based on Apple Silicon architecture.
+@@ -58,34 +57,36 @@ impl Device {
+         MTLCreateSystemDefaultDevice().map(|raw| Device { raw })
+     }
+ 
++    /// `length` bytes from the process's buffer pool, uninitialised, cut from the working region of `queue`, where it
++    /// will be used.
+     pub fn new_buffer(
+         &self,
+         length: usize,
+-        options: MTLResourceOptions,
++        r#use: Use,
++        queue: usize,
++        fences: &Fences,
++        name: &'static str,
+     ) -> Result<Buffer, MetalKernelError> {
+-        self.as_ref()
+-            .newBufferWithLength_options(length, options)
+-            .map(Buffer::new)
+-            .ok_or(MetalKernelError::FailedToCreateResource(
+-                "Buffer".to_string(),
+-            ))
++        super::pool::buffer_pool()?.allocate(self, length, r#use, queue, fences, name)
+     }
+ 
+-    pub fn new_buffer_with_data(
++    /// As [`Self::new_buffer`], filled from `pointer`. Shared storage, so the copy is a `memcpy` and needs no blit.
++    ///
++    /// # Safety
++    /// `pointer` is readable for `length` bytes.
++    pub unsafe fn new_buffer_with_data(
+         &self,
+         pointer: *const c_void,
+         length: usize,
+-        options: MTLResourceOptions,
++        r#use: Use,
++        queue: usize,
++        fences: &Fences,
++        name: &'static str,
+     ) -> Result<Buffer, MetalKernelError> {
+-        let pointer = ptr::NonNull::new(pointer as *mut c_void).unwrap();
+-        unsafe {
+-            self.as_ref()
+-                .newBufferWithBytes_length_options(pointer, length, options)
+-                .map(Buffer::new)
+-                .ok_or(MetalKernelError::FailedToCreateResource(
+-                    "Buffer".to_string(),
+-                ))
+-        }
++        let buffer = self.new_buffer(length, r#use, queue, fences, name)?;
++        // SAFETY: the pool's buffer is at least `length` long and shared; the caller's source is readable for `length`.
++        unsafe { ptr::copy_nonoverlapping(pointer as *const u8, buffer.contents(), length) };
++        Ok(buffer)
+     }
+ 
+     pub fn new_library_with_source(
+@@ -108,7 +109,9 @@ impl Device {
+         let raw = self
+             .as_ref()
+             .newComputePipelineStateWithFunction_error(function.as_ref())
+-            .unwrap();
++            .map_err(|e| {
++                MetalKernelError::FailedToCreateResource(format!("ComputePipeline: {e}"))
++            })?;
+         Ok(ComputePipeline::new(raw))
+     }
+ 
+@@ -159,4 +162,14 @@ impl Device {
+             _ => MetalDeviceType::Medium,
+         }
+     }
++
++    pub fn supports_family(&self, family: MTLGPUFamily) -> bool {
++        self.as_ref().supportsFamily(family)
++    }
++
++    /// Metal 4 tensor ops (`<metal_tensor>`) on an M5-class GPU (Apple10), as llama.cpp takes it: an older GPU reports
++    /// Metal 4 too and computes these kernels wrongly.
++    pub fn has_tensor_api(&self) -> bool {
++        self.supports_family(MTLGPUFamily::Metal4) && self.supports_family(MTLGPUFamily::Apple10)
++    }
+ }
+diff --git c/candle-metal-kernels/src/metal/buffer.rs w/candle-metal-kernels/src/metal/buffer.rs
+index ea04dfb1..28ea06b6 100644
+--- c/candle-metal-kernels/src/metal/buffer.rs
++++ w/candle-metal-kernels/src/metal/buffer.rs
+@@ -6,17 +6,40 @@ use std::{collections::HashMap, sync::Arc};
+ pub type MetalResource = ProtocolObject<dyn MTLResource>;
+ pub type MTLResourceOptions = objc2_metal::MTLResourceOptions;
+ 
+-#[derive(Clone, Debug, Hash, PartialEq)]
++/// A buffer as the kernels see it: a run of `len` bytes at `base` inside a Metal buffer object.
++/// A pooled buffer is a run of its queue's working region, so every binding adds the base and
++/// the CPU's pointer starts there; a buffer over memory the caller holds is the whole object.
++#[derive(Clone, Debug)]
+ pub struct Buffer {
+     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
++    base: usize,
++    len: usize,
++    /// The pool's hold on these pages, dropped with the last handle, which is what returns them: read by being dropped
++    /// and never otherwise. `None` where the caller already holds the memory and only wants it seen as a buffer.
++    #[allow(dead_code)]
++    held: Option<Arc<dyn super::pool::Held>>,
+ }
+ 
+ unsafe impl Send for Buffer {}
+ unsafe impl Sync for Buffer {}
+ 
+ impl Buffer {
++    /// A buffer over memory the caller holds itself: the whole object.
+     pub fn new(raw: Retained<ProtocolObject<dyn MTLBuffer>>) -> Buffer {
+-        Buffer { raw }
++        use objc2_metal::MTLBuffer as _;
++        let len = raw.length();
++        Buffer { raw, base: 0, len, held: None }
++    }
++
++    /// A run the pool handed out: `len` bytes at `base` of `raw`; `held`
++    /// goes back to the pool when the last handle drops.
++    pub fn pooled(
++        raw: Retained<ProtocolObject<dyn MTLBuffer>>,
++        base: usize,
++        len: usize,
++        held: Arc<dyn super::pool::Held>,
++    ) -> Buffer {
++        Buffer { raw, base, len, held: Some(held) }
+     }
+ 
+     pub fn contents(&self) -> *mut u8 {
+@@ -25,15 +48,28 @@ impl Buffer {
+ 
+     pub fn data(&self) -> *mut u8 {
+         use objc2_metal::MTLBuffer as _;
+-        self.as_ref().contents().as_ptr() as *mut u8
++        // SAFETY: the run is inside the object, `len` bytes from `base`.
++        unsafe { (self.raw.contents().as_ptr() as *mut u8).add(self.base) }
+     }
+ 
++    /// The run's length: what the caller may use, never the object's.
+     pub fn length(&self) -> usize {
+-        self.as_ref().length()
++        self.len
++    }
++
++    /// Where the run begins inside the object — what a binding adds.
++    pub fn base(&self) -> usize {
++        self.base
++    }
++
++    /// The run's GPU address, for a table a kernel resolves on the device.
++    pub fn gpu_address(&self) -> u64 {
++        use objc2_metal::MTLBuffer as _;
++        self.raw.gpuAddress() + self.base as u64
+     }
+ 
+     pub fn did_modify_range(&self, range: NSRange) {
+-        self.as_ref().didModifyRange(range);
++        self.as_ref().didModifyRange(NSRange { location: range.location + self.base, length: range.length });
+     }
+ }
+ 
+diff --git c/candle-metal-kernels/src/metal/compute_pipeline.rs w/candle-metal-kernels/src/metal/compute_pipeline.rs
+index 4162db24..133ca219 100644
+--- c/candle-metal-kernels/src/metal/compute_pipeline.rs
++++ w/candle-metal-kernels/src/metal/compute_pipeline.rs
+@@ -4,6 +4,8 @@ use objc2_metal::MTLComputePipelineState;
+ #[derive(Clone, Debug)]
+ pub struct ComputePipeline {
+     raw: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
++    /// Kernel-function name, for the gated dispatch histogram (`KDISP_HIST`, eval-only); `"?"` until `with_name`.
++    name: std::sync::Arc<str>,
+ }
+ 
+ unsafe impl Send for ComputePipeline {}
+@@ -11,7 +13,26 @@ unsafe impl Sync for ComputePipeline {}
+ 
+ impl ComputePipeline {
+     pub fn new(raw: Retained<ProtocolObject<dyn MTLComputePipelineState>>) -> ComputePipeline {
+-        ComputePipeline { raw }
++        ComputePipeline {
++            raw,
++            name: std::sync::Arc::from("?"),
++        }
++    }
++
++    /// Tag this pipeline with its kernel-function name (dispatch-histogram).
++    pub fn with_name(mut self, name: &str) -> ComputePipeline {
++        self.name = std::sync::Arc::from(name);
++        self
++    }
++
++    #[inline]
++    pub fn name(&self) -> &str {
++        &self.name
++    }
++
++    #[inline]
++    pub fn name_arc(&self) -> &std::sync::Arc<str> {
++        &self.name
+     }
+ 
+     pub fn max_total_threads_per_threadgroup(&self) -> usize {
+diff --git c/candle-metal-kernels/src/kernel.rs w/candle-metal-kernels/src/kernel.rs
+index f941e302..f41ee4b6 100644
+--- c/candle-metal-kernels/src/kernel.rs
++++ w/candle-metal-kernels/src/kernel.rs
+@@ -1,5 +1,5 @@
+ use crate::source::{
+-    AFFINE, BINARY, CAST, CONV, FILL, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE,
++    AFFINE, BINARY, CAST, CONV, FILL, INDEXING, MLX_GEMM, MLX_SORT, NAX, QUANTIZED, RANDOM, REDUCE,
+     SDPA, SORT, TERNARY, UNARY,
+ };
+ use crate::utils::get_env_bool;
+@@ -9,6 +9,7 @@ use crate::{
+ };
+ use objc2::available;
+ use objc2::rc::Retained;
++use objc2_foundation::{NSDictionary, NSObject, NSString};
+ use std::collections::HashMap;
+ use std::sync::RwLock;
+ 
+@@ -83,8 +84,8 @@ impl Kernels {
+         }
+     }
+ 
+-    fn get_library_source(&self, source: Source) -> &'static str {
+-        match source {
++    fn get_library_source(&self, source: Source) -> String {
++        let src = match source {
+             Source::Affine => AFFINE,
+             Source::Binary => BINARY,
+             Source::Cast => CAST,
+@@ -100,6 +101,10 @@ impl Kernels {
+             Source::Ternary => TERNARY,
+             Source::Unary => UNARY,
+             Source::Sdpa => SDPA,
++        };
++        match source {
++            Source::Quantized | Source::Sdpa => [NAX, src].concat(),
++            _ => src.to_string(),
+         }
+     }
+ 
+@@ -116,9 +121,10 @@ impl Kernels {
+         } else {
+             let lib = {
+                 let source_content = self.get_library_source(source);
+-                let compile_options = get_compile_options();
++                let macros = source_macros_for_device(source, device);
++                let compile_options = get_compile_options_with_macros(&macros);
+                 device
+-                    .new_library_with_source(source_content, Some(&compile_options))
++                    .new_library_with_source(&source_content, Some(&compile_options))
+                     .map_err(|e| MetalKernelError::LoadLibraryError(e.to_string()))?
+             };
+             libraries.insert(source, lib.clone());
+@@ -158,7 +164,8 @@ impl Kernels {
+             let func = self.load_function(device, source, name.as_ref(), constants.as_ref())?;
+             let pipeline = device
+                 .new_compute_pipeline_state_with_function(&func)
+-                .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
++                .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?
++                .with_name(name.as_ref());
+             pipelines.insert((name, constants), pipeline.clone());
+ 
+             Ok(pipeline)
+@@ -178,7 +185,7 @@ impl Kernels {
+     }
+ }
+ 
+-fn get_compile_options() -> Retained<MTLCompileOptions> {
++fn get_compile_options_with_macros(macros: &[(&str, &str)]) -> Retained<MTLCompileOptions> {
+     let compile_options = MTLCompileOptions::new();
+     //unsafe { compile_options.setEnableLogging(true) };
+ 
+@@ -198,5 +205,35 @@ fn get_compile_options() -> Retained<MTLCompileOptions> {
+         #[allow(deprecated)]
+         compile_options.setFastMathEnabled(fast_math_enabled);
+     }
++
++    if !macros.is_empty() {
++        let keys: Vec<Retained<NSString>> =
++            macros.iter().map(|(k, _)| NSString::from_str(k)).collect();
++        let values: Vec<Retained<NSObject>> = macros
++            .iter()
++            .map(|(_, v)| {
++                // SAFETY: NSString is a subclass of NSObject; pointer-only retype.
++                let s = NSString::from_str(v);
++                unsafe {
++                    Retained::cast_unchecked::<NSObject>(s)
++                }
++            })
++            .collect();
++        let key_refs: Vec<&NSString> = keys.iter().map(|k| k.as_ref()).collect();
++        let value_refs: Vec<&NSObject> = values.iter().map(|v| v.as_ref()).collect();
++        let dict = NSDictionary::from_slices(&key_refs, &value_refs);
++        unsafe {
++            compile_options.setPreprocessorMacros(Some(&dict));
++        }
++    }
+     compile_options
+ }
++
++/// QUANTIZED and SDPA opt into Metal 4 tensor-ops (`GGML_METAL_HAS_TENSOR=1`) when device supports `MTLGPUFamilyMetal4`.
++fn source_macros_for_device(source: Source, device: &Device) -> Vec<(&'static str, &'static str)> {
++    let mut macros = Vec::new();
++    if matches!(source, Source::Quantized | Source::Sdpa) && device.has_tensor_api() {
++        macros.push(("GGML_METAL_HAS_TENSOR", "1"));
++    }
++    macros
++}
+diff --git c/candle-metal-kernels/src/metal/mod.rs w/candle-metal-kernels/src/metal/mod.rs
+index 5079c831..c314aab6 100644
+--- c/candle-metal-kernels/src/metal/mod.rs
++++ w/candle-metal-kernels/src/metal/mod.rs
+@@ -5,6 +5,7 @@ pub mod compute_pipeline;
+ pub mod device;
+ pub mod encoder;
+ pub mod library;
++pub mod pool;
+ 
+ pub use buffer::*;
+ pub use command_buffer::*;
+@@ -13,3 +14,8 @@ pub use compute_pipeline::*;
+ pub use device::*;
+ pub use encoder::*;
+ pub use library::*;
++pub use pool::*;
++
++// objc2 re-exports, so a host can name these types without depending on objc2.
++pub use objc2::rc::Retained;
++pub use objc2::runtime::ProtocolObject;
+diff --git c/candle-core/src/metal_backend/mod.rs w/candle-core/src/metal_backend/mod.rs
+index 95bf37c3..05c0c6c7 100644
+--- c/candle-core/src/metal_backend/mod.rs
++++ w/candle-core/src/metal_backend/mod.rs
+@@ -5,16 +5,17 @@ use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvT
+ use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
+ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
+ use candle_metal_kernels::{
+-    metal::{Buffer, Commands, Device},
+-    BufferOffset, CallConvTranspose2dCfg, Kernels, RESOURCE_OPTIONS,
++    metal::{Buffer, Commands, Device, Use},
++    BufferOffset, CallConvTranspose2dCfg, Kernels,
+ };
+ use objc2_foundation::NSRange;
+-use std::collections::HashMap;
+ use std::ffi::c_void;
+ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
+ 
+ mod device;
++mod thread_stream;
+ pub use device::{DeviceId, MetalDevice};
++pub use thread_stream::ThreadStream;
+ 
+ pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
+     BufferOffset {
+@@ -70,6 +71,14 @@ impl From<String> for MetalError {
+     }
+ }
+ 
++impl MetalError {
++    /// A FAILED ALLOCATION, WITH THE TENSOR'S NAME: the pool's own reason,
++    /// the memory plan's arithmetic where a bound refused it.
++    pub fn allocating(name: &str, e: candle_metal_kernels::MetalKernelError) -> Self {
++        MetalError::Message(format!("{name}: {e}"))
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub struct MetalStorage {
+     /// The actual buffer containing the data.
+@@ -1907,47 +1916,69 @@ impl MetalStorage {
+         Ok(Self::new(buffer, device.clone(), el_count, dtype))
+     }
+ 
++    /// Every buffer is shared with the host: once the queue has run the work that wrote this one, its values are
++    /// read where they are, and a readback places nothing on the device.
+     pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
+-        let size = self.count * self.dtype.size_in_bytes();
+-        let buffer = self.device.allocate_buffer(size)?;
+-        {
+-            let blit = self.device.blit_command_encoder()?;
+-            blit.set_label("blit_to_cpu");
+-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size);
+-            blit.end_encoding();
+-        }
+         self.device.wait_until_completed()?;
+-        Ok(read_to_vec(&buffer, self.count))
++        Ok(read_to_vec(&self.buffer, self.count))
+     }
+ }
+ 
++/// One device instance per ordinal: an instance is a command queue with a working region of its own, so a second
++/// instance of the same GPU would hold a second region for the same work. Every `new(ordinal)` gets the one instance.
++static DEVICES: Mutex<Vec<(usize, MetalDevice)>> = Mutex::new(Vec::new());
++
++impl MetalDevice {
++    fn make(ordinal: usize) -> Result<Self> {
++        let device = Device::all().swap_remove(ordinal);
++        let command_queue = device.new_command_queue().map_err(MetalError::from)?;
++        let kernels = Arc::new(Kernels::new());
++        let id = DeviceId::new();
++        let commands = Commands::new(command_queue, id.key(), None).map_err(MetalError::from)?;
++        let fences = candle_metal_kernels::metal::Fences::new(
++            commands.completion_counter(),
++            commands.completion_event(),
++            commands.inflight_bound(),
++            commands.encoded_counts(),
++        );
++        // The seed lives as long as the device: the floor's, so a device costs no working memory and needs no region.
++        // SAFETY: a live array of one u64.
++        let seed_buffer = unsafe {
++            device.new_buffer_with_data(
++                [299792458u64].as_ptr() as *const c_void,
++                std::mem::size_of::<u64>(),
++                candle_metal_kernels::metal::Use::Fixed,
++                id.key(),
++                &fences,
++                "rng-seed",
++            )
++        }
++        .map_err(MetalError::from)?;
++        let seed = Arc::new(Mutex::new(seed_buffer));
++        Ok(Self {
++            id,
++            device,
++            commands: Arc::new(RwLock::new(commands)),
++            fences,
++            kernels,
++            seed,
++            seed_value: Arc::new(RwLock::new(299792458)),
++        })
++    }
++
++}
++
+ impl BackendDevice for MetalDevice {
+     type Storage = MetalStorage;
+ 
+     fn new(ordinal: usize) -> Result<Self> {
+-        let device = Device::all().swap_remove(ordinal);
+-        let command_queue = device.new_command_queue().map_err(MetalError::from)?;
+-        let kernels = Arc::new(Kernels::new());
+-        let seed = Arc::new(Mutex::new(
+-            device
+-                .new_buffer_with_data(
+-                    [299792458u64].as_ptr() as *const c_void,
+-                    std::mem::size_of::<u64>(),
+-                    RESOURCE_OPTIONS,
+-                )
+-                .map_err(MetalError::from)?,
+-        ));
+-        let commands = Commands::new(command_queue).map_err(MetalError::from)?;
+-        Ok(Self {
+-            id: DeviceId::new(),
+-            device,
+-            commands: Arc::new(RwLock::new(commands)),
+-            buffers: Arc::new(RwLock::new(HashMap::new())),
+-            private_buffers: Arc::new(RwLock::new(HashMap::new())),
+-            kernels,
+-            seed,
+-            seed_value: Arc::new(RwLock::new(299792458)),
+-        })
++        let mut devices = DEVICES.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some((_, d)) = devices.iter().find(|(o, _)| *o == ordinal) {
++            return Ok(d.clone());
++        }
++        let made = Self::make(ordinal)?;
++        devices.push((ordinal, made.clone()));
++        Ok(made)
+     }
+ 
+     fn location(&self) -> crate::DeviceLocation {
+@@ -1981,6 +2012,7 @@ impl BackendDevice for MetalDevice {
+         ))
+     }
+ 
++    #[track_caller]
+     fn storage_from_slice<T: crate::WithDType>(&self, s: &[T]) -> Result<Self::Storage> {
+         let (count, buffer) = match T::cpu_storage_ref(s) {
+             CpuStorageRef::U8(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+@@ -2003,33 +2035,12 @@ impl BackendDevice for MetalDevice {
+         Ok(Self::Storage::new(buffer?, self.clone(), count, T::DTYPE))
+     }
+ 
++    #[track_caller]
+     fn storage_from_cpu_storage(&self, storage: &CpuStorage) -> Result<Self::Storage> {
+-        let (count, buffer) = match storage {
+-            CpuStorage::U8(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+-            CpuStorage::U32(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+-            CpuStorage::I16(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+-            CpuStorage::I32(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+-            CpuStorage::I64(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+-            CpuStorage::BF16(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+-            CpuStorage::F16(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+-            CpuStorage::F32(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+-            CpuStorage::F64(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+-            CpuStorage::F8E4M3(storage) => (storage.len(), self.new_buffer_with_data(storage)),
+-            CpuStorage::F6E2M3(_)
+-            | CpuStorage::F6E3M2(_)
+-            | CpuStorage::F4(_)
+-            | CpuStorage::F8E8M0(_) => {
+-                return Err(Error::UnsupportedDTypeForOp(storage.dtype(), "to_dtype").bt())
+-            }
+-        };
+-        Ok(Self::Storage::new(
+-            buffer?,
+-            self.clone(),
+-            count,
+-            storage.dtype(),
+-        ))
++        self.upload(storage, Use::Staged)
+     }
+ 
++    #[track_caller]
+     fn storage_from_cpu_storage_owned(&self, storage: CpuStorage) -> Result<Self::Storage> {
+         self.storage_from_cpu_storage(&storage)
+     }
+diff --git c/candle-core/src/backend.rs w/candle-core/src/backend.rs
+index d8ab2b56..1c643a51 100644
+--- c/candle-core/src/backend.rs
++++ w/candle-core/src/backend.rs
+@@ -156,10 +156,15 @@ pub trait BackendDevice: Sized + std::fmt::Debug + Clone {
+     /// after this call.
+     unsafe fn alloc_uninit(&self, _shape: &Shape, _dtype: DType) -> Result<Self::Storage>;
+ 
++    // The three routes host bytes reach a device by, and the one place a buffer the CPU fills can be named:
++    // `#[track_caller]` here and on every hop above carries the line that built the tensor to the pool, as its label.
++    #[track_caller]
+     fn storage_from_slice<T: crate::WithDType>(&self, _: &[T]) -> Result<Self::Storage>;
+ 
++    #[track_caller]
+     fn storage_from_cpu_storage(&self, _: &CpuStorage) -> Result<Self::Storage>;
+ 
++    #[track_caller]
+     fn storage_from_cpu_storage_owned(&self, _: CpuStorage) -> Result<Self::Storage>;
+ 
+     fn rand_uniform(&self, _: &Shape, _: DType, _: f64, _: f64) -> Result<Self::Storage>;
+diff --git c/candle-core/src/device.rs w/candle-core/src/device.rs
+index d0167c61..f64e92d6 100644
+--- c/candle-core/src/device.rs
++++ w/candle-core/src/device.rs
+@@ -446,6 +446,7 @@ impl Device {
+         }
+     }
+ 
++    #[track_caller]
+     pub(crate) fn storage_from_slice<D: WithDType>(&self, data: &[D]) -> Result<Storage> {
+         match self {
+             Device::Cpu => Ok(Storage::Cpu(data.to_cpu_storage())),
+@@ -460,6 +461,7 @@ impl Device {
+         }
+     }
+ 
++    #[track_caller]
+     pub(crate) fn storage<A: NdArray>(&self, array: A) -> Result<Storage> {
+         match self {
+             Device::Cpu => Ok(Storage::Cpu(array.to_cpu_storage())),
+@@ -476,6 +478,7 @@ impl Device {
+         }
+     }
+ 
++    #[track_caller]
+     pub(crate) fn storage_owned<S: WithDType>(&self, data: Vec<S>) -> Result<Storage> {
+         match self {
+             Device::Cpu => Ok(Storage::Cpu(S::to_cpu_storage_owned(data))),
+diff --git c/candle-core/src/tensor.rs w/candle-core/src/tensor.rs
+index 52b7f79b..ea4b7585 100644
+--- c/candle-core/src/tensor.rs
++++ w/candle-core/src/tensor.rs
+@@ -405,6 +405,7 @@ impl Tensor {
+         Self::randn_impl(mean, std, s, device, false)
+     }
+ 
++    #[track_caller]
+     pub(crate) fn new_impl<A: crate::device::NdArray>(
+         array: A,
+         shape: Shape,
+@@ -422,6 +423,7 @@ impl Tensor {
+     }
+ 
+     /// Creates a new tensor on the specified device using the content and shape of the input.
++    #[track_caller]
+     pub fn new<A: crate::device::NdArray>(array: A, device: &Device) -> Result<Self> {
+         let shape = array.shape()?;
+         Self::new_impl(array, shape, device, false)
+@@ -515,6 +517,7 @@ impl Tensor {
+         Self::from_vec_impl(data, len, device, false)
+     }
+ 
++    #[track_caller]
+     pub(crate) fn from_vec_impl<S: ShapeWithOneHole, D: crate::WithDType>(
+         data: Vec<D>,
+         shape: S,
+@@ -540,6 +543,7 @@ impl Tensor {
+     /// ]);
+     /// # Ok::<(), candle_core::Error>(())
+     /// ```
++    #[track_caller]
+     pub fn from_vec<S: ShapeWithOneHole, D: crate::WithDType>(
+         data: Vec<D>,
+         shape: S,
+@@ -561,6 +565,7 @@ impl Tensor {
+     /// ]);
+     /// # Ok::<(), candle_core::Error>(())
+     /// ```
++    #[track_caller]
+     pub fn from_slice<S: ShapeWithOneHole, D: crate::WithDType>(
+         array: &[D],
+         shape: S,
+@@ -2365,6 +2370,35 @@ impl Tensor {
+     }
+ 
+     /// If the target device is the same as the tensor device, only a shallow copy is performed.
++    /// Place a host tensor on `device` as a weight the model keeps: from the pool that never gives memory back
++    /// ([`Tensor::to_device`] moves a tensor the caller drops). A device source is refused: it would strand its source.
++    #[track_caller]
++    pub fn to_device_kept(&self, device: &Device) -> Result<Tensor> {
++        if !self.device().is_cpu() {
++            bail!(
++                "`to_device_kept` expects source on cpu, got {:?}: build what model keeps on host",
++                self.device()
++            )
++        }
++        // A view's storage is its parent's, so take this tensor's own bytes.
++        let src = self.force_contiguous()?;
++        let storage = match (&*src.storage(), device) {
++            (Storage::Cpu(storage), Device::Metal(metal)) => {
++                Storage::Metal(metal.kept_storage_from_cpu(storage)?)
++            }
++            // The host has no pools, so keeping is just holding.
++            (Storage::Cpu(storage), Device::Cpu) => Storage::Cpu(storage.clone()),
++            _ => bail!("`to_device_kept` not implemented for {device:?}"),
++        };
++        Ok(from_storage(
++            storage,
++            src.shape().clone(),
++            BackpropOp::none(),
++            false,
++        ))
++    }
++
++    #[track_caller]
+     pub fn to_device(&self, device: &Device) -> Result<Tensor> {
+         if self.device().same_device(device) {
+             Ok(self.clone())
+diff --git c/candle-core/src/dummy_metal_backend.rs w/candle-core/src/dummy_metal_backend.rs
+index 8c23b580..21142acd 100644
+--- c/candle-core/src/dummy_metal_backend.rs
++++ w/candle-core/src/dummy_metal_backend.rs
+@@ -26,6 +26,12 @@ macro_rules! fail {
+     };
+ }
+ 
++impl MetalDevice {
++    pub fn kept_storage_from_cpu(&self, _: &CpuStorage) -> Result<MetalStorage> {
++        fail!()
++    }
++}
++
+ impl crate::backend::BackendStorage for MetalStorage {
+     type Device = MetalDevice;
+ 
+diff --git c/candle-metal-kernels/Cargo.toml w/candle-metal-kernels/Cargo.toml
+index 4fbff70a..338d71dc 100644
+--- c/candle-metal-kernels/Cargo.toml
++++ w/candle-metal-kernels/Cargo.toml
+@@ -19,9 +19,10 @@ half = { version = "2.5.0", features = [
+ once_cell = "1.21"
+ thiserror = "2"
+ tracing = "0.1.41"
+-objc2-metal = "0.3.2"
++objc2-metal = { version = "0.3.2", features = ["block2"] }
+ objc2 = "0.6.3"
+ objc2-foundation = "0.3.2"
++block2 = "0.6"
+ 
+ [dev-dependencies]
+ clap = { version = "4.5.49", features = ["derive"] }

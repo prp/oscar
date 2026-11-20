@@ -1,0 +1,830 @@
+Subject: [mistral.rs] prefix-cache-reuse-policy
+
+  What the prefix cache keeps, when it declines to, the seam an out-of-crate store spills it to, and how much of a prompt it spared the model — reported to the caller where OpenAI puts it.
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 3
+
+---
+diff --git c/mistralrs-core/src/prefix_cacher.rs w/mistralrs-core/src/prefix_cacher.rs
+index bfba5cf4..3c7e582a 100644
+--- c/mistralrs-core/src/prefix_cacher.rs
++++ w/mistralrs-core/src/prefix_cacher.rs
+@@ -1,10 +1,14 @@
++use std::collections::VecDeque;
++use std::sync::atomic::{AtomicBool, Ordering};
++
+ use candle_core::{Device, Result};
+ use indexmap::IndexMap;
+ use itertools::Itertools;
++use tokenizers::Tokenizer;
+ use tracing::info;
+ 
+ use crate::{
+-    kv_cache::RecurrentStateSnapshot, paged_attention::block_hash::BlockHash, pipeline::KvCache,
++    kv_cache::RecurrentState, paged_attention::block_hash::BlockHash, pipeline::KvCache,
+     sequence::Sequence,
+ };
+ 
+@@ -31,13 +35,40 @@ impl From<Vec<u32>> for Tokens {
+ #[derive(Clone)]
+ struct CacheElement {
+     cache: Vec<Option<KvCache>>,
+-    /// Recurrent state snapshots for hybrid models (one per recurrent layer)
+-    recurrent_snapshots: Option<Vec<RecurrentStateSnapshot>>,
++    /// A hybrid's recurrent snapshots (one per layer), taken at completion: valid only for an exact extension.
++    recurrent_snapshots: Option<RecurrentState>,
++    /// Recurrent state at the PROMPT boundary (offset, snapshots): the one
++    /// legal rewind point for a partial match on a hybrid entry.
++    recurrent_prompt: Option<(usize, RecurrentState)>,
+     audio_hashes: Option<Vec<u64>>,
+     image_hashes: Option<Vec<u64>>,
+     video_hashes: Option<Vec<u64>>,
+ }
+ 
++/// A per-token KV entry serves any prefix; a hybrid entry serves an exact extension or rewinds
++/// to its prompt boundary and nothing between, because point states cannot be trimmed. The
++/// engine must prefill at least one token, so a hit covering the whole request degrades or is rejected.
++pub fn usable_hit(
++    has_completion_rec: bool,
++    recurrent_prompt_offset: Option<usize>,
++    match_len: usize,
++    entry_len: usize,
++    request_len: usize,
++) -> Option<usize> {
++    let per_token = !has_completion_rec && recurrent_prompt_offset.is_none();
++    let eff = match recurrent_prompt_offset {
++        _ if per_token || match_len == entry_len => match_len,
++        Some(p) if match_len >= p => p,
++        _ => return None,
++    };
++    match eff {
++        0 => None,
++        eff if eff < request_len => Some(eff),
++        _ if per_token => (request_len > 1).then(|| request_len - 1),
++        _ => recurrent_prompt_offset.filter(|p| *p > 0 && *p < request_len),
++    }
++}
++
+ impl CacheElement {
+     fn can_rewind_to(&self, len: usize) -> bool {
+         self.cache
+@@ -49,17 +80,120 @@ impl CacheElement {
+ 
+ pub struct PrefixCacheManagerV2 {
+     caches: IndexMap<Tokens, CacheElement>,
+-    paged_recurrent_caches: IndexMap<Vec<BlockHash>, Vec<RecurrentStateSnapshot>>,
++    paged_recurrent_caches: IndexMap<Vec<BlockHash>, RecurrentState>,
+     n_on_device: usize,
+     no_prefix_cache: bool,
+     has_paged_attention: bool,
++    /// The durable block store, if installed: sealed blocks deposited into it, RAM prefix hits extended from it.
++    paged_store: Option<Arc<dyn PagedKvStore>>,
++    /// The chat turns that finished last.
++    turns: Turns,
++}
++
++/// The last finished chat turns, oldest first: each one's sampled tokens, their text and where its generation
++/// suffix begins; the tokenizer need not write that text as the model did, so a repeated turn takes its own tokens.
++#[derive(Default)]
++pub struct Turns(VecDeque<Turn>);
++
++struct Turn {
++    text: String,
++    toks: Vec<u32>,
++    boundary: usize,
++}
++
++/// The turns kept; a conversation's latest supersedes its earlier ones: this many conversations resume this way.
++const TURNS_KEPT: usize = 8;
++
++impl Turns {
++    /// A finished turn; it supersedes every kept turn it continues.
++    pub fn note(&mut self, text: String, toks: Vec<u32>, boundary: usize) {
++        self.0.retain(|t| !text.starts_with(t.text.as_str()));
++        self.0.push_back(Turn { text, toks, boundary });
++        if self.0.len() > TURNS_KEPT {
++            self.0.pop_front();
++        }
++    }
++
++    /// A chat prompt's tokens with the model's own for the turn it repeats: where `text` begins with a kept turn's
++    /// text and the rest tokenized alone is the render's tail, the turn's tokens stand for its text; else as given.
++    pub fn own_tokens(&self, text: &str, toks: Vec<u32>, tokenizer: &Tokenizer) -> Vec<u32> {
++        let Some(turn) = self
++            .0
++            .iter()
++            .filter(|t| text.starts_with(t.text.as_str()))
++            .max_by_key(|t| t.text.len())
++        else {
++            return toks;
++        };
++        let Ok(rest) = tokenizer.encode_fast(&text[turn.text.len()..], false) else {
++            return toks;
++        };
++        if !toks.ends_with(rest.get_ids()) {
++            return toks;
++        }
++        [turn.toks.as_slice(), rest.get_ids()].concat()
++    }
++
++    /// The diagnostics' line for a chat prompt: whether it keeps the tokens of the kept turn it continues, and where
++    /// the tokenizer's own tokens for the render, `canonical`, would have parted (or part), both sides as ids and text.
++    pub fn say_history(&self, toks: &[u32], canonical: &[u32], tokenizer: &Tokenizer) {
++        let shared = |t: &Turn, s: &[u32]| t.toks.iter().zip(s).take_while(|(a, b)| a == b).count();
++        let Some((turn, at)) = self
++            .0
++            .iter()
++            .map(|t| (t, shared(t, toks)))
++            .filter(|(t, at)| *at >= t.boundary)
++            .max_by_key(|(_, at)| *at)
++        else {
++            return;
++        };
++        let n = turn.toks.len();
++        let say = |ids: &[u32]| {
++            ids.iter()
++                .map(|&t| format!("{t} {:?}", tokenizer.decode(&[t], false).unwrap_or_default()))
++                .join(" ")
++        };
++        let from = |s: &[u32], at: usize| say(&s[at..(at + 8).min(s.len())]);
++        if at == n || at == toks.len() {
++            let own = shared(turn, canonical);
++            if own < at {
++                tracing::info!(
++                    target: "oscar::store",
++                    "history | keeps {at} of turn's {n} tokens, own from {own} where tokenizer writes otherwise | turn: {} | tokenizer: {}",
++                    from(&turn.toks, own),
++                    from(canonical, own),
++                );
++            } else {
++                tracing::info!(target: "oscar::store", "history | keeps {at} of turn's {n} tokens");
++            }
++            return;
++        }
++        tracing::info!(
++            target: "oscar::store",
++            "history | parts from turn's {n} tokens at {at} | shared: {} | turn: {} | history: {}",
++            say(&turn.toks[at.saturating_sub(3)..at]),
++            from(&turn.toks, at),
++            from(toks, at),
++        );
++    }
++}
++
++/// The runtime's diagnostics gate: each chat request says whether its history keeps the turn's tokens, or where not.
++static DIAGNOSE: AtomicBool = AtomicBool::new(false);
++
++pub fn set_diagnostics(on: bool) {
++    DIAGNOSE.store(on, Ordering::Relaxed);
++}
++
++pub fn diagnosing() -> bool {
++    DIAGNOSE.load(Ordering::Relaxed)
+ }
+ 
+ #[derive(Clone)]
+ pub enum MatchingCache {
+     Normal {
+         normal: Vec<Option<KvCache>>,
+-        recurrent_snapshots: Option<Vec<RecurrentStateSnapshot>>,
++        recurrent_snapshots: Option<RecurrentState>,
+         images_to_keep: usize,
+         audios_to_keep: usize,
+         videos_to_keep: usize,
+@@ -69,44 +203,103 @@ pub enum MatchingCache {
+ }
+ 
+ impl PrefixCacheManagerV2 {
+-    pub fn new(n_on_device: usize, no_prefix_cache: bool, has_paged_attention: bool) -> Self {
++    pub fn new(
++        n_on_device: usize,
++        no_prefix_cache: bool,
++        has_paged_attention: bool,
++        device: &Device,
++    ) -> Self {
+         if !no_prefix_cache && !has_paged_attention {
+             info!("Prefix caching enabled (sequence-level, non-paged attention). Expect higher multi-turn throughput for both text and multimodal.");
+         }
++        let paged_store = if !no_prefix_cache && has_paged_attention {
++            make_paged_kv_store(device)
++        } else {
++            None
++        };
+         PrefixCacheManagerV2 {
+             caches: IndexMap::new(),
+             paged_recurrent_caches: IndexMap::new(),
+             n_on_device,
+             no_prefix_cache,
+             has_paged_attention,
++            paged_store,
++            turns: Turns::default(),
+         }
+     }
+ 
+-    fn paged_recurrent_capacity(&self) -> usize {
+-        self.n_on_device.max(1).saturating_mul(8)
++    /// The chat turns that finished last.
++    pub fn turns(&self) -> &Turns {
++        &self.turns
+     }
+ 
+-    /// This always keeps the cache on the device.
++    /// The durable block store behind the paged pool, when one is installed.
++    pub fn paged_kv_store(&self) -> Option<Arc<dyn PagedKvStore>> {
++        self.paged_store.clone()
++    }
++
++    /// Each retained entry is a full per-layer state copy, so the memory plan states the cap (`set_paged_snapshot_cap`)
++    /// and charges exactly that many; a stated zero retains nothing, the two sides agreeing on "charged for none".
++    fn paged_recurrent_capacity(&self) -> usize {
++        crate::paged_attention::paged_snapshot_cap()
++            .unwrap_or_else(|| self.n_on_device.max(1).saturating_mul(8))
++    }
++
++    /// Trim the retained recurrent snapshots to the cap.
++    fn trim_paged_recurrent(&mut self) {
++        while self.paged_recurrent_caches.len() > self.paged_recurrent_capacity() {
++            let victim = self.paged_recurrent_victim(None);
++            let _ = self.paged_recurrent_caches.shift_remove_index(victim);
++        }
++    }
++
++    /// One retained snapshot released for a request the state memory could not seat (a rung is a cache entry, a
++    /// request is not); false with none left.
++    pub fn release_paged_recurrent(&mut self) -> bool {
++        if self.paged_recurrent_caches.is_empty() {
++            return false;
++        }
++        let victim = self.paged_recurrent_victim(None);
++        self.paged_recurrent_caches.shift_remove_index(victim).is_some()
++    }
++
++    /// Also the switch for the template-suffix prompt split, serving prefix caching alone; off is bitwise-stable.
++    pub fn sequence_caching_enabled(&self) -> bool {
++        !self.no_prefix_cache && !self.has_paged_attention
++    }
++
++    /// Always keeps the cache on the device. The recurrent snapshot is taken only where the cache keeps it,
++    /// which under paged attention it does not. A chat sequence is kept as a turn either way.
+     pub fn add_sequence(
+         &mut self,
+         seq: &mut Sequence,
+-        recurrent_snapshots: Option<Vec<RecurrentStateSnapshot>>,
++        tokenizer: Option<&Tokenizer>,
++        take_recurrent_snapshots: impl FnOnce(&Sequence) -> Option<RecurrentState>,
+     ) {
+         // Do not cache if prefix caching disabled
+         if self.no_prefix_cache {
+             return;
+         }
++        if let Some(tokenizer) = tokenizer.filter(|_| seq.get_mut_group().is_chat) {
++            if let Ok(text) = tokenizer.decode(seq.get_toks(), false) {
++                let boundary = seq.template_suffix_boundary.unwrap_or(seq.prompt_tokens());
++                self.turns.note(text, seq.get_toks().to_vec(), boundary);
++            }
++        }
+ 
+         // For paged attention, prefix caching is handled by the KVCacheManager.
+         // PrefixCacheManagerV2 only handles non-paged attention caching.
+         if !self.has_paged_attention {
+             let cache = seq.normal_cache().to_vec();
++            let recurrent_snapshots = take_recurrent_snapshots(&*seq);
++            let recurrent_prompt = seq.recurrent_prompt_snapshot.take();
+ 
+             self.caches.insert(
+                 seq.get_toks().to_vec().into(),
+                 CacheElement {
+                     cache,
+                     recurrent_snapshots,
++                    recurrent_prompt,
+                     image_hashes: seq.image_hashes().map(|x| x.to_vec()),
+                     audio_hashes: seq.audio_hashes().map(|x| x.to_vec()),
+                     video_hashes: seq.video_hashes().map(|x| x.to_vec()),
+@@ -121,55 +314,29 @@ impl PrefixCacheManagerV2 {
+         if self.no_prefix_cache {
+             return Ok(0);
+         }
+-        let mut n_on_device = 0;
+-        for cache in self.caches.values() {
++        // One predicate for both counting and evicting, so the two cannot drift.
++        let holds_device_memory = |cache: &CacheElement| {
+             let first_non_none = cache
+                 .cache
+                 .iter()
+                 .find_or_first(|x| x.as_ref().is_some_and(|kv| kv.k().ok().flatten().is_some()));
+-            let Some(Some(first_non_none)) = first_non_none else {
+-                continue;
++            let on_device = |data: Option<&candle_core::Tensor>| {
++                !matches!(data.expect("No KV cache data").device(), Device::Cpu)
+             };
+-
+-            let cache_device = match first_non_none {
+-                KvCache::Normal { k, .. } => {
+-                    k.all_data().as_ref().expect("No KV cache data").device()
+-                }
+-                KvCache::Rotating { k, .. } => {
+-                    k.all_data().as_ref().expect("No KV cache data").device()
+-                }
+-                KvCache::Shared { .. } => continue,
+-            };
+-
+-            if !matches!(cache_device, Device::Cpu) {
+-                n_on_device += 1;
++            match first_non_none {
++                Some(Some(KvCache::Normal { k, .. })) => on_device(k.all_data()),
++                Some(Some(KvCache::Rotating { k, .. })) => on_device(k.all_data()),
++                _ => false,
+             }
+-        }
++        };
++        let n_on_device = self.caches.values().filter(|c| holds_device_memory(c)).count();
+         let mut n_evicted = 0;
+         // Intentionally evict the first ones first, as they are the oldest
+         for cache in self.caches.values_mut() {
+             if n_on_device - n_evicted <= self.n_on_device {
+                 break;
+             }
+-            let first_non_none = cache
+-                .cache
+-                .iter()
+-                .find_or_first(|x| x.as_ref().is_some_and(|kv| kv.k().ok().flatten().is_some()));
+-            let Some(Some(first_non_none)) = first_non_none else {
+-                continue;
+-            };
+-
+-            let cache_device = match first_non_none {
+-                KvCache::Normal { k, .. } => {
+-                    k.all_data().as_ref().expect("No KV cache data").device()
+-                }
+-                KvCache::Rotating { k, .. } => {
+-                    k.all_data().as_ref().expect("No KV cache data").device()
+-                }
+-                KvCache::Shared { .. } => continue,
+-            };
+-
+-            if !matches!(cache_device, Device::Cpu) {
++            if holds_device_memory(cache) {
+                 cache.cache.clear();
+                 n_evicted += 1;
+             }
+@@ -188,45 +355,151 @@ impl PrefixCacheManagerV2 {
+         Ok(len)
+     }
+ 
++    /// Whether the paged path retains recurrent snapshots at all, and so the switch for the deposit cuts the
++    /// paged prompt split takes to serve them; off keeps prompt passes bitwise.
++    pub fn paged_recurrent_caching_enabled(&self) -> bool {
++        !self.no_prefix_cache && self.has_paged_attention
++    }
++
+     /// Add a recurrent-state snapshot for a paged-attention block-hash prefix key.
+     /// This is used by hybrid models to restore recurrent states alongside paged KV prefix hits.
++    /// `supersedes` removes the depositor's previous entry, so a decode-time deposit advances along one stream. The
++    /// room is made before `take` (the incoming key newest), never past the cap; evicting the incoming takes nothing.
+     pub fn add_paged_recurrent_prefix(
+         &mut self,
+         key: Vec<BlockHash>,
+-        snapshots: Vec<RecurrentStateSnapshot>,
+-    ) {
+-        if self.no_prefix_cache
+-            || !self.has_paged_attention
+-            || key.is_empty()
+-            || snapshots.is_empty()
+-        {
+-            return;
++        take: impl FnOnce() -> Result<RecurrentState>,
++        supersedes: Option<&[BlockHash]>,
++    ) -> Result<()> {
++        if !self.paged_recurrent_caching_enabled() || key.is_empty() {
++            return Ok(());
+         }
+ 
+-        // Maintain LRU order by reinserting on update.
++        if let Some(prev) = supersedes {
++            let _ = self.paged_recurrent_caches.shift_remove(prev);
++        }
++
++        // Maintain recency order by reinserting on update.
+         let _ = self.paged_recurrent_caches.shift_remove(&key);
+-        self.paged_recurrent_caches.insert(key, snapshots);
+-
+-        while self.paged_recurrent_caches.len() > self.paged_recurrent_capacity() {
+-            let _ = self.paged_recurrent_caches.shift_remove_index(0);
++        while self.paged_recurrent_caches.len() >= self.paged_recurrent_capacity() {
++            let victim = self.paged_recurrent_victim(Some(key.as_slice()));
++            if victim == self.paged_recurrent_caches.len() {
++                self.trim_paged_recurrent();
++                return Ok(());
++            }
++            let _ = self.paged_recurrent_caches.shift_remove_index(victim);
+         }
++        self.paged_recurrent_caches.insert(key, take()?);
++        Ok(())
+     }
+ 
+-    /// Lookup a recurrent-state snapshot for a paged-attention block-hash prefix key.
+-    /// Returns a cloned snapshot and updates LRU order.
+-    pub fn get_paged_recurrent_prefix(
++    /// One eviction under tail-anchored retention: the conversation touched least recently loses
++    /// an entry, its tips kept while anything else remains, the ladder behind a tip thinned where
++    /// densest relative to its depth. Returns the victim's index; `incoming` counts as the newest.
++    fn paged_recurrent_victim(&self, incoming: Option<&[BlockHash]>) -> usize {
++        let keys: Vec<&[BlockHash]> =
++            self.paged_recurrent_caches.keys().map(Vec::as_slice).chain(incoming).collect();
++        let n = keys.len();
++        let extends =
++            |a: &[BlockHash], b: &[BlockHash]| a.len() > b.len() && a[..b.len()] == *b;
++        // Conversations: connected components under the prefix relation.
++        let mut comp: Vec<usize> = (0..n).collect();
++        for i in 0..n {
++            for j in 0..i {
++                let related = extends(&keys[i], &keys[j]) || extends(&keys[j], &keys[i]);
++                if related && comp[i] != comp[j] {
++                    let (from, to) = (comp[i].max(comp[j]), comp[i].min(comp[j]));
++                    for c in comp.iter_mut() {
++                        if *c == from {
++                            *c = to;
++                        }
++                    }
++                }
++            }
++        }
++        // Entry order is recency order: the conversation whose newest entry sits earliest is the least recent.
++        let newest_of = |c: usize| (0..n).rev().find(|&i| comp[i] == c).unwrap();
++        let victim_comp = comp.iter().copied().min_by_key(|&c| newest_of(c)).unwrap();
++        let members: Vec<usize> = (0..n).filter(|&i| comp[i] == victim_comp).collect();
++        let tips: Vec<usize> = members
++            .iter()
++            .copied()
++            .filter(|&i| !members.iter().any(|&j| extends(&keys[j], &keys[i])))
++            .collect();
++        // Non-tip rungs as (distance behind the nearest tip, entry index).
++        let mut rungs: Vec<(usize, usize)> = members
++            .iter()
++            .copied()
++            .filter_map(|i| {
++                tips.iter()
++                    .filter(|&&t| extends(&keys[t], &keys[i]))
++                    .map(|&t| keys[t].len() - keys[i].len())
++                    .min()
++                    .map(|o| (o, i))
++            })
++            .collect();
++        let victim = match rungs.len() {
++            0 => members[0],
++            1 => rungs[0].1,
++            2 => {
++                rungs.sort_unstable();
++                rungs[1].1 // no interior rung: the deeper one is worth less
++            }
++            _ => {
++                rungs.sort_unstable();
++                // Evicting an interior rung merges its two gaps; the geometric target wants the merged ratio smallest
++                // (compared by cross-multiplication). The tip-adjacent and deepest rungs are never interior.
++                (1..rungs.len() - 1)
++                    .min_by(|&a, &b| {
++                        let ra = (rungs[a + 1].0 as u128) * (rungs[b - 1].0 as u128);
++                        let rb = (rungs[b + 1].0 as u128) * (rungs[a - 1].0 as u128);
++                        ra.cmp(&rb)
++                    })
++                    .map(|k| rungs[k].1)
++                    .unwrap()
++            }
++        };
++        victim
++    }
++
++    /// The deepest stored snapshot at or below a block-hash prefix, the nearest resume point when no entry
++    /// sits at the match itself: `(depth in blocks, snapshots)`, the entry's LRU order refreshed.
++    pub fn longest_paged_recurrent_ancestor(
+         &mut self,
+         key: &[BlockHash],
+-    ) -> Option<Vec<RecurrentStateSnapshot>> {
+-        if self.no_prefix_cache || !self.has_paged_attention || key.is_empty() {
++    ) -> Option<(usize, RecurrentState)> {
++        if !self.paged_recurrent_caching_enabled() || key.is_empty() {
+             return None;
+         }
+ 
+-        let key = key.to_vec();
+-        let snapshots = self.paged_recurrent_caches.shift_remove(&key)?;
++        let depth = self
++            .paged_recurrent_caches
++            .keys()
++            .filter(|k| k.len() <= key.len() && k.as_slice() == &key[..k.len()])
++            .map(|k| k.len())
++            .max()?;
++        let snapshots = self.paged_recurrent_caches.shift_remove(&key[..depth])?;
+         let out = snapshots.clone();
+-        self.paged_recurrent_caches.insert(key, snapshots);
+-        Some(out)
++        self.paged_recurrent_caches.insert(key[..depth].to_vec(), snapshots);
++        Some((depth, out))
++    }
++
++    /// Every retained state along a block-hash chain, shallow to deep, as `(depth in blocks, snapshots)`.
++    pub fn paged_recurrent_ancestors(
++        &self,
++        key: &[BlockHash],
++    ) -> Vec<(usize, RecurrentState)> {
++        if !self.paged_recurrent_caching_enabled() || key.is_empty() {
++            return Vec::new();
++        }
++        let mut out: Vec<(usize, RecurrentState)> = self
++            .paged_recurrent_caches
++            .iter()
++            .filter(|(k, _)| k.len() <= key.len() && k.as_slice() == &key[..k.len()])
++            .map(|(k, v)| (k.len(), v.clone()))
++            .collect();
++        out.sort_by_key(|(d, _)| *d);
++        out
+     }
+ 
+     /// Search for a matching cache given some tokens. Image-containing sequences are now cached too.
+@@ -316,20 +589,31 @@ impl PrefixCacheManagerV2 {
+                 continue;
+             }
+ 
++            // A completion-time snapshot cannot be rewound, so a partial match restores the prompt-boundary one.
++            let Some(eff_len) = usable_hit(
++                v.recurrent_snapshots.is_some(),
++                v.recurrent_prompt.as_ref().map(|(p, _)| *p),
++                match_len,
++                k.0.len(),
++                toks.0.len(),
++            ) else {
++                continue;
++            };
++
+             // Sliding/rotating caches only retain a fixed tail. If a cache has already
+             // truncated older tokens, it can still safely serve an exact extension of the
+             // cached prefix, but it cannot be rewound to an earlier logical length. Skip such
+             // candidates here so a rolled-over cache does not block a shorter valid prefix hit.
+-            if !v.can_rewind_to(match_len) {
++            if !v.can_rewind_to(eff_len) {
+                 continue;
+             }
+ 
+             if best_match
+                 .as_ref()
+-                .is_none_or(|(len, _, _, _, _)| match_len > *len)
++                .is_none_or(|(len, _, _, _, _)| eff_len > *len)
+             {
+                 best_match = Some((
+-                    match_len,
++                    eff_len,
+                     v,
+                     images_match_until,
+                     audios_match_until,
+@@ -338,20 +622,30 @@ impl PrefixCacheManagerV2 {
+             }
+         }
+ 
++        // Owned copy of the RAM winner, ending the borrow of self.caches for the disk path below.
++        let best_owned: Option<(usize, CacheElement, usize, usize, usize)> =
++            best_match.map(|(len, el, imu, amu, vmu)| (len, el.clone(), imu, amu, vmu));
++
+         if let Some((
+             match_len,
+             cache_element,
+             images_match_until,
+             audios_match_until,
+             videos_match_until,
+-        )) = best_match
++        )) = best_owned
+         {
+             let new_toks = toks.0[match_len..].to_vec();
+             if new_toks.is_empty() {
+                 return Ok(None);
+             }
++            // One line per engaged hit: the serving rehit metric.
++            info!(
++                "Prefix cache: hit at {match_len}/{} request tokens; {} left to prefill",
++                toks.0.len(),
++                new_toks.len()
++            );
+ 
+-            let mut cache = cache_element.clone();
++            let mut cache = cache_element;
+             // Count how many input images are not already cached
+             let images_to_keep = if let Some(input_hashes) = image_hashes {
+                 input_hashes.len().saturating_sub(images_match_until)
+@@ -376,9 +670,14 @@ impl PrefixCacheManagerV2 {
+             for layer in cache.cache.iter_mut().flatten() {
+                 layer.set_len(match_len)?;
+             }
++            // Match the snapshot to the hit point: prompt boundary for a rewind, completion for an exact extension.
++            let recurrent_for_hit = match cache.recurrent_prompt {
++                Some((p, snaps)) if match_len == p => Some(snaps),
++                _ => cache.recurrent_snapshots,
++            };
+             return Ok(Some(MatchingCache::Normal {
+                 normal: cache.cache,
+-                recurrent_snapshots: cache.recurrent_snapshots,
++                recurrent_snapshots: recurrent_for_hit,
+                 images_to_keep,
+                 audios_to_keep,
+                 videos_to_keep,
+@@ -396,7 +695,8 @@ mod tests {
+     use candle_core::{DType, Device, Tensor};
+ 
+     use super::{CacheElement, MatchingCache, PrefixCacheManagerV2};
+-    use crate::kv_cache::{KvCache, RotatingCache, SingleCache};
++    use crate::paged_attention::block_hash::hash_block_tokens;
++    use crate::kv_cache::{KvCache, RecurrentState, RotatingCache, SingleCache};
+ 
+     fn make_cache_tensor(len: usize) -> candle_core::Result<Tensor> {
+         Tensor::zeros((1, 1, len, 1), DType::F32, &Device::Cpu)
+@@ -423,15 +723,34 @@ mod tests {
+         Ok(KvCache::Normal { k, v })
+     }
+ 
++    /// A retained snapshot goes when a request needs its state; none left, nothing goes.
++    #[test]
++    fn a_retained_snapshot_is_released_for_a_request_until_none_is_left() -> candle_core::Result<()> {
++        let mut cacher = PrefixCacheManagerV2::new(1, false, false, &Device::Cpu);
++        let state = || -> candle_core::Result<RecurrentState> {
++            let t = Tensor::zeros((2,), DType::F32, &Device::Cpu)?;
++            Ok(RecurrentState::from_layers(vec![(t.clone(), t)], 0))
++        };
++        let key = |ts: &[u32]| ts.iter().map(|&t| hash_block_tokens(None, &[t], None)).collect::<Vec<_>>();
++        cacher.paged_recurrent_caches.insert(key(&[1, 2]), state()?);
++        cacher.paged_recurrent_caches.insert(key(&[1, 2, 3]), state()?);
++        assert!(cacher.release_paged_recurrent());
++        assert_eq!(cacher.paged_recurrent_caches.len(), 1);
++        assert!(cacher.release_paged_recurrent());
++        assert!(!cacher.release_paged_recurrent(), "nothing left to release");
++        Ok(())
++    }
++
+     #[test]
+     fn skips_rolled_over_rotating_candidate_that_cannot_rewind() -> candle_core::Result<()> {
+-        let mut prefix_cacher = PrefixCacheManagerV2::new(1, false, false);
++        let mut prefix_cacher = PrefixCacheManagerV2::new(1, false, false, &Device::Cpu);
+ 
+         prefix_cacher.caches.insert(
+             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into(),
+             CacheElement {
+                 cache: vec![Some(make_rotating_kv_cache(10, 4)?)],
+                 recurrent_snapshots: None,
++                recurrent_prompt: None,
+                 audio_hashes: None,
+                 image_hashes: None,
+                 video_hashes: None,
+@@ -442,6 +761,7 @@ mod tests {
+             CacheElement {
+                 cache: vec![Some(make_normal_kv_cache(6)?)],
+                 recurrent_snapshots: None,
++                recurrent_prompt: None,
+                 audio_hashes: None,
+                 image_hashes: None,
+                 video_hashes: None,
+@@ -468,13 +788,14 @@ mod tests {
+ 
+     #[test]
+     fn allows_exact_extension_from_rolled_over_rotating_cache() -> candle_core::Result<()> {
+-        let mut prefix_cacher = PrefixCacheManagerV2::new(1, false, false);
++        let mut prefix_cacher = PrefixCacheManagerV2::new(1, false, false, &Device::Cpu);
+ 
+         prefix_cacher.caches.insert(
+             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into(),
+             CacheElement {
+                 cache: vec![Some(make_rotating_kv_cache(10, 4)?)],
+                 recurrent_snapshots: None,
++                recurrent_prompt: None,
+                 audio_hashes: None,
+                 image_hashes: None,
+                 video_hashes: None,
+@@ -499,3 +820,90 @@ mod tests {
+         Ok(())
+     }
+ }
++
++// The seam for the durable block-granular KV store: this crate owns the paged KV representation and the cache
++// policy, so the contract lives here and the store is installed at startup; none installed, this file is inert.
++use std::sync::{Arc, OnceLock};
++
++/// One sealed (full, hash-covered) KV block of a sequence, named by its chain hash.
++pub struct SealedBlockMeta {
++    /// Chain hash at this block (commits to the whole prefix through it).
++    pub hash: u64,
++    /// The previous block's chain hash; 0 for a chain root.
++    pub parent: u64,
++    /// Block position in the sequence, 0-based.
++    pub pos: u32,
++    /// The pool block holding the content right now.
++    pub block_id: usize,
++}
++
++/// A boundary record: the partial-block KV rows at a resume-worthy position (the conversation tip, or a hybrid's
++/// prompt boundary) plus the state there. No hash covers a partial block: `tokens` match element-wise above `parent`.
++pub struct TailDeposit {
++    /// Chain hash of the last full block below the boundary; 0 when the boundary sits inside the first block.
++    pub parent: u64,
++    /// Block position the partial rows belong to (= full blocks below the boundary).
++    pub pos: u32,
++    /// The pool block holding the partial rows right now.
++    pub block_id: usize,
++    /// Tokens past the block floor, the element-wise match key; empty for a block-aligned boundary (then state-only).
++    pub tokens: Vec<u32>,
++    /// Recurrent state at the exact boundary; the tip's is the live sequence's own, whose object carries no
++    /// position, so the store takes it from the boundary. `None` for non-hybrids.
++    pub snapshots: Option<RecurrentState>,
++}
++
++/// A durable, block-granular store behind the paged KV pool: deposits stage copies of sealed blocks and a turn's
++/// boundary records (a hybrid's state at each); restores fill a sequence's blocks past its RAM hit at admission.
++pub trait PagedKvStore: Send + Sync {
++    /// Hand the store the block pool's memory and its block layout, once. `hash_probe`, the chain hash of a fixed
++    /// token pattern, fingerprints the hash function, so a store written under another toolchain is swept, not misread.
++    fn bind(
++        &self,
++        memory: Arc<dyn crate::paged_attention::KvBlockMemory>,
++        layout: &crate::paged_attention::KvBlockLayout,
++        hash_probe: u64,
++    );
++
++    /// Deposit a finished sequence's sealed blocks and its boundary records, which supersede
++    /// those of the turns it continues; `toks` is what the records are matched against. The
++    /// store copies device content out here and writes to disk later on its own thread.
++    fn note_finished_sequence(&self, blocks: &[SealedBlockMeta], tails: Vec<TailDeposit>, toks: &[u32]);
++
++    /// Keep the state at a fork (where a prompt parts from a sequence the store holds) for every later prompt
++    /// sharing the beginning: the blocks through it and a state-only record there, which no turn owns.
++    fn note_shared(&self, blocks: &[SealedBlockMeta], record: TailDeposit);
++
++    /// The deepest block of a prompt's `chain` where a held sequence parts from the prompt; `None` where none does.
++    fn fork_depth(&self, chain: &[u64], toks: &[u32]) -> Option<usize>;
++
++    /// Extend a RAM prefix hit of `ram_blocks` blocks (`dst_block_ids[i]` takes chain position `ram_blocks + i`): the
++    /// restored count and snapshot; a matching tail reaches the boundary, a hybrid below only past `ram_state_tokens`.
++    fn restore_extension(
++        &self,
++        chain: &[u64],
++        ram_blocks: usize,
++        dst_block_ids: &[usize],
++        hybrid: bool,
++        ram_state_tokens: usize,
++        toks: &[u32],
++    ) -> Option<(usize, Option<RecurrentState>)>;
++
++    /// Write everything dirty and seal, within `bound`. Called at exit.
++    fn flush(&self, bound: std::time::Duration);
++}
++
++/// Builds a store for a device, or `None` when configured off; called once, when the prefix cache is constructed.
++pub type PagedKvStoreFactory = fn(&Device) -> Option<Arc<dyn PagedKvStore>>;
++
++static FACTORY: OnceLock<PagedKvStoreFactory> = OnceLock::new();
++
++/// Install the store implementation before the first pipeline is built; later calls are ignored.
++pub fn set_paged_kv_store_factory(factory: PagedKvStoreFactory) {
++    let _ = FACTORY.set(factory);
++}
++
++/// Build a store, or `None` when none was installed or it is configured off.
++pub(crate) fn make_paged_kv_store(device: &Device) -> Option<Arc<dyn PagedKvStore>> {
++    FACTORY.get().and_then(|f| f(device))
++}
+diff --git c/mistralrs-core/src/response.rs w/mistralrs-core/src/response.rs
+index a819c1a4..0e3eb978 100644
+--- c/mistralrs-core/src/response.rs
++++ w/mistralrs-core/src/response.rs
+@@ -119,6 +119,16 @@ pub struct CompletionChunkChoice {
+ 
+ generate_repr!(CompletionChunkChoice);
+ 
++#[cfg_attr(feature = "pyo3_macros", pyclass)]
++#[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
++#[derive(Debug, Clone, Default, Serialize)]
++/// How much of the prompt was served from cached context rather than re-encoded, where OpenAI puts it.
++pub struct PromptTokensDetails {
++    pub cached_tokens: usize,
++}
++
++generate_repr!(PromptTokensDetails);
++
+ #[cfg_attr(feature = "pyo3_macros", pyclass)]
+ #[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
+ #[derive(Debug, Clone, Serialize)]
+@@ -126,6 +136,7 @@ generate_repr!(CompletionChunkChoice);
+ pub struct Usage {
+     pub completion_tokens: usize,
+     pub prompt_tokens: usize,
++    pub prompt_tokens_details: PromptTokensDetails,
+     pub total_tokens: usize,
+     pub avg_tok_per_sec: f32,
+     pub avg_prompt_tok_per_sec: f32,
+diff --git c/mistralrs/src/agent.rs w/mistralrs/src/agent.rs
+index 6e775bff..b51129c0 100644
+--- c/mistralrs/src/agent.rs
++++ w/mistralrs/src/agent.rs
+@@ -278,6 +278,7 @@ impl<'a> AgentStream<'a> {
+                                                     system_fingerprint: String::new(),
+                                                     object: String::new(),
+                                                     usage: crate::Usage {
++                                prompt_tokens_details: Default::default(),
+                                                         completion_tokens: 0,
+                                                         prompt_tokens: 0,
+                                                         total_tokens: 0,

@@ -1,0 +1,23 @@
+[package]
+name = "oscar-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+# Oscar's GGUF architecture ports. They live here rather than in the fork
+# because they are Oscar's code: the fork reaches them through the GgufArch
+# registry, which keeps the build-time edge one-way.
+
+[dependencies]
+half = "2"
+mistralrs-core = { workspace = true, features = ["metal"] }
+mistralrs-quant = { path = "../../third_party/oscar-mistral.rs/mistralrs-quant", features = ["metal"] }
+oscar-kernels = { path = "../oscar-kernels" }
+oscar-offload = { path = "../oscar-offload" }
+candle-core = { path = "../../third_party/oscar-candle/candle-core", features = ["metal"] }
+candle-nn = { path = "../../third_party/oscar-candle/candle-nn", features = ["metal"] }
+anyhow = "1"
+# The catalogue rows name each model for the command line.
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,966 @@
+Subject: [mistral.rs] serve-request-path
+
+  What a request carries into the chat template, and the one-line-in one-line-out record the serve lane keeps of it
+  Two things a template needs and the message types did not hand it: tool call arguments as a map rather than a JSON string, and the assistant's own reasoning, which every vendor template renders back into history and no model could ever see, because neither the wire type nor the in-process message list declared a field for it
+  Plus the ids the server advertises for the model it loaded, each naming the generation mode it serves, so a client pins a reference to what is loaded rather than a copy of it
+  And the record says when a request produced NO ANSWER: a reply whose content channel is empty because the whole budget went to reasoning is indistinguishable from a refusal otherwise, and on the streamed path only a field carried across the chunks can tell them apart
+  And the system message a chat that sends none is given: the embedder's default, installed once, so the model is told what it is
+  And the phase the engine is in and the tokens it has sampled, read by the status line beside a server
+  And a request for a model id the server does not serve is refused before it is parsed, with the status and the error object OpenAI gives it and one line saying which ids are served.
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 11
+
+---
+diff --git c/mistralrs-core/src/request.rs w/mistralrs-core/src/request.rs
+index be1e49f4..fcbc6458 100644
+--- c/mistralrs-core/src/request.rs
++++ w/mistralrs-core/src/request.rs
+@@ -64,6 +64,19 @@ impl ReasoningEffort {
+     }
+ }
+ 
++static DEFAULT_SYSTEM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
++
++/// The system message a chat request carries when its client sends none: the embedder's, installed before
++/// the first request; later calls are ignored.
++pub fn set_default_system_prompt(text: String) {
++    let _ = DEFAULT_SYSTEM.set(text);
++}
++
++/// The installed default system message, if any.
++pub fn default_system_prompt() -> Option<&'static str> {
++    DEFAULT_SYSTEM.get().map(String::as_str)
++}
++
+ #[derive(Clone, Debug, Serialize, Deserialize)]
+ /// Message or messages for a [`Request`].
+ pub enum RequestMessage {
+diff --git c/mistralrs-core/src/live.rs w/mistralrs-core/src/live.rs
+new file mode 100644
+index 00000000..3d07cabd
+--- /dev/null
++++ w/mistralrs-core/src/live.rs
+@@ -0,0 +1,119 @@
++//! What the engine is doing now, for a status line beside it: the phase of the step being run, when it began, the
++//! prompt and completion tokens processed; a chunk counts when it lands, its routed layers stamping progress first.
++
++use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
++use std::sync::OnceLock;
++use std::time::Instant;
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Phase {
++    Idle = 0,
++    Prefill = 1,
++    Decode = 2,
++}
++
++static PHASE: AtomicU8 = AtomicU8::new(0);
++static COMPLETION: AtomicU64 = AtomicU64::new(0);
++static PROMPT: AtomicU64 = AtomicU64::new(0);
++static BEGAN_NS: AtomicU64 = AtomicU64::new(0);
++static BEGAN_COMPLETION: AtomicU64 = AtomicU64::new(0);
++static BEGAN_PROMPT: AtomicU64 = AtomicU64::new(0);
++/// The prompt chunk in flight: its tokens, the routed layers that have run it, and the routed layers a
++/// chunk runs (set at load, re-learned from each chunk that lands).
++static CHUNK_TOKENS: AtomicU64 = AtomicU64::new(0);
++static CHUNK_LAYERS_DONE: AtomicU64 = AtomicU64::new(0);
++static CHUNK_LAYERS: AtomicU64 = AtomicU64::new(0);
++static EPOCH: OnceLock<Instant> = OnceLock::new();
++
++fn now_ns() -> u64 {
++    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
++}
++
++/// A phase change stamps when the new phase began and the counts it began at, and leaves no chunk in flight.
++pub(crate) fn set_phase(p: Phase) {
++    if PHASE.swap(p as u8, Relaxed) != p as u8 {
++        BEGAN_NS.store(now_ns(), Relaxed);
++        BEGAN_COMPLETION.store(COMPLETION.load(Relaxed), Relaxed);
++        BEGAN_PROMPT.store(PROMPT.load(Relaxed), Relaxed);
++        CHUNK_TOKENS.store(0, Relaxed);
++        CHUNK_LAYERS_DONE.store(0, Relaxed);
++    }
++}
++
++pub(crate) fn completion_token() {
++    COMPLETION.fetch_add(1, Relaxed);
++}
++
++/// A prompt chunk of `n` tokens landed: the layers it ran are the count a chunk runs from now on; nothing in flight.
++pub(crate) fn prompt_tokens(n: u64) {
++    PROMPT.fetch_add(n, Relaxed);
++    let done = CHUNK_LAYERS_DONE.swap(0, Relaxed);
++    if done > 0 {
++        CHUNK_LAYERS.store(done, Relaxed);
++    }
++    CHUNK_TOKENS.store(0, Relaxed);
++}
++
++/// The routed layers a prompt chunk runs, from the model's layout at load; a chunk that lands corrects it.
++pub fn set_prompt_layers(n: u64) {
++    CHUNK_LAYERS.store(n, Relaxed);
++}
++
++/// One routed layer of a prompt chunk of `tokens` tokens has run. Counted only in the prefill phase, so
++/// a drafter's or a census's multi-token forward stamps nothing.
++pub fn prompt_layer(tokens: u64) {
++    if PHASE.load(Relaxed) != Phase::Prefill as u8 {
++        return;
++    }
++    CHUNK_TOKENS.store(tokens, Relaxed);
++    CHUNK_LAYERS_DONE.fetch_add(1, Relaxed);
++}
++
++/// The engine now: its phase, the seconds it has run, the prompt and completion tokens processed since it began (the
++/// prompt count carrying the chunk in flight at the share of its layers run) and the completion tokens since launch.
++#[derive(Clone, Copy, Debug)]
++pub struct Live {
++    pub phase: Phase,
++    pub secs: f64,
++    pub prompt: u64,
++    pub completion: u64,
++    pub completion_total: u64,
++}
++
++pub fn now() -> Live {
++    let phase = match PHASE.load(Relaxed) {
++        1 => Phase::Prefill,
++        2 => Phase::Decode,
++        _ => Phase::Idle,
++    };
++    let completion_total = COMPLETION.load(Relaxed);
++    let in_flight = match (CHUNK_TOKENS.load(Relaxed), CHUNK_LAYERS_DONE.load(Relaxed), CHUNK_LAYERS.load(Relaxed)) {
++        (tokens, done, layers) if layers > 0 => tokens * done.min(layers) / layers,
++        _ => 0,
++    };
++    Live {
++        phase,
++        secs: now_ns().saturating_sub(BEGAN_NS.load(Relaxed)) as f64 / 1e9,
++        prompt: PROMPT.load(Relaxed).saturating_sub(BEGAN_PROMPT.load(Relaxed)) + in_flight,
++        completion: completion_total.saturating_sub(BEGAN_COMPLETION.load(Relaxed)),
++        completion_total,
++    }
++}
++
++/// How long something took, as every console line says it: seconds from one second up, whole milliseconds
++/// below, a time under a millisecond with its tenth; never a `0 ms` for a time that was not nothing.
++pub fn duration_text(secs: f64) -> String {
++    let ms = secs * 1e3;
++    // Each threshold is where the finer form would round up to the next one.
++    if ms >= 999.5 {
++        format!("{secs:.1} s")
++    } else if ms >= 0.95 {
++        format!("{ms:.0} ms")
++    } else if ms >= 0.05 {
++        format!("{ms:.1} ms")
++    } else if ms > 0.0 {
++        "<0.1 ms".to_string()
++    } else {
++        "0 ms".to_string()
++    }
++}
+diff --git c/mistralrs-server-core/src/util.rs w/mistralrs-server-core/src/util.rs
+index 79f2bf36..d841e52b 100644
+--- c/mistralrs-server-core/src/util.rs
++++ w/mistralrs-server-core/src/util.rs
+@@ -4,7 +4,7 @@ use image::DynamicImage;
+ use mistralrs_core::AudioInput;
+ use mistralrs_core::MistralRs;
+ use std::error::Error;
+-use std::sync::Arc;
++use std::sync::{Arc, OnceLock};
+ use tokio::{
+     fs::{self, File},
+     io::AsyncReadExt,
+@@ -130,6 +130,82 @@ pub async fn parse_audio_url(url_unparsed: &str) -> Result<AudioInput, anyhow::E
+     AudioInput::from_bytes(&bytes)
+ }
+ 
++static ADVERTISED: OnceLock<Vec<(String, Option<bool>)>> = OnceLock::new();
++
++/// Declare the ids this server advertises for the model it loaded, each with the generation mode
++/// its name carries (`None` = whatever the request asks). The embedder owns these, and registers
++/// each as an alias of the loaded model so they route and validate on every endpoint.
++pub fn set_advertised_models(ids: Vec<(String, Option<bool>)>) {
++    let _ = ADVERTISED.set(ids);
++}
++
++static EPILOGUE: OnceLock<Box<dyn Fn() -> Option<String> + Send + Sync>> = OnceLock::new();
++
++/// Install a second line for the per-request record, printed after each completed request: what a request cost
++/// below the API only the runtime underneath knows. `None` prints nothing.
++pub fn set_request_epilogue(line: Box<dyn Fn() -> Option<String> + Send + Sync>) {
++    let _ = EPILOGUE.set(line);
++}
++
++/// The epilogue line for the request that has just finished, if one is installed and it has something to say.
++pub(crate) fn request_epilogue() -> Option<String> {
++    EPILOGUE.get().and_then(|line| line())
++}
++
++static TEXT_TAP: OnceLock<Box<dyn Fn(&str, &str) + Send + Sync>> = OnceLock::new();
++
++/// Install a tap on the streamed text: each chunk's reasoning and content deltas, as the client sees them.
++pub fn set_text_tap(tap: Box<dyn Fn(&str, &str) + Send + Sync>) {
++    let _ = TEXT_TAP.set(tap);
++}
++
++pub(crate) fn text_tap(reasoning: &str, content: &str) {
++    if let Some(tap) = TEXT_TAP.get() {
++        tap(reasoning, content);
++    }
++}
++
++/// The advertised ids, in the order `/v1/models` lists them.
++pub fn advertised_models() -> &'static [(String, Option<bool>)] {
++    ADVERTISED.get().map_or(&[], Vec::as_slice)
++}
++
++/// The generation mode an advertised id names; `None` when the id is not one, or names no mode (the request chooses).
++pub fn advertised_thinking(model: &str) -> Option<bool> {
++    advertised_models()
++        .iter()
++        .find(|(id, _)| id == model)
++        .and_then(|(_, thinking)| *thinking)
++}
++
++/// A request for a model id this server does not serve, answered before anything is parsed: OpenAI's 404 with its
++/// error object, and one console line naming the id asked for and the ids served. `None` when the id is served.
++pub(crate) fn refuse_unserved_model(requested: &str, state: &Arc<MistralRs>) -> Option<axum::response::Response> {
++    use axum::response::IntoResponse;
++    if validate_model_name(requested, state.clone()).is_ok() {
++        return None;
++    }
++    let served = std::iter::once("\"default\"".to_string())
++        .chain(advertised_models().iter().map(|(id, _)| format!("\"{id}\"")))
++        .collect::<Vec<_>>()
++        .join(", ");
++    tracing::warn!(
++        target: "oscar_runtime::serve",
++        "A model not served was requested: \"{requested}\"; ids served: {served}",
++    );
++    let body = serde_json::json!({
++        "error": {
++            "message": format!("The model '{requested}' is not served here; the ids served: {served}"),
++            "type": "invalid_request_error",
++            "param": "model",
++            "code": "model_not_found",
++        }
++    });
++    let mut response = axum::Json(body).into_response();
++    *response.status_mut() = axum::http::StatusCode::NOT_FOUND;
++    Some(response)
++}
++
+ /// Validates that the requested model matches one of the loaded models.
+ ///
+ /// This function checks if the model parameter from an OpenAI API request
+diff --git c/mistralrs-server-core/src/openai.rs w/mistralrs-server-core/src/openai.rs
+index 5ae65072..d0c9a0ec 100644
+--- c/mistralrs-server-core/src/openai.rs
++++ w/mistralrs-server-core/src/openai.rs
+@@ -278,6 +278,9 @@ pub struct Message {
+     pub tool_calls: Option<Vec<ToolCall>>,
+     /// Tool call ID this message is responding to (for tool messages)
+     pub tool_call_id: Option<String>,
++    /// The assistant's own reasoning for this turn, as the client returns it; without the field serde drops
++    /// it here and no chat template can render the model its prior thinking back.
++    pub reasoning_content: Option<String>,
+ }
+ 
+ /// Stop token configuration for generation
+@@ -583,6 +586,9 @@ pub struct ChatCompletionRequest {
+     // mistral.rs additional
+     #[schema(example = json!(Option::None::<usize>))]
+     pub top_k: Option<usize>,
++    /// Seeds the request's sampling, so the same request returns the same completion.
++    #[schema(example = json!(Option::None::<u64>))]
++    pub seed: Option<u64>,
+     #[schema(example = json!(Option::None::<Grammar>))]
+     pub grammar: Option<Grammar>,
+     #[schema(example = json!(Option::None::<f64>))]
+@@ -703,6 +709,9 @@ pub struct CompletionRequest {
+     // mistral.rs additional
+     #[schema(example = json!(Option::None::<usize>))]
+     pub top_k: Option<usize>,
++    /// Seeds the request's sampling, so the same request returns the same completion.
++    #[schema(example = json!(Option::None::<u64>))]
++    pub seed: Option<u64>,
+     #[schema(example = json!(Option::None::<Grammar>))]
+     pub grammar: Option<Grammar>,
+     #[schema(example = json!(Option::None::<f64>))]
+@@ -1079,6 +1088,9 @@ pub struct ResponsesCreateRequest {
+     // mistral.rs additional
+     #[schema(example = json!(Option::None::<usize>))]
+     pub top_k: Option<usize>,
++    /// Seeds the request's sampling, so the same request returns the same completion.
++    #[schema(example = json!(Option::None::<u64>))]
++    pub seed: Option<u64>,
+     #[schema(example = json!(Option::None::<Grammar>))]
+     pub grammar: Option<Grammar>,
+     #[schema(example = json!(Option::None::<f64>))]
+diff --git c/mistralrs-server-core/src/chat_completion.rs w/mistralrs-server-core/src/chat_completion.rs
+index 2925f175..8816606d 100644
+--- c/mistralrs-server-core/src/chat_completion.rs
++++ w/mistralrs-server-core/src/chat_completion.rs
+@@ -14,11 +14,12 @@ use axum::{
+ use either::Either;
+ use indexmap::IndexMap;
+ use itertools::Itertools;
++use mistralrs_core::Usage;
+ use mistralrs_core::{
+     ChatCompletionChunkResponse, ChatCompletionResponse, Constraint, MistralRs, ModelCategory,
+     NormalRequest, ReasoningEffort, Request, RequestMessage, Response, SamplingParams,
+ };
+-use serde_json::Value;
++use serde_json::{json, Value};
+ use tokio::sync::mpsc::{Receiver, Sender};
+ 
+ use crate::{
+@@ -31,12 +32,15 @@ use crate::{
+         BaseJsonModelError, ErrorToResponse, JsonError, ModelErrorMessage,
+     },
+     openai::{
+-        ChatCompletionRequest, Grammar, JsonSchemaResponseFormat, MessageInnerContent,
++        ChatCompletionRequest, Grammar, JsonSchemaResponseFormat, Message, MessageInnerContent,
+         ResponseFormat,
+     },
+     streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
+     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
+-    util::{parse_audio_url, parse_image_url, sanitize_error_message, validate_model_name},
++    util::{
++        advertised_thinking, parse_audio_url, parse_image_url, sanitize_error_message,
++        validate_model_name,
++    },
+     video::parse_video_url,
+ };
+ 
+@@ -86,6 +90,12 @@ pub type ChatCompletionStreamer = BaseStreamer<
+     ChatCompletionOnDoneCallback,
+ >;
+ 
++/// An error inside a stream, as the JSON error object an OpenAI client parses, never bare text.
++fn error_event(message: &str) -> Result<Event, axum::Error> {
++    let body = serde_json::json!({ "error": { "message": message, "type": "server_error" } });
++    Event::default().json_data(body)
++}
++
+ impl futures::Stream for ChatCompletionStreamer {
+     type Item = Result<Event, axum::Error>;
+ 
+@@ -125,24 +135,37 @@ impl futures::Stream for ChatCompletionStreamer {
+                     );
+                     // Done now, just need to send the [DONE]
+                     self.done_state = DoneState::SendingDone;
+-                    Poll::Ready(Some(Ok(Event::default().data(msg))))
++                    Poll::Ready(Some(error_event(&msg)))
+                 }
+                 Response::ValidationError(e) => {
+                     self.done_state = DoneState::SendingDone;
+-                    Poll::Ready(Some(Ok(
+-                        Event::default().data(sanitize_error_message(e.as_ref()))
+-                    )))
++                    Poll::Ready(Some(error_event(&sanitize_error_message(e.as_ref()))))
+                 }
+                 Response::InternalError(e) => {
+                     MistralRs::maybe_log_error(self.state.clone(), &*e);
+                     self.done_state = DoneState::SendingDone;
+-                    Poll::Ready(Some(Ok(
+-                        Event::default().data(sanitize_error_message(e.as_ref()))
+-                    )))
++                    Poll::Ready(Some(error_event(&sanitize_error_message(e.as_ref()))))
+                 }
+                 Response::Chunk(mut response) => {
++                    self.answered |= response.choices.iter().any(|c| {
++                        c.delta.content.as_ref().is_some_and(|t| !t.is_empty())
++                            || c.delta.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
++                    });
++                    for c in &response.choices {
++                        crate::util::text_tap(
++                            c.delta.reasoning_content.as_deref().unwrap_or(""),
++                            c.delta.content.as_deref().unwrap_or(""),
++                        );
++                    }
+                     if response.choices.iter().all(|x| x.finish_reason.is_some()) {
+                         self.done_state = DoneState::SendingDone;
++                        if let Some(usage) = &response.usage {
++                            log_request_completed(
++                                usage,
++                                response.choices.first().and_then(|c| c.finish_reason.as_deref()),
++                                self.answered,
++                            );
++                        }
+                     }
+                     // Done now, just need to send the [DONE]
+                     MistralRs::maybe_log_response(self.state.clone(), &response);
+@@ -213,6 +236,44 @@ fn parse_reasoning_effort(effort: &Option<String>) -> Option<ReasoningEffort> {
+         })
+ }
+ 
++/// A text message as a chat template reads it: the call arguments the wire carries as strings become maps, and a turn
++/// of calls alone has empty content, the template writing its calls from `tool_calls`.
++pub fn template_message(message: &Message) -> Result<IndexMap<String, Either<String, Vec<IndexMap<String, Value>>>>> {
++    let content = match message.content.as_deref() {
++        Some(Either::Left(content)) => content.clone(),
++        Some(Either::Right(_)) => anyhow::bail!("Expected a text message."),
++        None => {
++            message.tool_calls.as_ref().context("No content was provided, expected tool calls to be provided.")?;
++            String::new()
++        }
++    };
++    let fields = [
++        ("role", Some(&message.role)),
++        ("content", Some(&content)),
++        ("tool_call_id", message.tool_call_id.as_ref()),
++        ("name", message.name.as_ref()),
++        ("reasoning_content", message.reasoning_content.as_ref()),
++    ];
++    let mut map: IndexMap<_, _> =
++        fields.into_iter().filter_map(|(k, v)| Some((k.to_string(), Either::Left(v?.clone())))).collect();
++    if let Some(calls) = &message.tool_calls {
++        let calls = calls
++            .iter()
++            .map(|tc| {
++                let (name, arguments) = (&tc.function.name, &tc.function.arguments);
++                let arguments = serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.clone()));
++                IndexMap::from([
++                    ("id".to_string(), Value::String(tc.id.clone().unwrap_or_else(|| name.clone()))),
++                    ("type".to_string(), Value::String("function".to_string())),
++                    ("function".to_string(), json!({"name": name, "arguments": arguments})),
++                ])
++            })
++            .collect();
++        map.insert("tool_calls".to_string(), Either::Right(calls));
++    }
++    Ok(map)
++}
++
+ /// Parses and validates a chat completion request.
+ ///
+ /// This function transforms an OpenAI-compatible chat completion request into the
+@@ -228,6 +289,12 @@ pub async fn parse_request(
+     // Validate that the requested model matches the loaded model
+     validate_model_name(&oairequest.model, state.clone())?;
+ 
++    // The mode the client chose, in the two places it can be: the request's own field, or the advertised id
++    // it asked for by name. The field wins: an id names a mode, it does not impose one.
++    let enable_thinking = oairequest
++        .enable_thinking
++        .or_else(|| advertised_thinking(&oairequest.model));
++
+     // Parse reasoning effort for Harmony-format models
+     let reasoning_effort = parse_reasoning_effort(&oairequest.reasoning_effort);
+ 
+@@ -240,84 +307,8 @@ pub async fn parse_request(
+             let mut audio_urls = Vec::new();
+             let mut video_urls = Vec::new();
+             for message in req_messages {
+-                let content = match message.content.as_deref() {
+-                    Some(content) => content.clone(),
+-                    None => {
+-                        // Handle tool call
+-                        let calls = message
+-                            .tool_calls
+-                            .as_ref()
+-                            .context(
+-                                "No content was provided, expected tool calls to be provided.",
+-                            )?
+-                            .iter()
+-                            .map(|call| &call.function)
+-                            .collect::<Vec<_>>();
+-
+-                        Either::Left(serde_json::to_string(&calls)?)
+-                    }
+-                };
+-
+-                match &content {
+-                    Either::Left(content) => {
+-                        let mut message_map: IndexMap<
+-                            String,
+-                            Either<String, Vec<IndexMap<String, Value>>>,
+-                        > = IndexMap::new();
+-                        message_map.insert("role".to_string(), Either::Left(message.role.clone()));
+-                        message_map.insert("content".to_string(), Either::Left(content.clone()));
+-
+-                        // Add tool_calls for assistant messages that have them
+-                        if let Some(ref tool_calls) = message.tool_calls {
+-                            // Convert tool_calls to Vec<IndexMap<String, Value>> for Jinja template
+-                            let tool_calls_vec: Vec<IndexMap<String, Value>> = tool_calls
+-                                .iter()
+-                                .map(|tc| {
+-                                    let mut tc_map = IndexMap::new();
+-                                    // Use provided ID or fallback to function name
+-                                    let id =
+-                                        tc.id.clone().unwrap_or_else(|| tc.function.name.clone());
+-                                    tc_map.insert("id".to_string(), Value::String(id));
+-                                    tc_map.insert(
+-                                        "type".to_string(),
+-                                        Value::String("function".to_string()),
+-                                    );
+-                                    let mut function_map = serde_json::Map::new();
+-                                    function_map.insert(
+-                                        "name".to_string(),
+-                                        Value::String(tc.function.name.clone()),
+-                                    );
+-                                    function_map.insert(
+-                                        "arguments".to_string(),
+-                                        Value::String(tc.function.arguments.clone()),
+-                                    );
+-                                    tc_map.insert(
+-                                        "function".to_string(),
+-                                        Value::Object(function_map),
+-                                    );
+-                                    tc_map
+-                                })
+-                                .collect();
+-                            message_map
+-                                .insert("tool_calls".to_string(), Either::Right(tool_calls_vec));
+-                        }
+-
+-                        // Add tool_call_id for tool messages
+-                        if let Some(ref tool_call_id) = message.tool_call_id {
+-                            message_map.insert(
+-                                "tool_call_id".to_string(),
+-                                Either::Left(tool_call_id.clone()),
+-                            );
+-                        }
+-
+-                        // Add name for tool messages
+-                        if let Some(ref name) = message.name {
+-                            message_map.insert("name".to_string(), Either::Left(name.clone()));
+-                        }
+-
+-                        messages.push(message_map);
+-                    }
+-                    Either::Right(image_messages) => {
++                match message.content.as_deref() {
++                    Some(Either::Right(image_messages)) => {
+                         // If there is only one message, it is possible a text message
+                         // found when rig is used as client. In this case, we need to check if
+                         // the message is a text message or an image message.
+@@ -523,6 +514,7 @@ pub async fn parse_request(
+                         audio_urls.extend(audio_urls_iter);
+                         video_urls.extend(video_urls_iter);
+                     }
++                    _ => messages.push(template_message(&message)?),
+                 }
+             }
+             if !image_urls.is_empty() || !audio_urls.is_empty() || !video_urls.is_empty() {
+@@ -558,13 +550,13 @@ pub async fn parse_request(
+                     images,
+                     audios,
+                     videos,
+-                    enable_thinking: oairequest.enable_thinking,
++                    enable_thinking,
+                     reasoning_effort,
+                 }
+             } else {
+                 RequestMessage::Chat {
+                     messages,
+-                    enable_thinking: oairequest.enable_thinking,
++                    enable_thinking,
+                     reasoning_effort,
+                 }
+             }
+@@ -578,7 +570,7 @@ pub async fn parse_request(
+             messages.push(message_map);
+             RequestMessage::Chat {
+                 messages,
+-                enable_thinking: oairequest.enable_thinking,
++                enable_thinking,
+                 reasoning_effort,
+             }
+         }
+@@ -629,6 +621,7 @@ pub async fn parse_request(
+                 logits_bias: oairequest.logit_bias,
+                 n_choices: oairequest.n_choices,
+                 dry_params,
++                seed: oairequest.seed,
+             },
+             response: tx,
+             return_logprobs: oairequest.logprobs,
+@@ -651,6 +644,56 @@ pub async fn parse_request(
+     ))
+ }
+ 
++/// The serve lane's operational record: one line in, one line out, the fields constant across requests left to the
++/// startup banner; under an `oscar_runtime::serve` target, so a server shows them without the startup narration.
++fn log_request_received(req: &ChatCompletionRequest) {
++    let (messages, chars) = match &req.messages {
++        Either::Left(msgs) => (msgs.len(), serde_json::to_string(msgs).map_or(0, |s| s.len())),
++        Either::Right(prompt) => (1, prompt.len()),
++    };
++    tracing::info!(
++        target: "oscar_runtime::serve",
++        "request in   | {messages} msg | {chars} chars | max_tokens {}",
++        req.max_tokens.map_or_else(|| "unset".to_string(), |m| m.to_string()),
++    );
++}
++
++/// Why an empty reply is empty: a completed request with nothing in its content channel produced no answer, which a
++/// client cannot tell from a refusal; `length` on a reasoning model means it thought the budget away. A call answers.
++fn no_answer_note(finish: Option<&str>, answered: bool) -> &'static str {
++    match (answered, finish) {
++        (true, _) => "",
++        (false, Some("length")) => {
++            " | no answer: token budget spent reasoning; raise max_tokens or use model's non-thinking id"
++        }
++        (false, _) => " | no answer: reply has no content, no tool call",
++    }
++}
++
++fn log_request_completed(usage: &Usage, finish: Option<&str>, answered: bool) {
++    let cached = usage.prompt_tokens_details.cached_tokens;
++    let fresh = usage.prompt_tokens.saturating_sub(cached);
++    // The prompt's rate is its new tokens' over the time to the first token:
++    // the cached ones are restored, not processed.
++    let fresh_rate = if usage.total_prompt_time_sec > 0.0 { fresh as f32 / usage.total_prompt_time_sec } else { 0.0 };
++    tracing::info!(
++        target: "oscar_runtime::serve",
++        "request done | {} | TTFT {} | prompt {} = {cached} cached + {fresh} new \
++         @ {:.0} tok/s | completion {} @ {:.1} tok/s | {}{}",
++        mistralrs_core::live::duration_text(usage.total_time_sec as f64),
++        mistralrs_core::live::duration_text(usage.total_prompt_time_sec as f64),
++        usage.prompt_tokens,
++        fresh_rate,
++        usage.completion_tokens,
++        usage.avg_compl_tok_per_sec,
++        finish.unwrap_or("?"),
++        no_answer_note(finish, answered),
++    );
++    if let Some(extra) = crate::util::request_epilogue() {
++        tracing::info!(target: "oscar_runtime::serve", "{extra}");
++    }
++}
++
+ /// OpenAI-compatible chat completions endpoint handler.
+ #[utoipa::path(
+     post,
+@@ -662,6 +705,18 @@ pub async fn parse_request(
+ pub async fn chatcompletions(
+     State(state): ExtractedMistralRsState,
+     Json(oairequest): Json<ChatCompletionRequest>,
++) -> axum::response::Response {
++    if let Some(refused) = crate::util::refuse_unserved_model(&oairequest.model, &state) {
++        return refused;
++    }
++    log_request_received(&oairequest);
++    chatcompletions_admitted(state, oairequest).await.into_response()
++}
++
++/// The chat completion of a request whose model id is served.
++async fn chatcompletions_admitted(
++    state: SharedMistralRsState,
++    oairequest: ChatCompletionRequest,
+ ) -> ChatCompletionResponder {
+     let (tx, mut rx) = create_response_channel(None);
+ 
+@@ -732,6 +787,14 @@ pub fn match_responses(state: SharedMistralRsState, response: Response) -> ChatC
+         }
+         Response::ValidationError(e) => ChatCompletionResponder::ValidationError(e),
+         Response::Done(response) => {
++            log_request_completed(
++                &response.usage,
++                response.choices.first().and_then(|c| c.finish_reason.as_str().into()),
++                response.choices.iter().any(|c| {
++                    c.message.content.as_ref().is_some_and(|t| !t.is_empty())
++                        || c.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty())
++                }),
++            );
+             MistralRs::maybe_log_response(state, &response);
+             ChatCompletionResponder::Json(response)
+         }
+diff --git c/mistralrs-server-core/src/completions.rs w/mistralrs-server-core/src/completions.rs
+index 7abdcc7d..b413ec4a 100644
+--- c/mistralrs-server-core/src/completions.rs
++++ w/mistralrs-server-core/src/completions.rs
+@@ -238,6 +238,7 @@ pub fn parse_request(
+                 logits_bias: oairequest.logit_bias,
+                 n_choices: oairequest.n_choices,
+                 dry_params,
++                seed: oairequest.seed,
+             },
+             response: tx,
+             return_logprobs: oairequest.logprobs.is_some(),
+@@ -277,7 +278,15 @@ pub fn parse_request(
+ pub async fn completions(
+     State(state): ExtractedMistralRsState,
+     Json(oairequest): Json<CompletionRequest>,
+-) -> CompletionResponder {
++) -> axum::response::Response {
++    if let Some(refused) = crate::util::refuse_unserved_model(&oairequest.model, &state) {
++        return refused;
++    }
++    completions_admitted(state, oairequest).await.into_response()
++}
++
++/// The completion of a request whose model id is served.
++async fn completions_admitted(state: SharedMistralRsState, oairequest: CompletionRequest) -> CompletionResponder {
+     let (tx, mut rx) = create_response_channel(None);
+ 
+     let (request, is_streaming) = match parse_request(oairequest, state.clone(), tx) {
+diff --git c/mistralrs-server-core/src/streaming.rs w/mistralrs-server-core/src/streaming.rs
+index 8250252a..e5296a26 100644
+--- c/mistralrs-server-core/src/streaming.rs
++++ w/mistralrs-server-core/src/streaming.rs
+@@ -39,6 +39,9 @@ pub struct BaseStreamer<R, C, D> {
+     pub on_chunk: Option<C>,
+     /// Optional callback to execute when streaming completes
+     pub on_done: Option<D>,
++    /// Whether any chunk carried an answer (content or a tool call): a reasoning model can think its budget away and
++    /// stream nothing else, which the final chunk alone cannot tell from a reply that ended; only a carry across can.
++    pub answered: bool,
+ }
+ 
+ /// Generic function to create a SSE streamer with optional callbacks.
+@@ -58,6 +61,7 @@ pub(crate) fn base_create_streamer<R, C, D>(
+         chunks: Vec::new(),
+         on_chunk,
+         on_done,
++        answered: false,
+     }
+ }
+ 
+diff --git c/mistralrs-server-core/src/handlers.rs w/mistralrs-server-core/src/handlers.rs
+index 30390017..0250804c 100644
+--- c/mistralrs-server-core/src/handlers.rs
++++ w/mistralrs-server-core/src/handlers.rs
+@@ -13,6 +13,7 @@ use utoipa::ToSchema;
+ use crate::{
+     openai::{ModelObject, ModelObjects},
+     types::ExtractedMistralRsState,
++    util::advertised_models,
+ };
+ 
+ #[derive(Debug, Clone, Copy, Deserialize, Serialize, ToSchema)]
+@@ -42,17 +43,21 @@ impl From<TuneProfileRequest> for TuneProfile {
+ pub async fn models(State(state): ExtractedMistralRsState) -> Json<ModelObjects> {
+     let mut model_objects = Vec::new();
+ 
+-    // Add "default" as a special model option
+-    model_objects.push(ModelObject {
+-        id: "default".to_string(),
+-        object: "model",
+-        created: state.get_creation_time(),
+-        owned_by: "local",
+-        status: None,
+-        tools_available: None,
+-        mcp_tools_count: None,
+-        mcp_servers_connected: None,
+-    });
++    // "default" names whichever model is loaded; the embedder's advertised ids say which that is and in
++    // what mode, so a client naming one carries a reference rather than a copy of the facts.
++    let advertised = advertised_models().iter().map(|(id, _)| id.clone());
++    for id in std::iter::once("default".to_string()).chain(advertised) {
++        model_objects.push(ModelObject {
++            id,
++            object: "model",
++            created: state.get_creation_time(),
++            owned_by: "local",
++            status: None,
++            tools_available: None,
++            mcp_tools_count: None,
++            mcp_servers_connected: None,
++        });
++    }
+ 
+     // Get all models with their status (loaded, unloaded, reloading)
+     let models_with_status = state.list_models_with_status().unwrap_or_default();
+diff --git c/mistralrs-server-core/src/responses.rs w/mistralrs-server-core/src/responses.rs
+index 6a09d65e..65e0e6f3 100644
+--- c/mistralrs-server-core/src/responses.rs
++++ w/mistralrs-server-core/src/responses.rs
+@@ -263,6 +263,7 @@ fn convert_input_items_to_messages(items: Vec<InputItem>) -> Vec<Message> {
+                     name: msg_param.name,
+                     tool_calls: None,
+                     tool_call_id: None,
++                    reasoning_content: None,
+                 });
+             }
+             TaggedInputItem::ItemReference { id: _ } => {
+@@ -285,6 +286,7 @@ fn convert_input_items_to_messages(items: Vec<InputItem>) -> Vec<Message> {
+                         function: crate::openai::FunctionCalled { name, arguments },
+                     }]),
+                     tool_call_id: None,
++                    reasoning_content: None,
+                 });
+             }
+             TaggedInputItem::FunctionCallOutput { call_id, output } => {
+@@ -295,6 +297,7 @@ fn convert_input_items_to_messages(items: Vec<InputItem>) -> Vec<Message> {
+                     name: None,
+                     tool_calls: None,
+                     tool_call_id: Some(call_id),
++                    reasoning_content: None,
+                 });
+             }
+         }
+@@ -889,6 +892,7 @@ impl futures::Stream for OpenResponsesStreamer {
+                                 name: None,
+                                 tool_calls: None,
+                                 tool_call_id: None,
++                                reasoning_content: None,
+                             });
+                         }
+ 
+@@ -1372,6 +1376,7 @@ async fn parse_openresponses_request(
+             name: None,
+             tool_calls: None,
+             tool_call_id: None,
++            reasoning_content: None,
+         });
+     }
+ 
+@@ -1390,6 +1395,7 @@ async fn parse_openresponses_request(
+                 name: None,
+                 tool_calls: None,
+                 tool_call_id: None,
++                reasoning_content: None,
+             });
+         }
+     }
+@@ -1448,6 +1454,7 @@ async fn parse_openresponses_request(
+     let chat_request = ChatCompletionRequest {
+         messages: Either::Left(final_messages.clone()),
+         model: oairequest.model,
++        seed: None,
+         logit_bias: oairequest.logit_bias,
+         logprobs: oairequest.logprobs,
+         top_logprobs: oairequest.top_logprobs,
+@@ -1581,6 +1588,7 @@ pub async fn create_response(
+                                         name: None,
+                                         tool_calls: None,
+                                         tool_call_id: None,
++                                        reasoning_content: None,
+                                     });
+                                 }
+                             }
+@@ -1671,6 +1679,7 @@ pub async fn create_response(
+                                     name: None,
+                                     tool_calls: None,
+                                     tool_call_id: None,
++                                    reasoning_content: None,
+                                 });
+                             }
+                         }
+diff --git c/mistralrs-server-core/src/cached_responses.rs w/mistralrs-server-core/src/cached_responses.rs
+index 8d4097f2..31266c7f 100644
+--- c/mistralrs-server-core/src/cached_responses.rs
++++ w/mistralrs-server-core/src/cached_responses.rs
+@@ -143,6 +143,7 @@ mod tests {
+             name: None,
+             tool_calls: None,
+             tool_call_id: None,
++            reasoning_content: None,
+         }];
+ 
+         cache
+diff --git c/mistralrs/src/messages.rs w/mistralrs/src/messages.rs
+index 84447bc1..8e02c8bd 100644
+--- c/mistralrs/src/messages.rs
++++ w/mistralrs/src/messages.rs
+@@ -6,6 +6,8 @@ use image::DynamicImage;
+ use indexmap::IndexMap;
+ use serde_json::{json, Value};
+ 
++use mistralrs_core::ReasoningEffort;
++
+ /// A type which can be used as a chat request.
+ ///
+ /// Implemented by [`TextMessages`], [`MultimodalMessages`], and [`RequestBuilder`].
+@@ -103,11 +105,28 @@ impl TextMessages {
+     }
+ 
+     /// Append a message with the given role and text content.
+-    pub fn add_message(mut self, role: TextMessageRole, text: impl ToString) -> Self {
+-        self.messages.push(IndexMap::from([
++    pub fn add_message(self, role: TextMessageRole, text: impl ToString) -> Self {
++        self.add_message_with_reasoning(role, text, "")
++    }
++
++    /// Append a message with the reasoning that produced it, as `reasoning_content`, the field a
++    /// client sends over the wire, so an in-process history renders as a served one does. Empty
++    /// reasoning adds no field, leaving a template's think scaffold unfilled.
++    pub fn add_message_with_reasoning(
++        mut self,
++        role: TextMessageRole,
++        text: impl ToString,
++        reasoning: impl ToString,
++    ) -> Self {
++        let mut message = IndexMap::from([
+             ("role".to_string(), Either::Left(role.to_string())),
+             ("content".to_string(), Either::Left(text.to_string())),
+-        ]));
++        ]);
++        let reasoning = reasoning.to_string();
++        if !reasoning.is_empty() {
++            message.insert("reasoning_content".to_string(), Either::Left(reasoning));
++        }
++        self.messages.push(message);
+         self
+     }
+ 
+@@ -451,6 +470,7 @@ pub struct RequestBuilder {
+     sampling_params: SamplingParams,
+     web_search_options: Option<WebSearchOptions>,
+     enable_thinking: Option<bool>,
++    reasoning_effort: Option<ReasoningEffort>,
+     truncate_sequence: bool,
+     pending_prefixes: Vec<PendingMediaPrefix>,
+ }
+@@ -477,6 +497,7 @@ impl From<TextMessages> for RequestBuilder {
+             sampling_params: SamplingParams::deterministic(),
+             web_search_options: None,
+             enable_thinking: None,
++            reasoning_effort: None,
+             truncate_sequence: false,
+             pending_prefixes: Vec::new(),
+         }
+@@ -499,6 +520,7 @@ impl From<MultimodalMessages> for RequestBuilder {
+             sampling_params: SamplingParams::deterministic(),
+             web_search_options: None,
+             enable_thinking: None,
++            reasoning_effort: None,
+             truncate_sequence: false,
+             pending_prefixes: value.pending_prefixes,
+         }
+@@ -522,6 +544,7 @@ impl RequestBuilder {
+             sampling_params: SamplingParams::deterministic(),
+             web_search_options: None,
+             enable_thinking: None,
++            reasoning_effort: None,
+             truncate_sequence: false,
+             pending_prefixes: Vec::new(),
+         }
+@@ -845,6 +868,12 @@ impl RequestBuilder {
+         self
+     }
+ 
++    /// The reasoning effort a template renders where the model has levels.
++    pub fn reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
++        self.reasoning_effort = Some(effort);
++        self
++    }
++
+     /// Truncate prompts that exceed the model's maximum context length.
+     pub fn with_truncate_sequence(mut self, truncate_sequence: bool) -> Self {
+         self.truncate_sequence = truncate_sequence;
+@@ -872,7 +901,7 @@ impl RequestLike for RequestBuilder {
+             RequestMessage::Chat {
+                 messages: other,
+                 enable_thinking: self.enable_thinking,
+-                reasoning_effort: None,
++                reasoning_effort: self.reasoning_effort,
+             }
+         } else {
+             let mut other_messages = Vec::new();
+@@ -889,7 +918,7 @@ impl RequestLike for RequestBuilder {
+                 audios: other_audios,
+                 videos: other_videos,
+                 enable_thinking: self.enable_thinking,
+-                reasoning_effort: None,
++                reasoning_effort: self.reasoning_effort,
+             }
+         }
+     }

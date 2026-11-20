@@ -1,0 +1,5 @@
+# One compiler on every machine: the one the gates' banked figures were built with. Moving it is a gate.
+[toolchain]
+channel = "nightly-2026-07-11"
+profile = "minimal"
+components = ["rustfmt"]

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Refuse a commit while a fork tree does not hold patches/ exactly: patches/ is the only tracked copy of the fork
+# diff, so such a commit banks a series that does not describe the code being built. Installed by setup.sh via
+# core.hooksPath. OSCAR_SKIP_FORK_CHECK=1 commits anyway (a patches/-only revert, say).
+set -uo pipefail
+[ "${OSCAR_SKIP_FORK_CHECK:-0}" = 1 ] && exit 0
+root=$(git rev-parse --show-toplevel)
+[ -x "$root/setup.sh" ] || exit 0
+# Git exports GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE to its hooks; the check runs `git -C <fork>`, which would
+# inherit them and read this repo's object store from inside the fork.
+env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "$root/setup.sh" --check >/dev/null 2>&1 && exit 0
+env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE "$root/setup.sh" --check >&2
+echo "pre-commit: refusing; OSCAR_SKIP_FORK_CHECK=1 git commit … bypasses this" >&2
+exit 1

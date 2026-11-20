@@ -1,0 +1,314 @@
+Subject: [candle] strided-copy-and-unary-kernels
+
+  The templated 3D-grid rewrite of the strided copy path, and the unary kernels beside it.
+
+Applies to: 0.10.2
+Files: 4
+
+---
+diff --git c/candle-metal-kernels/src/kernels/cast.rs w/candle-metal-kernels/src/kernels/cast.rs
+index 6145c49d..02b496ba 100644
+--- c/candle-metal-kernels/src/kernels/cast.rs
++++ w/candle-metal-kernels/src/kernels/cast.rs
+@@ -1,3 +1,4 @@
++use crate::kernels::unary::{row_major_strides_u64, strided_v2_grid};
+ use crate::utils::{BufferOffset, EncoderProvider};
+ use crate::{get_tile_size, linear_split};
+ use crate::{set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Source};
+@@ -42,6 +43,35 @@ pub fn call_cast_strided(
+     input_strides: &[usize],
+     output: &Buffer,
+ ) -> Result<(), MetalKernelError> {
++    if (2..=4).contains(&shape.len()) {
++        let n = shape.len();
++        let v2_name = format!("{}_v2_n{}", kernel_name, n);
++        let pipeline = kernels.load_pipeline(device, Source::Cast, v2_name)?;
++
++        let encoder = ep.encoder();
++        let encoder: &ComputeCommandEncoder = encoder.as_ref();
++        encoder.set_compute_pipeline_state(&pipeline);
++
++        let dims_u32: Vec<u32> = shape.iter().map(|&x| x as u32).collect();
++        let src_strides_u64: Vec<u64> = input_strides.iter().map(|&x| x as u64).collect();
++        let dst_strides_u64 = row_major_strides_u64(shape);
++        set_params!(
++            encoder,
++            (
++                &dims_u32[..],
++                &src_strides_u64[..],
++                &dst_strides_u64[..],
++                &input,
++                output
++            )
++        );
++        let (grid, group) = strided_v2_grid(shape);
++        encoder.use_resource(input.buffer, MTLResourceUsage::Read);
++        encoder.use_resource(output, MTLResourceUsage::Write);
++        encoder.dispatch_threads(grid, group);
++        return Ok(());
++    }
++
+     let pipeline = kernels.load_pipeline(device, Source::Cast, kernel_name)?;
+ 
+     let encoder = ep.encoder();
+diff --git c/candle-metal-kernels/src/kernels/unary.rs w/candle-metal-kernels/src/kernels/unary.rs
+index 40fae635..59f25c46 100644
+--- c/candle-metal-kernels/src/kernels/unary.rs
++++ w/candle-metal-kernels/src/kernels/unary.rs
+@@ -51,6 +51,10 @@ pub fn call_unary_strided(
+     strides: &[usize],
+     output: BufferOffset,
+ ) -> Result<(), MetalKernelError> {
++    if (2..=4).contains(&shape.len()) {
++        return call_unary_strided_v2(device, ep, kernels, name, shape, input, strides, output);
++    }
++
+     let pipeline = kernels.load_pipeline(device, Source::Unary, name.0)?;
+ 
+     let length: usize = shape.iter().product();
+@@ -67,6 +71,86 @@ pub fn call_unary_strided(
+     Ok(())
+ }
+ 
++#[allow(clippy::too_many_arguments)]
++fn call_unary_strided_v2(
++    device: &Device,
++    ep: impl EncoderProvider,
++    kernels: &Kernels,
++    name: strided::Kernel,
++    shape: &[usize],
++    input: BufferOffset,
++    strides: &[usize],
++    output: BufferOffset,
++) -> Result<(), MetalKernelError> {
++    let n = shape.len();
++    let v2_name = format!("{}_v2_n{}", name.0, n);
++    let pipeline = kernels.load_pipeline(device, Source::Unary, v2_name)?;
++
++    let encoder = ep.encoder();
++    let encoder: &ComputeCommandEncoder = encoder.as_ref();
++    encoder.set_compute_pipeline_state(&pipeline);
++
++    let dims_u32: Vec<u32> = shape.iter().map(|&x| x as u32).collect();
++    let src_strides_u64: Vec<u64> = strides.iter().map(|&x| x as u64).collect();
++    let dst_strides_u64 = row_major_strides_u64(shape);
++    set_params!(
++        encoder,
++        (
++            &dims_u32[..],
++            &src_strides_u64[..],
++            &dst_strides_u64[..],
++            &input,
++            &output
++        )
++    );
++    let (grid, group) = strided_v2_grid(shape);
++    encoder.use_resource(input.buffer, MTLResourceUsage::Read);
++    encoder.use_resource(output.buffer, MTLResourceUsage::Write);
++    encoder.dispatch_threads(grid, group);
++    Ok(())
++}
++
++pub(crate) fn row_major_strides_u64(shape: &[usize]) -> Vec<u64> {
++    let n = shape.len();
++    let mut strides = vec![0u64; n];
++    let mut p: u64 = 1;
++    for i in (0..n).rev() {
++        strides[i] = p;
++        p *= shape[i] as u64;
++    }
++    strides
++}
++
++/// Thread.x along last dim (coalesced when stride[N-1]==1); group (32,8,1) = one simdgroup/row.
++pub(crate) fn strided_v2_grid(shape: &[usize]) -> (objc2_metal::MTLSize, objc2_metal::MTLSize) {
++    use objc2_metal::MTLSize;
++    let n = shape.len();
++    let grid = match n {
++        2 => MTLSize {
++            width: shape[1],
++            height: shape[0],
++            depth: 1,
++        },
++        3 => MTLSize {
++            width: shape[2],
++            height: shape[1],
++            depth: shape[0],
++        },
++        4 => MTLSize {
++            width: shape[3],
++            height: shape[2],
++            depth: shape[0] * shape[1],
++        },
++        _ => unreachable!("strided_v2_grid only valid for 2..=4 dims"),
++    };
++    let group = MTLSize {
++        width: 32.min(grid.width).max(1),
++        height: 8.min(grid.height).max(1),
++        depth: 1,
++    };
++    (grid, group)
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub fn call_const_set_contiguous(
+     device: &Device,
+@@ -104,6 +188,27 @@ pub fn call_const_set_strided(
+     strides: &[usize],
+     output: BufferOffset,
+ ) -> Result<(), MetalKernelError> {
++    if (2..=4).contains(&shape.len()) {
++        let n = shape.len();
++        let v2_name = format!("{}_v2_n{}", name.0, n);
++        let pipeline = kernels.load_pipeline(device, Source::Unary, v2_name)?;
++
++        let encoder = ep.encoder();
++        let encoder: &ComputeCommandEncoder = encoder.as_ref();
++        encoder.set_compute_pipeline_state(&pipeline);
++
++        let dims_u32: Vec<u32> = shape.iter().map(|&x| x as u32).collect();
++        let dst_strides_u64: Vec<u64> = strides.iter().map(|&x| x as u64).collect();
++        set_params!(
++            encoder,
++            (&dims_u32[..], &dst_strides_u64[..], input, &output)
++        );
++        let (grid, group) = strided_v2_grid(shape);
++        encoder.use_resource(output.buffer, MTLResourceUsage::Write);
++        encoder.dispatch_threads(grid, group);
++        return Ok(());
++    }
++
+     let pipeline = kernels.load_pipeline(device, Source::Unary, name.0)?;
+ 
+     let length: usize = shape.iter().product();
+diff --git c/candle-metal-kernels/src/metal_src/cast.metal w/candle-metal-kernels/src/metal_src/cast.metal
+index 0cb6c255..6fed3942 100644
+--- c/candle-metal-kernels/src/metal_src/cast.metal
++++ w/candle-metal-kernels/src/metal_src/cast.metal
+@@ -68,13 +68,43 @@ template <typename T, typename U, typename IR = T>
+     );
+ }
+ 
++// One thread's element offset on the rank-N 3D grid: tid.x and tid.y the two
++// innermost dims, tid.z the outer ones packed row-major.
++template <uint N>
++METAL_FUNC ulong strided_v2_index(uint3 tid, constant uint *dims, constant ulong *strides) {
++    ulong idx = (ulong)tid.x * strides[N - 1] + (ulong)tid.y * strides[N - 2];
++    if (N == 3) {
++        idx += (ulong)tid.z * strides[0];
++    } else if (N == 4) {
++        idx += (ulong)(tid.z / dims[1]) * strides[0] + (ulong)(tid.z % dims[1]) * strides[1];
++    }
++    return idx;
++}
++
++// Rank-templated 3D-grid variant: thread coordinates map straight onto tensor dims.
++template <typename T, typename U, uint N, typename IR = T>
++[[kernel]] void cast_kernel_strided_v2(
++    constant uint *dims,         // [N]
++    constant ulong *src_strides, // [N], element strides in source
++    constant ulong *dst_strides, // [N], element strides in (row-major) dest
++    constant const T *input,
++    device U *output,
++    uint3 tid [[thread_position_in_grid]]
++) {
++    output[strided_v2_index<N>(tid, dims, dst_strides)] =
++        static_cast<U>(static_cast<IR>(input[strided_v2_index<N>(tid, dims, src_strides)]));
++}
++
+ // Macros to help initialize kernels
+ #define init_kernel(name, func, ...) \
+   template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
+ 
+ #define init_cast(tname, t, uname, u)                                           \
+     init_kernel("cast_" #tname "_" #uname, cast_kernel, t, u)                   \
+-    init_kernel("cast_" #tname "_" #uname "_strided", cast_kernel_strided, t, u)
++    init_kernel("cast_" #tname "_" #uname "_strided", cast_kernel_strided, t, u) \
++    init_kernel("cast_" #tname "_" #uname "_strided_v2_n2", cast_kernel_strided_v2, t, u, 2) \
++    init_kernel("cast_" #tname "_" #uname "_strided_v2_n3", cast_kernel_strided_v2, t, u, 3) \
++    init_kernel("cast_" #tname "_" #uname "_strided_v2_n4", cast_kernel_strided_v2, t, u, 4)
+ 
+ #if defined(__HAVE_BFLOAT__)
+ #define init_cast_all(tname, t)         \
+diff --git c/candle-metal-kernels/src/metal_src/unary.metal w/candle-metal-kernels/src/metal_src/unary.metal
+index a481e696..8517cf9f 100644
+--- c/candle-metal-kernels/src/metal_src/unary.metal
++++ w/candle-metal-kernels/src/metal_src/unary.metal
+@@ -65,6 +65,34 @@ template <typename T, typename U, typename unary>
+     output[tid] = static_cast<U>(op(input[idx]));
+ }
+ 
++// One thread's element offset on the rank-N 3D grid: tid.x and tid.y the two
++// innermost dims, tid.z the outer ones packed row-major.
++template <uint N>
++METAL_FUNC ulong strided_v2_index(uint3 tid, constant uint *dims, constant ulong *strides) {
++    ulong idx = (ulong)tid.x * strides[N - 1] + (ulong)tid.y * strides[N - 2];
++    if (N == 3) {
++        idx += (ulong)tid.z * strides[0];
++    } else if (N == 4) {
++        idx += (ulong)(tid.z / dims[1]) * strides[0] + (ulong)(tid.z % dims[1]) * strides[1];
++    }
++    return idx;
++}
++
++// Rank-templated 3D-grid variants whose thread coordinates map onto tensor dims: no per-thread modulo or divide.
++template <typename T, typename U, typename unary, uint N>
++[[kernel]] void unary_kernel_strided_v2(
++    constant uint *dims,         // [N]
++    constant ulong *src_strides, // [N], element strides in source
++    constant ulong *dst_strides, // [N], element strides in (row-major) dest
++    constant const T *input,
++    device U *output,
++    uint3 tid [[thread_position_in_grid]]
++) {
++    unary op;
++    output[strided_v2_index<N>(tid, dims, dst_strides)] =
++        static_cast<U>(op(input[strided_v2_index<N>(tid, dims, src_strides)]));
++}
++
+ template <typename T, int W = work_per_thread<T>()>
+ [[kernel]] void const_set(
+     constant size_t &dim,
+@@ -94,6 +122,18 @@ template <typename T>
+     output[idx] = input;
+ }
+ 
++// const_set_strided_v2 — dst is the strided side; the scalar input is broadcast.
++template <typename T, uint N>
++[[kernel]] void const_set_strided_v2(
++    constant uint *dims,         // [N]
++    constant ulong *dst_strides, // [N], element strides in destination
++    device const T &input,
++    device T *output,
++    uint3 tid [[thread_position_in_grid]]
++) {
++    output[strided_v2_index<N>(tid, dims, dst_strides)] = input;
++}
++
+ template <typename T>
+ [[kernel]] void copy2d(
+     constant int64_t &d1,
+@@ -204,7 +244,10 @@ define_unary_op(utanh, precise::tanh(x));
+ 
+ #define init_unary(op_name, unary_op, tname, t)                                         \
+     init_kernel(#op_name "_" #tname, unary_kernel, t, t, unary_op)                      \
+-    init_kernel(#op_name "_" #tname "_strided", unary_kernel_strided, t, t, unary_op)
++    init_kernel(#op_name "_" #tname "_strided", unary_kernel_strided, t, t, unary_op)   \
++    init_kernel(#op_name "_" #tname "_strided_v2_n2", unary_kernel_strided_v2, t, t, unary_op, 2) \
++    init_kernel(#op_name "_" #tname "_strided_v2_n3", unary_kernel_strided_v2, t, t, unary_op, 3) \
++    init_kernel(#op_name "_" #tname "_strided_v2_n4", unary_kernel_strided_v2, t, t, unary_op, 4)
+ 
+ #if defined(__HAVE_BFLOAT__)
+ #define init_unary_float(op_name, unary_op)   \
+@@ -222,7 +265,10 @@ define_unary_op(utanh, precise::tanh(x));
+ 
+ #define init_const_set(tname, t)                    \
+     init_kernel("const_set_" #tname, const_set, t)  \
+-    init_kernel("const_set_" #tname "_strided", const_set_strided, t)
++    init_kernel("const_set_" #tname "_strided", const_set_strided, t) \
++    init_kernel("const_set_" #tname "_strided_v2_n2", const_set_strided_v2, t, 2) \
++    init_kernel("const_set_" #tname "_strided_v2_n3", const_set_strided_v2, t, 3) \
++    init_kernel("const_set_" #tname "_strided_v2_n4", const_set_strided_v2, t, 4)
+ 
+ // Initialize all unary kernels for floating point types
+ init_unary_float(gelu_erf, ugelu_erf);

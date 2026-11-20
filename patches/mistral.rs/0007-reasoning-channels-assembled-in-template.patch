@@ -1,0 +1,487 @@
+Subject: [mistral.rs] reasoning-channels-assembled-in-template
+
+  A reasoning format whose channel delimiters the template assembles from markers instead of writing literally, so neither the tag detector nor the parser can be driven off the delimiters themselves (Kimi K3).
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 3
+
+---
+diff --git c/mistralrs-core/src/reasoning_parsers/tag_based.rs w/mistralrs-core/src/reasoning_parsers/tag_based.rs
+index 46e47e3c..98757050 100644
+--- c/mistralrs-core/src/reasoning_parsers/tag_based.rs
++++ w/mistralrs-core/src/reasoning_parsers/tag_based.rs
+@@ -27,6 +27,20 @@ pub const CHANNEL_OPEN_TAG: &str = "<|channel>";
+ /// Channel close delimiter (same as `CHANNEL_CLOSE_TOKEN`).
+ pub const CHANNEL_CLOSE_TAG: &str = "<channel|>";
+ 
++/// The three markers a Kimi K3 template builds its tags from (`<|open|>` + name + `<|sep|>`): literals in
++/// the template's own macro bodies, which makes them a detectable signature.
++pub const KIMI_OPEN_MARK: &str = "<|open|>";
++pub const KIMI_CLOSE_MARK: &str = "<|close|>";
++pub const KIMI_SEP_MARK: &str = "<|sep|>";
++
++/// Kimi K3 reasoning open delimiter; the generation prompt ends with it, so a sequence starts inside the block.
++pub const KIMI_THINK_OPEN_TAG: &str = "<|open|>think<|sep|>";
++/// Kimi K3 reasoning close, folded with the answer channel's opening marker that always follows it,
++/// so content begins clean and no scaffolding reaches a content delta.
++pub const KIMI_THINK_CLOSE_TAG: &str = "<|close|>think<|sep|><|open|>response<|sep|>";
++/// Kimi K3 answer close; what follows it is message scaffolding the model emits before EOS, not answer text.
++pub const KIMI_RESPONSE_CLOSE_TAG: &str = "<|close|>response<|sep|>";
++
+ /// Context for tracking tag-delimited reasoning parsing state within a sequence.
+ ///
+ /// This provides incremental parsing of token streams containing reasoning tags,
+@@ -42,6 +56,11 @@ pub struct TagReasoningContext {
+     reasoning_strip_prefix: Option<String>,
+     /// Whether we still need to strip the reasoning prefix for the current block.
+     pending_strip: bool,
++    /// Delimiter that ends the answer, for formats tagging their answer channel as well as their reasoning
++    /// (Kimi K3): text after it is scaffolding, so content stops there instead of running to EOS.
++    content_end_tag: Option<String>,
++    /// Whether that delimiter has been seen.
++    content_ended: bool,
+     /// Accumulated final content (outside reasoning blocks)
+     accumulated_content: String,
+     /// Accumulated reasoning content (inside reasoning blocks)
+@@ -99,6 +118,15 @@ impl TagReasoningContext {
+         ctx
+     }
+ 
++    /// A TagReasoningContext for Kimi K3's channel tags; `starts_in_block` because the generation
++    /// prompt opens a channel, the reasoning one when thinking is on and the answer one when off.
++    pub fn new_kimi_channel(starts_in_block: bool) -> Self {
++        let mut ctx = Self::with_tags(KIMI_THINK_OPEN_TAG, KIMI_THINK_CLOSE_TAG);
++        ctx.content_end_tag = Some(KIMI_RESPONSE_CLOSE_TAG.to_string());
++        ctx.in_think_block = starts_in_block;
++        ctx
++    }
++
+     fn with_tags(open: &str, close: &str) -> Self {
+         Self {
+             open_tag: open.to_string(),
+@@ -107,6 +135,8 @@ impl TagReasoningContext {
+             allow_implicit_leading_reasoning_prefix: false,
+             reasoning_strip_prefix: None,
+             pending_strip: false,
++            content_end_tag: None,
++            content_ended: false,
+             accumulated_content: String::new(),
+             accumulated_reasoning: String::new(),
+             in_think_block: false,
+@@ -159,6 +189,11 @@ impl TagReasoningContext {
+ 
+         // Process the buffer, looking for complete tags
+         loop {
++            if self.content_ended {
++                // Past the answer's closing delimiter: the rest is the message scaffolding the model emits before EOS.
++                self.buffer.clear();
++                break;
++            }
+             if self.in_think_block {
+                 // Strip optional prefix (e.g., "thought\n") at the start of a
+                 // reasoning block. Handles the case where the prefix arrives
+@@ -226,23 +261,30 @@ impl TagReasoningContext {
+                     }
+                 }
+ 
+-                // Looking for open tag
+-                if let Some(start_pos) = self.buffer.find(&*self.open_tag) {
+-                    // Found opening tag - extract content before it
++                // What ends this span: a tagged answer channel's close, otherwise the next reasoning block's open.
++                let seek = self
++                    .content_end_tag
++                    .clone()
++                    .unwrap_or_else(|| self.open_tag.clone());
++                if let Some(start_pos) = self.buffer.find(&*seek) {
++                    // Found the tag - extract content before it
+                     let content = self.buffer[..start_pos].to_string();
+                     self.accumulated_content.push_str(&content);
+-                    self.in_think_block = true;
+                     // Remove processed part including the tag
+-                    let new_start = start_pos + self.open_tag.len();
++                    let new_start = start_pos + seek.len();
+                     self.buffer = self.buffer[new_start..].to_string();
++                    if self.content_end_tag.is_some() {
++                        self.content_ended = true;
++                        continue;
++                    }
++                    self.in_think_block = true;
+                     // Mark that we need to strip the optional prefix (e.g., "thought\n")
+                     if self.reasoning_strip_prefix.is_some() {
+                         self.pending_strip = true;
+                     }
+                 } else {
+-                    // No complete opening tag found
+-                    // Check if buffer might contain a partial opening tag at the end
+-                    let partial_len = self.potential_partial_tag_len_for(&self.open_tag);
++                    // No complete tag: the buffer may end in a partial one.
++                    let partial_len = self.potential_partial_tag_len_for(&seek);
+                     if partial_len > 0 {
+                         // Keep the potential partial tag in buffer, process the rest
+                         let safe_len = self.buffer.len() - partial_len;
+@@ -269,8 +311,9 @@ impl TagReasoningContext {
+         let buffer_bytes = self.buffer.as_bytes();
+         let tag_bytes = tag.as_bytes();
+ 
+-        // Check each possible suffix of the buffer
+-        for suffix_len in 1..=tag.len().min(self.buffer.len()) {
++        // Longest first: a tag repeating its own opening marker (K3's '…think<|sep|><|open|>…' holds '<|' many
++        // times) also matches a short suffix, and holding only that would flush the real partial tag into the channel.
++        for suffix_len in (1..=tag.len().min(self.buffer.len())).rev() {
+             let suffix_start = self.buffer.len() - suffix_len;
+             let suffix = &buffer_bytes[suffix_start..];
+             let tag_prefix = &tag_bytes[..suffix_len];
+@@ -414,6 +457,13 @@ pub fn is_channel_tag_template(template: &str) -> bool {
+     template.contains(CHANNEL_OPEN_TOKEN) && template.contains(CHANNEL_CLOSE_TOKEN)
+ }
+ 
++/// Whether a chat template uses Kimi K3's channel tags: assembled in macros, so the markers are the signature.
++pub fn is_kimi_channel_template(template: &str) -> bool {
++    template.contains(KIMI_OPEN_MARK)
++        && template.contains(KIMI_CLOSE_MARK)
++        && template.contains(KIMI_SEP_MARK)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -520,6 +570,84 @@ mod tests {
+         assert_eq!(ctx.content(), Some("contentdone".to_string()));
+     }
+ 
++    // === Kimi K3 Channel Tag Tests ===
++
++    #[test]
++    fn test_kimi_survives_misaligned_chunk_boundaries() {
++        // 7-byte chunks split the fold tag after "think<|", whose suffix "<|" is also a prefix of the
++        // tag: the holdback must keep the longest candidate, not the first.
++        let raw = "plan<|close|>think<|sep|><|open|>response<|sep|>answer<|close|>response<|sep|>tail";
++        let mut ctx = TagReasoningContext::new_kimi_channel(true);
++        for chunk in raw.as_bytes().chunks(7) {
++            ctx.process_text(std::str::from_utf8(chunk).unwrap());
++        }
++        ctx.finalize();
++        assert_eq!(ctx.reasoning_content().as_deref(), Some("plan"));
++        assert_eq!(ctx.content().as_deref(), Some("answer"));
++    }
++
++    #[test]
++    fn test_kimi_full_turn() {
++        // The whole trained sequence: the prompt opened the think channel; the model closes it, answers,
++        // closes the answer and emits the message scaffolding before EOS.
++        let mut ctx = TagReasoningContext::new_kimi_channel(true);
++        ctx.process_text(
++            "weighing it up<|close|>think<|sep|><|open|>response<|sep|>\
++             the answer<|close|>response<|sep|><|close|>message<|sep|>",
++        );
++        ctx.finalize();
++        assert_eq!(ctx.reasoning_content(), Some("weighing it up".to_string()));
++        assert_eq!(ctx.content(), Some("the answer".to_string()));
++    }
++
++    #[test]
++    fn test_kimi_truncated_mid_reasoning() {
++        // A budget that ends before the close tag: everything is reasoning and no answer is claimed.
++        let mut ctx = TagReasoningContext::new_kimi_channel(true);
++        ctx.process_text("still planning, never finished");
++        ctx.finalize();
++        assert_eq!(
++            ctx.reasoning_content(),
++            Some("still planning, never finished".to_string())
++        );
++        assert_eq!(ctx.content(), None);
++    }
++
++    #[test]
++    fn test_kimi_thinking_disabled_starts_in_answer() {
++        // Thinking off: the template opens the answer channel, so content starts at once; the close tag ends it.
++        let mut ctx = TagReasoningContext::new_kimi_channel(false);
++        ctx.process_text("just the answer<|close|>response<|sep|><|close|>message<|sep|>");
++        ctx.finalize();
++        assert_eq!(ctx.reasoning_content(), None);
++        assert_eq!(ctx.content(), Some("just the answer".to_string()));
++    }
++
++    #[test]
++    fn test_kimi_split_across_token_boundaries() {
++        // The delimiters arrive a few characters at a time, as tokens do.
++        let mut ctx = TagReasoningContext::new_kimi_channel(true);
++        for piece in [
++            "plan", "<|clo", "se|>thi", "nk<|sep|>", "<|open|>resp", "onse<|sep|>", "ans", "wer",
++            "<|close|>res", "ponse<|sep|>", "<|close|>message<|sep|>",
++        ] {
++            ctx.process_text(piece);
++        }
++        ctx.finalize();
++        assert_eq!(ctx.reasoning_content(), Some("plan".to_string()));
++        assert_eq!(ctx.content(), Some("answer".to_string()));
++    }
++
++    #[test]
++    fn test_is_kimi_channel_template() {
++        // K3 assembles its tags in macros, so the markers rather than the assembled delimiters are the signature.
++        assert!(is_kimi_channel_template(
++            "{{- '<|open|>' + tag -}}{{- '<|sep|>' -}}{{- '<|close|>' + tag + '<|sep|>' -}}"
++        ));
++        assert!(!is_kimi_channel_template("template with <think></think>"));
++        assert!(!is_kimi_channel_template("only <|open|> and <|sep|>"));
++    }
++
+     #[test]
+     fn test_is_think_tag_template() {
+         assert!(is_think_tag_template(
+diff --git c/mistralrs-core/src/reasoning_parsers/mod.rs w/mistralrs-core/src/reasoning_parsers/mod.rs
+index dbd4c68f..746972df 100644
+--- c/mistralrs-core/src/reasoning_parsers/mod.rs
++++ w/mistralrs-core/src/reasoning_parsers/mod.rs
+@@ -3,6 +3,7 @@
+ //! Supports multiple reasoning formats:
+ //! - **Think tags**: `<think>...</think>` (DeepSeek R1, QwQ, SmolLM3)
+ //! - **Channel tags**: `<|channel>thought\n...<channel|>` (Gemma 4)
++//! - **Kimi channel tags**: `<|open|>think<|sep|>...<|close|>think<|sep|>` (Kimi K3)
+ //! - **Harmony**: Token-based channel format (GPT-OSS)
+ 
+ pub mod harmony;
+@@ -46,11 +47,13 @@ pub trait ReasoningParser: Send + Sync {
+ pub enum ReasoningMode {
+     /// OpenAI Harmony format (GPT-OSS models)
+     Harmony,
+-    /// Tag-based reasoning (think tags or Gemma 4 channel tags)
++    /// Tag-based reasoning (think tags, or Gemma 4 / Kimi K3 channel tags)
+     TagBased,
+ }
+ 
+ /// Check if a template uses any reasoning format (think tags or channel tags).
+ pub fn is_reasoning_template(template: &str) -> bool {
+-    tag_based::is_think_tag_template(template) || tag_based::is_channel_tag_template(template)
++    tag_based::is_think_tag_template(template)
++        || tag_based::is_channel_tag_template(template)
++        || tag_based::is_kimi_channel_template(template)
+ }
+diff --git c/mistralrs-core/src/pipeline/chat_template.rs w/mistralrs-core/src/pipeline/chat_template.rs
+index 31b5a584..4ea2b38f 100644
+--- c/mistralrs-core/src/pipeline/chat_template.rs
++++ w/mistralrs-core/src/pipeline/chat_template.rs
+@@ -24,7 +24,8 @@ const SUPPORTED_ALTERNATE_EOS: &[&str] = &[
+ ];
+ 
+ /// Repository default for templates that support an explicit thinking toggle.
+-const DEFAULT_ENABLE_THINKING: bool = true;
++/// Public because the sampling row a request gets is keyed on the same carried field, and the two must not drift.
++pub const DEFAULT_ENABLE_THINKING: bool = true;
+ 
+ #[allow(dead_code)]
+ #[derive(Debug, Deserialize)]
+@@ -124,6 +125,13 @@ impl ChatTemplate {
+             .any(|t| crate::reasoning_parsers::tag_based::is_channel_tag_template(t))
+     }
+ 
++    /// Check if the template uses Kimi K3's channel-based reasoning tags.
++    pub fn uses_kimi_channel_tags(&self) -> bool {
++        self.get_template_contents()
++            .iter()
++            .any(|t| crate::reasoning_parsers::tag_based::is_kimi_channel_template(t))
++    }
++
+     pub fn eos_tok(&self) -> Option<String> {
+         match self.eos_token.as_ref()?.0 {
+             Either::Left(ref lit) => Some(lit.clone()),
+@@ -248,6 +256,8 @@ pub struct GenerationConfig {
+     #[serde(default)]
+     min_p: Option<f64>,
+     #[serde(default)]
++    presence_penalty: Option<f32>,
++    #[serde(default)]
+     repetition_penalty: Option<f32>,
+     #[serde(default)]
+     max_new_tokens: Option<usize>,
+@@ -263,6 +273,7 @@ impl GenerationConfig {
+             top_k: self.top_k,
+             top_p: self.top_p,
+             min_p: self.min_p,
++            presence_penalty: self.presence_penalty,
+             repetition_penalty: self.repetition_penalty,
+             max_new_tokens: self.max_new_tokens,
+             max_length: self.max_length,
+@@ -276,38 +287,143 @@ impl GenerationConfig {
+     }
+ }
+ 
++/// The `tojson` chat templates are written against, transformers' `json.dumps` (`", "` and `": "`, keys in order,
++/// nothing escaped). Jinja's own filter escapes `< > & '` and sorts keys: a tools block the model was never shown.
+ fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
+-    if let Ok(indent) = kwargs.get("indent") {
+-        let mut buf = Vec::new();
+-        let repeat = b" ".repeat(indent);
+-        let formatter = serde_json::ser::PrettyFormatter::with_indent(&repeat);
+-        let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+-        value.serialize(&mut ser).unwrap();
+-        String::from_utf8(buf).map_err(|err| {
+-            Error::new(ErrorKind::BadSerialization, "cannot serialize to JSON").with_source(err)
+-        })
+-    } else {
+-        serde_json::to_string(&value).map_err(|err| {
+-            Error::new(ErrorKind::BadSerialization, "cannot serialize to JSON").with_source(err)
+-        })
+-    }
+-    .map_err(|err| {
+-        Error::new(ErrorKind::InvalidOperation, "cannot serialize to JSON").with_source(err)
+-    })
+-    .map(|s| {
+-        // When this filter is used the return value is safe for both HTML and JSON
+-        let mut rv = String::with_capacity(s.len());
+-        for c in s.chars() {
+-            match c {
+-                '<' => rv.push_str("\\u003c"),
+-                '>' => rv.push_str("\\u003e"),
+-                '&' => rv.push_str("\\u0026"),
+-                '\'' => rv.push_str("\\u0027"),
+-                _ => rv.push(c),
++    let indent: Option<Value> = kwargs.get("indent")?;
++    let separators: Option<Vec<String>> = kwargs.get("separators")?;
++    let sort_keys = kwargs.get::<Option<bool>>("sort_keys")?.unwrap_or(false);
++    let ensure_ascii = kwargs.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false);
++    kwargs.assert_all_used()?;
++    let indent = indent.map(|v| match v.as_str() {
++        Some(s) => s.to_string(),
++        None => " ".repeat(v.as_usize().unwrap_or(0)),
++    });
++    let (item, key) = match separators.as_deref() {
++        Some([item, key]) => (item.clone(), key.clone()),
++        Some(_) => {
++            return Err(Error::new(ErrorKind::InvalidOperation, "tojson: separators is a pair"))
++        }
++        None => (if indent.is_some() { "," } else { ", " }.to_string(), ": ".to_string()),
++    };
++    let bad = |e: serde_json::Error| {
++        Error::new(ErrorKind::BadSerialization, "cannot serialize to JSON").with_source(e)
++    };
++    let mut json = serde_json::to_value(&value).map_err(bad)?;
++    if sort_keys {
++        fn sort(v: &mut serde_json::Value) {
++            match v {
++                serde_json::Value::Object(m) => {
++                    m.sort_keys();
++                    m.values_mut().for_each(sort);
++                }
++                serde_json::Value::Array(a) => a.iter_mut().for_each(sort),
++                _ => {}
+             }
+         }
+-        Value::from_safe_string(rv)
+-    })
++        sort(&mut json);
++    }
++    let layout = PyLayout {
++        item: item.as_bytes(),
++        key: key.as_bytes(),
++        indent: indent.as_deref().map(str::as_bytes),
++        depth: 0,
++        has_value: false,
++    };
++    let mut buf = Vec::new();
++    json.serialize(&mut serde_json::Serializer::with_formatter(&mut buf, layout))
++        .map_err(bad)?;
++    let s = String::from_utf8(buf).expect("serde_json writes UTF-8");
++    if !ensure_ascii {
++        return Ok(Value::from_safe_string(s));
++    }
++    // Non-ASCII occurs only inside strings, where Python writes `\uXXXX`.
++    let mut out = String::with_capacity(s.len());
++    for c in s.chars() {
++        if c.is_ascii() {
++            out.push(c);
++        } else {
++            let mut units = [0u16; 2];
++            for u in c.encode_utf16(&mut units) {
++                out.push_str(&format!("\\u{u:04x}"));
++            }
++        }
++    }
++    Ok(Value::from_safe_string(out))
++}
++
++/// `json.dumps`'s layout: `item` between entries, `key` after a key, and under an indent every entry on its own line.
++struct PyLayout<'a> {
++    item: &'a [u8],
++    key: &'a [u8],
++    indent: Option<&'a [u8]>,
++    depth: usize,
++    has_value: bool,
++}
++
++impl PyLayout<'_> {
++    fn newline<W: ?Sized + std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
++        if let Some(indent) = self.indent {
++            w.write_all(b"\n")?;
++            for _ in 0..self.depth {
++                w.write_all(indent)?;
++            }
++        }
++        Ok(())
++    }
++
++    fn open<W: ?Sized + std::io::Write>(&mut self, w: &mut W, bracket: &[u8]) -> std::io::Result<()> {
++        self.depth += 1;
++        self.has_value = false;
++        w.write_all(bracket)
++    }
++
++    fn close<W: ?Sized + std::io::Write>(&mut self, w: &mut W, bracket: &[u8]) -> std::io::Result<()> {
++        self.depth -= 1;
++        if self.has_value {
++            self.newline(w)?;
++        }
++        w.write_all(bracket)
++    }
++
++    fn entry<W: ?Sized + std::io::Write>(&self, w: &mut W, first: bool) -> std::io::Result<()> {
++        if !first {
++            w.write_all(self.item)?;
++        }
++        self.newline(w)
++    }
++}
++
++impl serde_json::ser::Formatter for PyLayout<'_> {
++    fn begin_array<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
++        self.open(w, b"[")
++    }
++    fn end_array<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
++        self.close(w, b"]")
++    }
++    fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
++        self.entry(w, first)
++    }
++    fn end_array_value<W: ?Sized + std::io::Write>(&mut self, _w: &mut W) -> std::io::Result<()> {
++        self.has_value = true;
++        Ok(())
++    }
++    fn begin_object<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
++        self.open(w, b"{")
++    }
++    fn end_object<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
++        self.close(w, b"}")
++    }
++    fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
++        self.entry(w, first)
++    }
++    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
++        w.write_all(self.key)
++    }
++    fn end_object_value<W: ?Sized + std::io::Write>(&mut self, _w: &mut W) -> std::io::Result<()> {
++        self.has_value = true;
++        Ok(())
++    }
+ }
+ 
+ fn strftime_now(fmt: String) -> Result<String, minijinja::Error> {
+@@ -564,6 +680,8 @@ pub fn apply_chat_template_to(
+             reasoning_effort => reasoning_effort_str,
+         })?)
+     } else {
++        // As JSON, whose keys keep their order: a struct reaches a template with its fields sorted by name.
++        let tools = tools.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>()?;
+         Ok(tmpl.render(context! {
+             messages => new_messages,
+             add_generation_prompt => add_generation_prompt,

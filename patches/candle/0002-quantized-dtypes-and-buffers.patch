@@ -1,0 +1,596 @@
+Subject: [candle] quantized-dtypes-and-buffers
+
+  The three i-quant dtypes a GGUF reader must name and size but has no codec for, the Metal buffer accessors oscar reaches quantized weights through, a weight quantised on the host placed once with no device storage made first, and the GGUF reader's staging as an anonymous mapping rather than a malloc block the allocator would keep dirty.
+
+Applies to: 0.10.2
+Files: 4
+
+---
+diff --git c/candle-core/src/quantized/metal.rs w/candle-core/src/quantized/metal.rs
+index ad746ef0..bcd4154f 100644
+--- c/candle-core/src/quantized/metal.rs
++++ w/candle-core/src/quantized/metal.rs
+@@ -34,86 +34,88 @@ impl QMetalStorage {
+     }
+ 
+     pub fn dequantize(&self, elem_count: usize) -> Result<MetalStorage> {
+-        use crate::quantized::k_quants::GgmlType;
++        // A float tensor on the device is already its dense form: the same bytes in the same buffer, so the
++        // result keeps the pool the tensor was placed in rather than taking a copy in the working pool.
++        if self.dtype == GgmlDType::F32 {
++            return Ok(MetalStorage::new(Arc::clone(&self.buffer), self.device.clone(), elem_count, DType::F32));
++        }
++        let buffer = self.device.new_buffer_with_data(&self.dequantize_host(elem_count)?)?;
++        Ok(MetalStorage::new(buffer, self.device.clone(), elem_count, DType::F32))
++    }
+ 
+-        let buffer = self.device.allocate_buffer(self.buffer.length())?;
+-        let blit = self.device.blit_command_encoder()?;
+-        blit.set_label("blit_to_cpu");
+-        blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+-        blit.end_encoding();
++    /// The values on the host, read from the tensor's own buffer: every buffer is shared with the host, so nothing is
++    /// placed on the device to carry them back, and a table built while decode has lent the working region cannot fail.
++    pub fn dequantize_host(&self, elem_count: usize) -> Result<Vec<f32>> {
++        use crate::quantized::k_quants::GgmlType;
+         self.device.wait_until_completed()?;
+         let mut out = vec![0.0; elem_count];
+         let block_len = elem_count / self.dtype.block_size();
+         match self.dtype {
+             GgmlDType::F32 => {
+-                let vec: Vec<f32> = read_to_vec(&buffer, block_len);
++                let vec: Vec<f32> = read_to_vec(&self.buffer, block_len);
+                 f32::to_float(&vec, &mut out);
+             }
+             GgmlDType::F16 => {
+-                let vec: Vec<half::f16> = read_to_vec(&buffer, block_len);
++                let vec: Vec<half::f16> = read_to_vec(&self.buffer, block_len);
+                 half::f16::to_float(&vec, &mut out);
+             }
+             GgmlDType::BF16 => {
+-                let vec: Vec<half::bf16> = read_to_vec(&buffer, block_len);
++                let vec: Vec<half::bf16> = read_to_vec(&self.buffer, block_len);
+                 half::bf16::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q4_0 => {
+-                let vec: Vec<crate::quantized::BlockQ4_0> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ4_0> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ4_0::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q4_1 => {
+-                let vec: Vec<crate::quantized::BlockQ4_1> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ4_1> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ4_1::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q5_0 => {
+-                let vec: Vec<crate::quantized::BlockQ5_0> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ5_0> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ5_0::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q5_1 => {
+-                let vec: Vec<crate::quantized::BlockQ5_1> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ5_1> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ5_1::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q8_0 => {
+-                let vec: Vec<crate::quantized::BlockQ8_0> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ8_0> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ8_0::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q8_1 => {
+-                let vec: Vec<crate::quantized::BlockQ8_1> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ8_1> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ8_1::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q2K => {
+-                let vec: Vec<crate::quantized::BlockQ2K> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ2K> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ2K::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q3K => {
+-                let vec: Vec<crate::quantized::BlockQ3K> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ3K> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ3K::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q4K => {
+-                let vec: Vec<crate::quantized::BlockQ4K> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ4K> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ4K::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q5K => {
+-                let vec: Vec<crate::quantized::BlockQ5K> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ5K> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ5K::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q6K => {
+-                let vec: Vec<crate::quantized::BlockQ6K> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ6K> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ6K::to_float(&vec, &mut out);
+             }
+             GgmlDType::Q8K => {
+-                let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
++                let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&self.buffer, block_len);
+                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
+             }
++            GgmlDType::Iq1S | GgmlDType::Iq2XXS | GgmlDType::Iq3XXS => {
++                crate::bail!("{:?} has no dequantiser", self.dtype)
++            }
+         }
+-
+-        let buffer = self.device.new_buffer_with_data(&out)?;
+-        Ok(MetalStorage::new(
+-            buffer,
+-            self.device.clone(),
+-            elem_count,
+-            DType::F32,
+-        ))
++        Ok(out)
+     }
+ 
+     pub fn quantize(&mut self, src: &MetalStorage) -> Result<()> {
+@@ -166,6 +168,7 @@ impl QMetalStorage {
+         Ok(())
+     }
+ 
++    #[allow(dead_code)]
+     pub fn quantize_onto(&mut self, src: &crate::CpuStorage) -> Result<()> {
+         // Quantization only happens on CPU for now.
+         let elem_count = src.as_slice::<f32>()?.len();
+@@ -220,6 +223,13 @@ impl QMetalStorage {
+         dst_shape.push(n);
+         let dst_shape = Shape::from(dst_shape);
+         let device = storage.device().clone();
++        // The mv kernels read src1 as f32; any other input dtype is silently misinterpreted byte-wise.
++        if storage.dtype() != DType::F32 {
++            crate::bail!(
++                "quantized matmul-mv expects f32 input, got {:?}",
++                storage.dtype()
++            );
++        }
+         let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul")?;
+         let encoder = device.command_encoder()?;
+         // In some cases it would be better to use the mm variant, though it has its drawbacks
+@@ -309,11 +319,46 @@ impl QMetalStorage {
+             [vec![1; 4 - src_shape.rank()], src_shape.dims().to_vec()].concat(),
+         );
+ 
++        // The tensor-op kernel reads half activations: the input is cast once
++        // for it (the rounding the tile kernel applies as it stages f32).
++        let nax =
++            candle_metal_kernels::quantized_matmul_mm_nax(device.device(), src1_l.dims()[2], k)
++                && self.dtype.has_dense_nax_kernel();
++        let half = if nax {
++            let half = device.new_buffer(src_shape.elem_count(), DType::F16, "qmatmul-half")?;
++            candle_metal_kernels::call_cast_contiguous(
++                device.device(),
++                &encoder,
++                device.kernels(),
++                "cast_f32_f16",
++                DType::F32.size_in_bytes(),
++                src_shape.elem_count(),
++                candle_metal_kernels::BufferOffset {
++                    buffer: storage.buffer(),
++                    offset_in_bytes: layout.start_offset() * DType::F32.size_in_bytes(),
++                },
++                &half,
++            )
++            .map_err(MetalError::from)?;
++            Some(half)
++        } else {
++            None
++        };
++        let (src1_buffer, src1_dtype, src1_offset) = match &half {
++            Some(half) => (half.as_ref(), DType::F16, 0),
++            None => (
++                storage.buffer(),
++                DType::F32,
++                layout.start_offset() * DType::F32.size_in_bytes(),
++            ),
++        };
++
+         candle_metal_kernels::call_quantized_matmul_mm_t(
+             device.device(),
+             &encoder,
+             device.kernels(),
+             self.dtype.into(),
++            nax,
+             src0_l.dims(),
+             &src0_stride,
+             &self.buffer,
+@@ -321,10 +366,10 @@ impl QMetalStorage {
+             &src1_l
+                 .stride()
+                 .iter()
+-                .map(|x| x * DType::F32.size_in_bytes())
++                .map(|x| x * src1_dtype.size_in_bytes())
+                 .collect::<Vec<_>>(),
+-            storage.buffer(),
+-            src1_l.start_offset() * storage.dtype().size_in_bytes(),
++            src1_buffer,
++            src1_offset,
+             dst_shape.dims(),
+             0,
+             &dst,
+@@ -335,16 +380,10 @@ impl QMetalStorage {
+         Ok((dst_storage, dst_shape))
+     }
+ 
++    /// The blocks' bytes, read where they are (see `dequantize_host`).
+     pub fn data(&self) -> Result<Vec<u8>> {
+-        let buffer = self.device.allocate_buffer(self.buffer.length())?;
+-        {
+-            let blit = self.device.blit_command_encoder()?;
+-            blit.set_label("blit_to_cpu");
+-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+-            blit.end_encoding();
+-        }
+         self.device.wait_until_completed()?;
+-        Ok(read_to_vec::<u8>(&buffer, self.storage_size_in_bytes()))
++        Ok(read_to_vec::<u8>(&self.buffer, self.storage_size_in_bytes()))
+     }
+ }
+ 
+@@ -352,7 +391,8 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
+     device: &MetalDevice,
+     data: &[T],
+ ) -> Result<QStorage> {
+-    let buffer = device.new_buffer_with_data(data)?;
++    // A weight: from the pool that never gives memory back.
++    let buffer = device.new_fixed_buffer_with_data(data)?;
+     let device = device.clone();
+     Ok(QStorage::Metal(QMetalStorage {
+         dtype: T::DTYPE,
+@@ -361,6 +401,13 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
+     }))
+ }
+ 
++/// A weight quantised on the host, as its blocks' bytes: placed once, from the pool that never gives memory
++/// back, as `load_quantized` places one read from a file.
++pub fn load_quantized_bytes(device: &MetalDevice, dtype: GgmlDType, data: &[u8]) -> Result<QStorage> {
++    let buffer = device.new_fixed_buffer_with_data(data)?;
++    Ok(QStorage::Metal(QMetalStorage { dtype, device: device.clone(), buffer }))
++}
++
+ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
+     let ptr = buffer.contents() as *const T;
+     assert!(!ptr.is_null());
+@@ -383,6 +430,10 @@ impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
+             GgmlDType::Q5K => candle_metal_kernels::GgmlDType::Q5K,
+             GgmlDType::Q6K => candle_metal_kernels::GgmlDType::Q6K,
+             GgmlDType::Q8K => candle_metal_kernels::GgmlDType::Q8K,
++            // No storage of these dtypes is ever built; `QStorage::from_data` refuses them at load.
++            GgmlDType::Iq1S | GgmlDType::Iq2XXS | GgmlDType::Iq3XXS => {
++                unreachable!("{value:?} has no kernel dtype")
++            }
+             GgmlDType::F16 => candle_metal_kernels::GgmlDType::F16,
+             GgmlDType::F32 => candle_metal_kernels::GgmlDType::F32,
+             GgmlDType::BF16 => candle_metal_kernels::GgmlDType::F16,
+diff --git c/candle-core/src/quantized/mod.rs w/candle-core/src/quantized/mod.rs
+index 8edd3544..88b05f35 100644
+--- c/candle-core/src/quantized/mod.rs
++++ w/candle-core/src/quantized/mod.rs
+@@ -2,6 +2,7 @@ use crate::{
+     backend::BackendStorage, CpuStorage, DType, Device, Result, Shape, Storage, Tensor, D,
+ };
+ use k_quants::*;
++use rayon::prelude::*;
+ use std::borrow::Cow;
+ 
+ #[cfg(target_feature = "avx2")]
+@@ -84,6 +85,10 @@ pub enum QStorage {
+ 
+ impl QStorage {
+     pub fn from_data(data: Cow<'_, [u8]>, device: &Device, dtype: GgmlDType) -> Result<Self> {
++        // The i-quants are recognised in a GGUF header so the tensor table walks, but no backend here has a codec.
++        if matches!(dtype, GgmlDType::Iq1S | GgmlDType::Iq2XXS | GgmlDType::Iq3XXS) {
++            crate::bail!("{dtype:?} tensors cannot be loaded: no dequantiser")
++        }
+         match device {
+             Device::Cpu => Ok(Self::Cpu(dtype.from_data(data))),
+             Device::Metal(d) => match dtype {
+@@ -102,6 +107,7 @@ impl QStorage {
+                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
+                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
++                GgmlDType::Iq1S | GgmlDType::Iq2XXS | GgmlDType::Iq3XXS => unreachable!(),
+             },
+             Device::Cuda(d) => match dtype {
+                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
+@@ -119,6 +125,7 @@ impl QStorage {
+                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
+                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
++                GgmlDType::Iq1S | GgmlDType::Iq2XXS | GgmlDType::Iq3XXS => unreachable!(),
+             },
+         }
+     }
+@@ -193,7 +200,6 @@ impl QStorage {
+             (QStorage::Cpu(storage), Storage::Cpu(src)) => {
+                 storage.from_float(src.as_slice::<f32>()?);
+             }
+-            (QStorage::Metal(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
+             (QStorage::Cuda(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
+             _ => crate::bail!("Invalid quantize source storage locations: not on cpu"),
+         }
+@@ -269,6 +275,18 @@ pub enum GgmlDType {
+     Q5K,
+     Q6K,
+     Q8K,
++    /// Read-only i-quant formats: nameable and measurable so a GGUF holding them parses, but with no codec here.
++    Iq1S,
++    Iq2XXS,
++    Iq3XXS,
++}
++
++impl GgmlDType {
++    /// The dense formats with a tensor-op GEMM instantiation; the rest take the f32 tile kernel.
++    pub fn has_dense_nax_kernel(self) -> bool {
++        use GgmlDType::*;
++        matches!(self, F32 | F16 | BF16 | Q8_0 | Q6K | Q5K | Q4K | Q3K | Q5_0 | Iq1S | Iq2XXS | Iq3XXS)
++    }
+ }
+ 
+ impl GgmlDType {
+@@ -288,6 +306,9 @@ impl GgmlDType {
+             13 => Self::Q5K,
+             14 => Self::Q6K,
+             15 => Self::Q8K,
++            16 => Self::Iq2XXS,
++            18 => Self::Iq3XXS,
++            19 => Self::Iq1S,
+             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
+             30 => Self::BF16,
+             _ => crate::bail!("unknown dtype for tensor {u}"),
+@@ -295,7 +316,7 @@ impl GgmlDType {
+         Ok(dtype)
+     }
+ 
+-    pub(crate) fn to_u32(self) -> u32 {
++    pub fn to_u32(self) -> u32 {
+         match self {
+             Self::F32 => 0,
+             Self::F16 => 1,
+@@ -311,6 +332,9 @@ impl GgmlDType {
+             Self::Q5K => 13,
+             Self::Q6K => 14,
+             Self::Q8K => 15,
++            Self::Iq2XXS => 16,
++            Self::Iq3XXS => 18,
++            Self::Iq1S => 19,
+             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
+             Self::BF16 => 30,
+         }
+@@ -333,6 +357,7 @@ impl GgmlDType {
+             Self::Q5K => Box::new(vec![BlockQ5K::zeros(); elem_count / BlockQ5K::BLCK_SIZE]),
+             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
+             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
++            Self::Iq1S | Self::Iq2XXS | Self::Iq3XXS => unimplemented!("{self:?} has no codec"),
+             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
+         }
+     }
+@@ -353,6 +378,7 @@ impl GgmlDType {
+             Self::Q5K => Box::new(as_t_slice::<BlockQ5K>(data).to_vec()),
+             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
+             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
++            Self::Iq1S | Self::Iq2XXS | Self::Iq3XXS => unimplemented!("{self:?} has no codec"),
+             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
+         }
+     }
+@@ -376,6 +402,10 @@ impl GgmlDType {
+             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
+             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
+             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
++            // f16 scale + packed indices, per QK_K weights.
++            Self::Iq1S => 50,
++            Self::Iq2XXS => 66,
++            Self::Iq3XXS => 98,
+         }
+     }
+ 
+@@ -390,7 +420,15 @@ impl GgmlDType {
+             Self::Q5_1 => k_quants::QK5_1,
+             Self::Q8_0 => k_quants::QK8_0,
+             Self::Q8_1 => k_quants::QK8_1,
+-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
++            Self::Q2K
++            | Self::Q3K
++            | Self::Q4K
++            | Self::Q5K
++            | Self::Q6K
++            | Self::Q8K
++            | Self::Iq1S
++            | Self::Iq2XXS
++            | Self::Iq3XXS => k_quants::QK_K,
+         }
+     }
+ }
+@@ -411,6 +449,10 @@ pub trait QuantizedType: Send + Sync {
+     fn size(&self) -> usize;
+ }
+ 
++/// Blocks quantised or dequantised per task: a block depends on its own elements alone, so a slice is split into runs
++/// of this many blocks for every core; 64 k-quant blocks are 16K elements, about a millisecond, so the split is unseen.
++const BLOCKS_A_RUN: usize = 64;
++
+ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
+     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
+         k_quants::matmul(mkn, lhs, self.as_slice(), dst)
+@@ -424,7 +466,9 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
+     }
+ 
+     fn from_float(&mut self, xs: &[f32]) {
+-        T::from_float(xs, self)
++        self.par_chunks_mut(BLOCKS_A_RUN)
++            .zip(xs.par_chunks(BLOCKS_A_RUN * T::BLCK_SIZE))
++            .for_each(|(ys, xs)| T::from_float(xs, ys));
+     }
+ 
+     fn from_float_imatrix(&mut self, xs: &[f32], imatrix_weights: &[f32], n_per_row: usize) {
+@@ -441,7 +485,9 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
+ 
+     fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
+         let mut ys = vec![0.0f32; elem_count];
+-        T::to_float(self.as_slice(), &mut ys);
++        self.par_chunks(BLOCKS_A_RUN)
++            .zip(ys.par_chunks_mut(BLOCKS_A_RUN * T::BLCK_SIZE))
++            .for_each(|(xs, ys)| T::to_float(xs, ys));
+         Ok(CpuStorage::F32(ys))
+     }
+ 
+@@ -481,6 +527,8 @@ impl QTensor {
+         Ok(Self { storage, shape })
+     }
+ 
++    /// Metal only: swap the backing buffer for an UNTRACKED copy
++
+     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
+         let shape = src.shape();
+         let block_size = dtype.block_size();
+@@ -598,9 +646,20 @@ impl QTensor {
+                 block_size
+             )
+         }
+-        // storage is on the `dev`, src is on `cpu`
+-        let mut storage = dev.qzeros(elem_count, dtype)?;
+-        storage.quantize_onto(&src.storage())?;
++        // Quantised on the host and placed once. On Metal, storage made on `dev` first would be a zeroed buffer
++        // the size of the weight, taken from the working pool only to be thrown away.
++        let storage = match dev {
++            Device::Metal(metal) => {
++                let mut host = Device::Cpu.qzeros(elem_count, dtype)?;
++                host.quantize_onto(&src.storage())?;
++                metal::load_quantized_bytes(metal, dtype, &host.data()?)?
++            }
++            _ => {
++                let mut storage = dev.qzeros(elem_count, dtype)?;
++                storage.quantize_onto(&src.storage())?;
++                storage
++            }
++        };
+         Ok(Self {
+             storage,
+             shape: shape.clone(),
+@@ -624,7 +683,12 @@ impl QTensor {
+     }
+ 
+     pub fn dequantize(&self, device: &Device) -> Result<Tensor> {
+-        let storage = self.storage.dequantize(self.shape.elem_count())?;
++        let elem_count = self.shape.elem_count();
++        // A device tensor read on the host is dequantised there, from its buffer (`QMetalStorage::dequantize_host`).
++        let storage = match (&self.storage, device) {
++            (QStorage::Metal(s), Device::Cpu) => Storage::Cpu(CpuStorage::F32(s.dequantize_host(elem_count)?)),
++            (s, _) => s.dequantize(elem_count)?,
++        };
+         let none = crate::op::BackpropOp::none();
+         crate::tensor::from_storage(storage, self.shape.clone(), none, false).to_device(device)
+     }
+@@ -654,6 +718,15 @@ impl QTensor {
+         self.storage.data()
+     }
+ 
++    /// `MTLBuffer`-backed storage (no GPU→CPU blit); `None` for CPU/CUDA.
++    #[cfg(feature = "metal")]
++    pub fn metal_storage(&self) -> Option<&metal::QMetalStorage> {
++        match &self.storage {
++            QStorage::Metal(s) => Some(s),
++            _ => None,
++        }
++    }
++
+     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+         match &self.storage {
+             QStorage::Cuda(s) => match (&*x.storage(), &*ids.storage()) {
+diff --git c/candle-core/src/quantized/dummy_metal.rs w/candle-core/src/quantized/dummy_metal.rs
+index 6f470e90..bbbd7566 100644
+--- c/candle-core/src/quantized/dummy_metal.rs
++++ w/candle-core/src/quantized/dummy_metal.rs
+@@ -24,6 +24,10 @@ impl QMetalStorage {
+         Err(Error::NotCompiledWithMetalSupport)
+     }
+ 
++    pub fn dequantize_host(&self, _elem_count: usize) -> Result<Vec<f32>> {
++        Err(Error::NotCompiledWithMetalSupport)
++    }
++
+     pub fn quantize(&mut self, _src: &MetalStorage) -> Result<()> {
+         Err(Error::NotCompiledWithMetalSupport)
+     }
+@@ -46,10 +50,6 @@ impl QMetalStorage {
+         Err(Error::NotCompiledWithMetalSupport)
+     }
+ 
+-    pub fn quantize_onto(&mut self, _src: &crate::CpuStorage) -> Result<()> {
+-        Err(Error::NotCompiledWithCudaSupport)
+-    }
+-
+     pub fn storage_size_in_bytes(&self) -> usize {
+         0
+     }
+@@ -85,3 +85,7 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
+ ) -> Result<super::QStorage> {
+     Err(Error::NotCompiledWithMetalSupport)
+ }
++
++pub fn load_quantized_bytes(_device: &MetalDevice, _dtype: super::GgmlDType, _data: &[u8]) -> Result<super::QStorage> {
++    Err(Error::NotCompiledWithMetalSupport)
++}
+diff --git c/candle-core/src/quantized/gguf_file.rs w/candle-core/src/quantized/gguf_file.rs
+index 197e43cf..365968c3 100644
+--- c/candle-core/src/quantized/gguf_file.rs
++++ w/candle-core/src/quantized/gguf_file.rs
+@@ -69,12 +69,24 @@ impl TensorInfo {
+         )
+         }
+         let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
+-        let mut raw_data = vec![0u8; size_in_bytes];
+-        reader.seek(std::io::SeekFrom::Start(tensor_data_offset + self.offset))?;
+-        reader.read_exact(&mut raw_data)?;
++        // The page-aligned run covering the tensor, read into an anonymous mapping: on an uncached descriptor a direct
++        // read, leaving no page behind as a read at the tensor's offset does (a malloc block's freed pages stay dirty).
++        const PAGE: u64 = 16384;
++        let start = tensor_data_offset + self.offset;
++        let head = (start % PAGE) as usize;
++        let span = (head + size_in_bytes).next_multiple_of(PAGE as usize);
++        let mut raw_data = memmap2::MmapMut::map_anon(span.max(1))?;
++        reader.seek(std::io::SeekFrom::Start(start - head as u64))?;
++        let mut got = 0;
++        while got < head + size_in_bytes {
++            match reader.read(&mut raw_data[got..span])? {
++                0 => crate::bail!("file ends inside tensor at byte {start}"),
++                n => got += n,
++            }
++        }
+         super::ggml_file::qtensor_from_ggml(
+             self.ggml_dtype,
+-            &raw_data,
++            &raw_data[head..head + size_in_bytes],
+             self.shape.dims().to_vec(),
+             device,
+         )
+@@ -313,7 +325,7 @@ impl Value {
+         Ok(v)
+     }
+ 
+-    fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
++    pub fn write<W: std::io::Write>(&self, w: &mut W) -> Result<()> {
+         match self {
+             &Self::U8(v) => w.write_u8(v)?,
+             &Self::I8(v) => w.write_i8(v)?,
+@@ -373,7 +385,7 @@ impl ValueType {
+         Ok(v)
+     }
+ 
+-    fn to_u32(self) -> u32 {
++    pub fn to_u32(self) -> u32 {
+         match self {
+             Self::U8 => 0,
+             Self::I8 => 1,
+@@ -481,7 +493,7 @@ impl Content {
+     }
+ }
+ 
+-fn write_string<W: std::io::Write>(w: &mut W, str: &str) -> Result<()> {
++pub fn write_string<W: std::io::Write>(w: &mut W, str: &str) -> Result<()> {
+     let bytes = str.as_bytes();
+     w.write_u64::<LittleEndian>(bytes.len() as u64)?;
+     w.write_all(bytes)?;

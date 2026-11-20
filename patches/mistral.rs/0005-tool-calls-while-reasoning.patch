@@ -1,0 +1,767 @@
+Subject: [mistral.rs] tool-calls-while-reasoning
+
+  Tool-call parsing while the model is still reasoning, the sampling-site hooks the eval recorder needs, and an ordered tool schema — the template renders it into the prompt, so a map whose iteration order varies per instance re-renders the tools block on every request and defeats prefix reuse.
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 5
+
+---
+diff --git c/mistralrs-core/src/tools/mod.rs w/mistralrs-core/src/tools/mod.rs
+index 00249a98..509bd8f6 100644
+--- c/mistralrs-core/src/tools/mod.rs
++++ w/mistralrs-core/src/tools/mod.rs
+@@ -9,10 +9,9 @@ use serde::de::{self, Deserializer, MapAccess, Visitor};
+ use serde_json::{Map, Value};
+ use std::collections::HashMap;
+ use std::fmt;
+-use std::sync::{Arc, OnceLock};
++use std::sync::{Arc, LazyLock, OnceLock};
+ use uuid::Uuid;
+ 
+-use crate::Pipeline;
+ use mistralrs_mcp::CalledFunction;
+ 
+ // Re-export the types so they're accessible as tools::Type
+@@ -256,7 +255,135 @@ fn parse_gemma4_tool_calls(message: &str) -> Result<Option<String>> {
+     Ok(Some(json))
+ }
+ 
+-fn process_model_specific_message(message: &str) -> Result<String> {
++/// `re`'s matches when they tile `body` with nothing but whitespace between and around them: a truncated
++/// stream leaves a dangling key or an unclosed value, and a call with arguments dropped is worse than none.
++fn tiling<'a>(re: &Regex, body: &'a str) -> Option<Vec<regex::Captures<'a>>> {
++    let mut end = 0;
++    let mut out = Vec::new();
++    for c in re.captures_iter(body) {
++        let m = c.get(0).unwrap();
++        if !body[end..m.start()].trim().is_empty() {
++            return None;
++        }
++        end = m.end();
++        out.push(c);
++    }
++    body[end..].trim().is_empty().then_some(out)
++}
++
++/// A value as the model wrote it: typed JSON where it parses, text otherwise.
++fn json_or_text(raw: &str) -> Value {
++    serde_json::from_str::<Value>(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
++}
++
++static QWEN_FN_RE: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"(?s)<function=(?P<name>[^>\s]+)>(?P<body>.*?)</function>").unwrap());
++static QWEN_PARAM_RE: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"(?s)<parameter=(?P<key>[^>\s]+)>(?P<val>.*?)</parameter>").unwrap());
++
++/// The XML tool-call form as the JSON object the matcher already parses. Only the template's one newline either
++/// side of a value comes off: the rest is what the model wrote and the history gives back. Typed JSON where it parses.
++fn parse_qwen_xml_function(inner: &str) -> Option<Value> {
++    let caps = QWEN_FN_RE.captures(inner)?;
++    let mut args = Map::new();
++    for p in QWEN_PARAM_RE.captures_iter(caps.name("body").unwrap().as_str()) {
++        let raw = p.name("val").unwrap().as_str();
++        let raw = raw.strip_prefix('\n').unwrap_or(raw);
++        let raw = raw.strip_suffix('\n').unwrap_or(raw);
++        args.insert(p.name("key").unwrap().as_str().to_string(), json_or_text(raw));
++    }
++    Some(serde_json::json!({
++        "name": caps.name("name").unwrap().as_str(),
++        "arguments": Value::Object(args),
++    }))
++}
++
++static GLM_PAIR_RE: LazyLock<Regex> = LazyLock::new(|| {
++    Regex::new(r"(?s)<arg_key>(?P<key>.*?)</arg_key>\s*<arg_value>(?P<val>.*?)</arg_value>").unwrap()
++});
++
++/// GLM's tool-call form: the function name as bare text, then `<arg_key>`/`<arg_value>` pairs. It shares Qwen's
++/// outer tag, so the name must look like an identifier or a Qwen-JSON body would parse here. A half call is nothing.
++fn parse_glm_tool_call(inner: &str) -> Option<Value> {
++    let split = inner.find("<arg_key>").unwrap_or(inner.len());
++    let name = inner[..split].trim();
++    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')) {
++        return None;
++    }
++    let mut args = Map::new();
++    for c in tiling(&GLM_PAIR_RE, &inner[split..])? {
++        let val = json_or_text(c.name("val").unwrap().as_str());
++        args.insert(c.name("key").unwrap().as_str().trim().to_string(), val);
++    }
++    Some(serde_json::json!({ "name": name, "arguments": Value::Object(args) }))
++}
++
++/// The inverse of the K3 template's `attr()`: `&` as `&amp;`, `"` as `&quot;`.
++fn unescape_kimi_attr(s: &str) -> String {
++    s.replace("&quot;", "\"").replace("&amp;", "&")
++}
++
++static KIMI_ARG_RE: LazyLock<Regex> = LazyLock::new(|| {
++    Regex::new(
++        r#"(?s)<\|open\|>argument key="(?P<key>[^"]*)" type="(?P<ty>[^"]*)"<\|sep\|>(?P<val>.*?)<\|close\|>argument<\|sep\|>"#,
++    )
++    .unwrap()
++});
++static KIMI_JSON_RE: LazyLock<Regex> = LazyLock::new(|| {
++    Regex::new(r#"(?s)^<\|open\|>json type="object"<\|sep\|>(?P<raw>.*?)<\|close\|>json<\|sep\|>$"#).unwrap()
++});
++static KIMI_TOOLS_RE: LazyLock<Regex> =
++    LazyLock::new(|| Regex::new(r"(?s)<\|open\|>tools<\|sep\|>(?P<body>.*?)<\|close\|>tools<\|sep\|>").unwrap());
++static KIMI_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
++    Regex::new(
++        r#"(?s)<\|open\|>call tool="(?P<name>[^"]*)" index="[^"]*"<\|sep\|>(?P<inner>.*?)<\|close\|>call<\|sep\|>"#,
++    )
++    .unwrap()
++});
++
++/// The arguments inside one K3 `call` block: `argument` tags (`type` names the JSON type; a string is verbatim,
++/// the rest JSON) or the template's raw `json` fallback block carrying a whole object.
++fn parse_kimi_call_args(inner: &str) -> Option<Value> {
++    let trimmed = inner.trim();
++    if trimmed.is_empty() {
++        return Some(Value::Object(Map::new()));
++    }
++    if let Some(c) = KIMI_JSON_RE.captures(trimmed) {
++        let raw = c.name("raw").unwrap().as_str().trim();
++        return serde_json::from_str::<Value>(raw).ok().filter(|v| v.is_object());
++    }
++    let mut args = Map::new();
++    for c in tiling(&KIMI_ARG_RE, inner)? {
++        let key = unescape_kimi_attr(c.name("key").unwrap().as_str());
++        let val_text = c.name("val").unwrap().as_str();
++        let val = if c.name("ty").unwrap().as_str() == "string" {
++            Value::String(val_text.to_string())
++        } else {
++            serde_json::from_str::<Value>(val_text.trim()).ok()?
++        };
++        args.insert(key, val);
++    }
++    Some(Value::Object(args))
++}
++
++/// Kimi K3 emits tool calls after its answer channel, in tags its template assembles from `<|open|>`/`<|sep|>`/
++/// `<|close|>`. As for GLM, every block complete and contiguous or no call: a truncated stream must not drop arguments.
++fn parse_kimi_tool_calls(message: &str) -> Option<Vec<Value>> {
++    let mut calls = Vec::new();
++    for block in KIMI_TOOLS_RE.captures_iter(message) {
++        for c in tiling(&KIMI_CALL_RE, block.name("body").unwrap().as_str())? {
++            let name = unescape_kimi_attr(c.name("name").unwrap().as_str());
++            if name.trim().is_empty() {
++                return None;
++            }
++            let args = parse_kimi_call_args(c.name("inner").unwrap().as_str())?;
++            calls.push(serde_json::json!({ "name": name, "arguments": args }));
++        }
++    }
++    (!calls.is_empty()).then_some(calls)
++}
++
++pub fn process_model_specific_message(message: &str) -> Result<String> {
+     static DEEPSEEK_REGEX: OnceLock<Regex> = OnceLock::new();
+     static QWEN_REGEX: OnceLock<Regex> = OnceLock::new();
+ 
+@@ -275,15 +402,35 @@ fn process_model_specific_message(message: &str) -> Result<String> {
+         }
+     }
+ 
++    // Kimi K3 places its calls after the response channel, so the raw completion carries them.
++    if message.contains("<|open|>tools<|sep|>") {
++        if let Some(calls) = parse_kimi_tool_calls(message) {
++            return Ok(match &calls[..] {
++                [one] => one.to_string(),
++                many => Value::Array(many.to_vec()).to_string(),
++            });
++        }
++    }
++
+     if let Some(message) = message.strip_prefix("<|python_tag|>") {
+         // Llama case
+         Ok(message.to_string())
+     } else if qwen_regex.is_match(message) {
+-        if let Some(caps) = qwen_regex.captures(message) {
+-            let inner = caps.name("inner").unwrap().as_str();
+-            return Ok(inner.trim().to_string());
+-        }
+-        Ok(message.to_string())
++        let inners: Vec<&str> = qwen_regex
++            .captures_iter(message)
++            .map(|c| c.name("inner").unwrap().as_str().trim())
++            .collect();
++        // Every block converts by one of the tag-sharing forms, parallel calls
++        // becoming an array; anything else falls back to the JSON form.
++        let parsed: Option<Vec<Value>> = inners
++            .iter()
++            .map(|i| parse_qwen_xml_function(i).or_else(|| parse_glm_tool_call(i)))
++            .collect();
++        return Ok(match parsed.as_deref() {
++            Some([one]) => one.to_string(),
++            Some(calls) if !calls.is_empty() => Value::Array(calls.to_vec()).to_string(),
++            _ => inners.first().copied().unwrap_or(message).to_string(),
++        });
+     } else if let Some(message) = message
+         .strip_prefix("[TOOL_CALLS][")
+         .and_then(|s| s.strip_suffix("]"))
+@@ -372,22 +519,6 @@ where
+     d.deserialize_any(ArgVisitor)
+ }
+ 
+-/// Fixup potentially broken JSON
+-/// 1) allow/handle arguments as maps in quotations
+-fn fix_broken_json(raw: &str) -> anyhow::Result<String> {
+-    // Only apply the fix if the first pattern matches - otherwise we might corrupt valid JSON
+-    // where arguments is a properly escaped string containing `}`
+-    if raw.contains(r#""arguments":"{"#) {
+-        // 1) Delete the opening quote that shouldn't be there
+-        let tmp = raw.replacen(r#""arguments":"{"#, r#""arguments":{"#, 1);
+-        // 2) Delete the closing quote that matches it
+-        let fixed = tmp.replacen(r#"}"}"#, r#"}}"#, 1);
+-        Ok(fixed)
+-    } else {
+-        Ok(raw.to_string())
+-    }
+-}
+-
+ impl ToolCallingMatcher {
+     pub fn new(tool_choice: ToolChoice) -> anyhow::Result<Self> {
+         Ok(Self { tool_choice })
+@@ -399,16 +530,11 @@ impl ToolCallingMatcher {
+     // If the start of a message could be a tool call, then it looks like an incomplete JSON of a given structure, e.g. `{"name": "foo", "param`.
+     //
+     // Returns a tuple of `(could_be_tool, is_complete_tool)`.
+-    pub fn prefix_could_be_tool(
+-        &self,
+-        _pipeline: &dyn Pipeline,
+-        message_prefix: &str,
+-    ) -> Result<(bool, bool)> {
++    pub fn prefix_could_be_tool(&self, message_prefix: &str) -> Result<(bool, bool)> {
+         if matches!(self.tool_choice, ToolChoice::None) {
+             return Ok((false, false));
+         }
+         let message_prefix = process_model_specific_message(message_prefix)?;
+-        let message_prefix = fix_broken_json(&message_prefix).unwrap();
+ 
+         // Check if the prefix could be a JSON serialization of any of the following types.
+         Ok([
+@@ -427,16 +553,11 @@ impl ToolCallingMatcher {
+         .unwrap_or((contains_tool_call_prefix(&message_prefix), false)))
+     }
+ 
+-    pub fn get_call(
+-        &self,
+-        _pipeline: &dyn Pipeline,
+-        message: &str,
+-    ) -> anyhow::Result<Vec<ToolCallResponse>> {
++    pub fn get_call(&self, message: &str) -> anyhow::Result<Vec<ToolCallResponse>> {
+         if matches!(self.tool_choice, ToolChoice::None) {
+             return Ok(Vec::new());
+         }
+         let message = process_model_specific_message(message)?;
+-        let message = fix_broken_json(&message).unwrap();
+ 
+         if let Ok(deser) = serde_json::from_str::<CalledFunctionParameters>(&message) {
+             let id = format!("call-{}", Uuid::new_v4());
+@@ -493,9 +614,29 @@ where
+     }
+ }
+ 
++/// The tag parser classifies calls inside a think block as reasoning, so a content-only parse would drop them.
++/// Content first, then the think block, then the raw completion for grammars placing calls outside both (Kimi K3).
++pub fn parse_tools_from_reasoning_output(
++    content: Option<&str>,
++    reasoning: Option<&str>,
++    raw: Option<&str>,
++    matcher: Option<Arc<ToolCallingMatcher>>,
++) -> anyhow::Result<(Option<String>, Vec<ToolCallResponse>)> {
++    let kept = content.map(str::to_string);
++    let Some(matcher) = matcher else {
++        return Ok((kept, Vec::new()));
++    };
++    for (channel, keep_content) in [(content, false), (reasoning, true), (raw, true)] {
++        let calls = channel.map(|c| matcher.get_call(c)).transpose()?.unwrap_or_default();
++        if !calls.is_empty() {
++            return Ok((kept.filter(|_| keep_content), calls));
++        }
++    }
++    Ok((kept, Vec::new()))
++}
++
+ /// Takes raw UTf8 text and parses any possible tool calls from it.
+ pub fn parse_text_tools<'a>(
+-    pipeline: &dyn Pipeline,
+     raw_text: &'a str,
+     matcher: Option<Arc<ToolCallingMatcher>>,
+ ) -> anyhow::Result<(Option<&'a str>, Vec<ToolCallResponse>)> {
+@@ -504,7 +645,7 @@ pub fn parse_text_tools<'a>(
+ 
+     if let Some(ref matcher) = matcher {
+         let calls = matcher
+-            .get_call(pipeline, raw_text)
++            .get_call(raw_text)
+             .map_err(candle_core::Error::msg)?;
+         if !calls.is_empty() {
+             text_new = None;
+@@ -518,6 +659,88 @@ pub fn parse_text_tools<'a>(
+ mod tests {
+     use super::*;
+ 
++    fn kimi(body: &str) -> String {
++        format!("thinking<|close|>think<|sep|><|open|>response<|sep|>done<|close|>response<|sep|><|open|>tools<|sep|>{body}<|close|>tools<|sep|><|close|>message<|sep|>")
++    }
++
++    #[test]
++    fn kimi_typed_values_and_parallel_calls() {
++        let msg = kimi(
++            "<|open|>call tool=\"a\" index=\"1\"<|sep|>\
++             <|open|>argument key=\"f\" type=\"number\"<|sep|>2.0<|close|>argument<|sep|>\
++             <|open|>argument key=\"b\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|>\
++             <|open|>argument key=\"z\" type=\"null\"<|sep|>null<|close|>argument<|sep|>\
++             <|open|>argument key=\"obj\" type=\"object\"<|sep|>{\"k\": \"v\"}<|close|>argument<|sep|>\
++             <|open|>argument key=\"arr\" type=\"array\"<|sep|>[1, \"two\"]<|close|>argument<|sep|>\
++             <|close|>call<|sep|>\
++             <|open|>call tool=\"b\" index=\"2\"<|sep|><|close|>call<|sep|>",
++        );
++        let result = process_model_specific_message(&msg).unwrap();
++        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
++        assert_eq!(parsed.len(), 2);
++        assert_eq!(parsed[0].parameters["f"], 2.0);
++        assert_eq!(parsed[0].parameters["b"], true);
++        assert_eq!(parsed[0].parameters["z"], serde_json::Value::Null);
++        assert_eq!(parsed[0].parameters["obj"]["k"], "v");
++        assert_eq!(parsed[0].parameters["arr"][1], "two");
++        assert_eq!(parsed[1].name, "b");
++        assert_eq!(parsed[1].parameters, serde_json::json!({}));
++    }
++
++    #[test]
++    fn kimi_string_value_is_verbatim_not_json() {
++        // type="string" values are raw text — JSON-looking text stays text.
++        let msg = kimi(
++            "<|open|>call tool=\"t\" index=\"1\"<|sep|>\
++             <|open|>argument key=\"q\" type=\"string\"<|sep|>{\"not\": \"parsed\"}<|close|>argument<|sep|>\
++             <|close|>call<|sep|>",
++        );
++        let result = process_model_specific_message(&msg).unwrap();
++        let parsed: CalledFunctionParameters = serde_json::from_str(&result).unwrap();
++        assert_eq!(parsed.parameters["q"], "{\"not\": \"parsed\"}");
++    }
++
++    #[test]
++    fn kimi_raw_json_block() {
++        let msg = kimi(
++            "<|open|>call tool=\"t\" index=\"1\"<|sep|>\
++             <|open|>json type=\"object\"<|sep|>{\"city\": \"Paris\"}<|close|>json<|sep|>\
++             <|close|>call<|sep|>",
++        );
++        let result = process_model_specific_message(&msg).unwrap();
++        let parsed: CalledFunctionParameters = serde_json::from_str(&result).unwrap();
++        assert_eq!(parsed.parameters["city"], "Paris");
++    }
++
++    #[test]
++    fn kimi_escaped_attributes_unescape() {
++        let msg = kimi(
++            "<|open|>call tool=\"t\" index=\"1\"<|sep|>\
++             <|open|>argument key=\"we&quot;ird&amp;\" type=\"string\"<|sep|>v<|close|>argument<|sep|>\
++             <|close|>call<|sep|>",
++        );
++        let result = process_model_specific_message(&msg).unwrap();
++        let parsed: CalledFunctionParameters = serde_json::from_str(&result).unwrap();
++        assert_eq!(parsed.parameters["we\"ird&"], "v");
++    }
++
++    #[test]
++    fn kimi_junky_blocks_surface_no_call() {
++        // junk between two call blocks
++        let junky = kimi(
++            "<|open|>call tool=\"a\" index=\"1\"<|sep|><|close|>call<|sep|>\
++             JUNK<|open|>call tool=\"b\" index=\"2\"<|sep|><|close|>call<|sep|>",
++        );
++        assert_eq!(process_model_specific_message(&junky).unwrap(), junky);
++        // typed non-string value that is not valid JSON
++        let bad = kimi(
++            "<|open|>call tool=\"a\" index=\"1\"<|sep|>\
++             <|open|>argument key=\"n\" type=\"number\"<|sep|>not-a-number<|close|>argument<|sep|>\
++             <|close|>call<|sep|>",
++        );
++        assert_eq!(process_model_specific_message(&bad).unwrap(), bad);
++    }
++
+     #[test]
+     fn gemma4_single_tool_call() {
+         let msg = "<|tool_call>call:get_weather{city:<|\"|\x3eLondon<|\"|\x3e,units:<|\"|\x3ecelsius<|\"|\x3e}<tool_call|>";
+diff --git c/mistralrs-mcp/src/tools.rs w/mistralrs-mcp/src/tools.rs
+index e804df3d..ab73d947 100644
+--- c/mistralrs-mcp/src/tools.rs
++++ w/mistralrs-mcp/src/tools.rs
+@@ -28,14 +28,18 @@ pub enum ToolType {
+     Function,
+ }
+ 
+-/// Function definition for a tool
++/// Function definition for a tool, its fields in the OpenAI schema's order: the chat template renders it as this JSON.
+ #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+ #[derive(Clone, Debug, Deserialize, Serialize)]
+ pub struct Function {
+-    pub description: Option<String>,
+     pub name: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub description: Option<String>,
+     #[serde(alias = "arguments")]
+-    pub parameters: Option<HashMap<String, Value>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    /// An ordered map, not a `HashMap`: the chat template renders this into the prompt, and `HashMap` order varies
++    /// per instance, so identical tools would render differently and no prompt prefix would ever match.
++    pub parameters: Option<serde_json::Map<String, Value>>,
+ }
+ 
+ /// Tool definition
+diff --git c/mistralrs-mcp/src/client.rs w/mistralrs-mcp/src/client.rs
+index 787bb1a2..c09bd76c 100644
+--- c/mistralrs-mcp/src/client.rs
++++ w/mistralrs-mcp/src/client.rs
+@@ -506,11 +506,11 @@ impl McpClient {
+     /// Convert MCP tool input schema to Tool parameters format
+     fn convert_mcp_schema_to_parameters(
+         schema: &serde_json::Value,
+-    ) -> Option<HashMap<String, serde_json::Value>> {
++    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+         // MCP tools can have various schema formats, we'll try to convert common ones
+         match schema {
+             serde_json::Value::Object(obj) => {
+-                let mut params = HashMap::new();
++                let mut params = serde_json::Map::new();
+ 
+                 // If it's a JSON schema object, extract properties
+                 if let Some(properties) = obj.get("properties") {
+diff --git c/mistralrs-core/src/search/mod.rs w/mistralrs-core/src/search/mod.rs
+index 8a060c78..18e1d65f 100644
+--- c/mistralrs-core/src/search/mod.rs
++++ w/mistralrs-core/src/search/mod.rs
+@@ -1,4 +1,3 @@
+-use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+ pub mod rag;
+@@ -125,7 +124,7 @@ pub struct ExtractFunctionParameters {
+ 
+ pub fn get_search_tools(web_search_options: &WebSearchOptions) -> Result<Vec<Tool>> {
+     let search_tool = {
+-        let parameters: HashMap<String, Value> = serde_json::from_value(json!({
++        let parameters: serde_json::Map<String, Value> = serde_json::from_value(json!({
+             "type": "object",
+             "properties": {
+                 "query": {
+@@ -160,7 +159,7 @@ pub fn get_search_tools(web_search_options: &WebSearchOptions) -> Result<Vec<Too
+     };
+ 
+     let extract_tool = {
+-        let parameters: HashMap<String, Value> = serde_json::from_value(json!({
++        let parameters: serde_json::Map<String, Value> = serde_json::from_value(json!({
+             "type": "object",
+             "properties": {
+                 "url": {
+diff --git c/mistralrs-core/src/pipeline/sampling.rs w/mistralrs-core/src/pipeline/sampling.rs
+index 64260645..40240117 100644
+--- c/mistralrs-core/src/pipeline/sampling.rs
++++ w/mistralrs-core/src/pipeline/sampling.rs
+@@ -46,17 +46,18 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+         .tok_trie()
+         .decode_ext(&[logprobs.token], include_special);
+     seq.add_token(logprobs.clone(), completion_bytes, &is_done);
++    crate::live::completion_token();
+ 
+     // If we can have a tool and we got a tool, stop the sequence early.
+     // Doesn't conflict with the logic below because it does the same thing anyway.
+     if let Some(ref t) = seq.tools {
+         if let Ok(Some(ref d)) = seq.peek_delta() {
+             let (_tool_use_still_possible, tool_use_is_done) =
+-                t.prefix_could_be_tool(this, d.as_str())?;
++                t.prefix_could_be_tool(d.as_str())?;
+ 
+             if tool_use_is_done
+                 && matches!(
+-                    parse_text_tools(this, d, seq.tools.clone()),
++                    parse_text_tools(d, seq.tools.clone()),
+                     Ok((None, _tools))
+                 )
+             {
+@@ -73,7 +74,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+         if let Some(ref t) = seq.tools {
+             if let Ok(Some(ref d)) = seq.peek_delta() {
+                 (tool_use_still_possible, tool_use_is_done) =
+-                    t.prefix_could_be_tool(this, d.as_str())?;
++                    t.prefix_could_be_tool(d.as_str())?;
+             }
+         };
+ 
+@@ -98,7 +99,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+                             )
+                         } else {
+                             let (text_new, _) =
+-                                parse_text_tools(this, delta.as_str(), seq.tools.clone())
++                                parse_text_tools(delta.as_str(), seq.tools.clone())
+                                     .map_err(candle_core::Error::msg)?;
+                             (text_new.map(ToString::to_string), None)
+                         };
+@@ -130,15 +131,36 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+                             }
+                         } else {
+                             // Not in Harmony mode - parse text for tool calls
+-                            let (_, tool_calls) =
+-                                parse_text_tools(this, delta.as_str(), seq.tools.clone())
++                            let (_, mut tool_calls) =
++                                parse_text_tools(delta.as_str(), seq.tools.clone())
+                                     .map_err(candle_core::Error::msg)?;
++                            // A grammar that puts calls after the answer channel (Kimi K3) never shows
++                            // them whole in one delta; at the end the full completion has them.
++                            if tool_calls.is_empty()
++                                && is_done.is_some()
++                                && seq.reasoning_mode().is_some()
++                            {
++                                let full = String::from_utf8_lossy(seq.completion_bytes());
++                                tool_calls = parse_text_tools(full.as_ref(), seq.tools.clone())
++                                    .map_err(candle_core::Error::msg)?
++                                    .1;
++                            }
+                             if !tool_calls.is_empty() {
+                                 is_done = Some(StopReason::ToolCalls);
+                             }
+                             tool_calls
+                         };
+ 
++                        // The parser's buffer holds the raw tool text; emitting it
++                        // would stream the call's XML beside the parsed form.
++                        let content_delta = if !tool_calls.is_empty()
++                            && seq.reasoning_mode().is_some()
++                        {
++                            None
++                        } else {
++                            content_delta
++                        };
++
+                         seq.add_streaming_chunk_choice_to_group(crate::ChunkChoice {
+                             delta: crate::Delta {
+                                 content: fixup_sentencepiece!(Option content_delta),
+@@ -198,6 +220,10 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+                 .is_err()
+             {
+                 // If we can't send the response, cancel the sequence
++                tracing::info!(
++                    "canceled sequence {}: streaming send failed, client disconnected",
++                    seq.id()
++                );
+                 seq.set_state(crate::sequence::SequenceState::Done(
+                     crate::sequence::StopReason::Canceled,
+                 ));
+@@ -208,18 +234,16 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+         // Handle Done state regardless of tool detection - must be outside the tool_use check
+         // to ensure sequence completes even when tool detection thinks output might be a tool call
+         if let Some(reason) = is_done {
+-            if use_prefix_cacher {
+-                let recurrent_snapshots = if this.cache().is_hybrid() {
+-                    seq.recurrent_state_idx()
+-                        .and_then(|idx| this.cache().hybrid().snapshot_recurrent_state(idx).ok())
+-                } else {
+-                    None
+-                };
+-                prefix_cacher.add_sequence(seq, recurrent_snapshots);
+-                prefix_cacher.evict_caches()?;
+-            }
++            // Done first, cache after — see the non-streaming path below.
+             seq.set_state(crate::sequence::SequenceState::Done(reason));
+             this.reset_non_granular_state();
++            if use_prefix_cacher {
++                prefix_cacher.add_sequence(seq, this.tokenizer().as_deref(), |seq| {
++                    let idx = seq.recurrent_state_idx().filter(|_| this.cache().is_hybrid())?;
++                    this.cache().hybrid().snapshot_recurrent_state(idx).ok()
++                });
++                prefix_cacher.evict_caches()?;
++            }
+         }
+     } else if let Some(mut reason) = is_done {
+         /*
+@@ -293,6 +317,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+                     let final_content = seq.get_response_content();
+                     let reasoning = seq.get_reasoning_content();
+ 
++                    let mut return_content = final_content.clone();
+                     let tool_calls = if mode == crate::reasoning_parsers::ReasoningMode::Harmony {
+                         let harmony_tool_calls = seq.get_harmony_tool_calls();
+                         harmony_tool_calls
+@@ -308,18 +333,24 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+                                 },
+                             })
+                             .collect()
+-                    } else if let Some(ref content) = final_content {
+-                        let (_, tc) = parse_text_tools(this, content.as_str(), seq.tools.clone())
+-                            .map_err(candle_core::Error::msg)?;
+-                        tc
+                     } else {
+-                        vec![]
++                        // Fall back to the think block, so calls emitted while reasoning still reach the client.
++                        let (kept_content, tc) =
++                            crate::tools::parse_tools_from_reasoning_output(
++                                final_content.as_deref(),
++                                reasoning.as_deref(),
++                                Some(text.as_str()),
++                                seq.tools.clone(),
++                            )
++                            .map_err(candle_core::Error::msg)?;
++                        return_content = kept_content;
++                        tc
+                     };
+ 
+-                    (final_content, tool_calls, reasoning)
++                    (return_content, tool_calls, reasoning)
+                 } else {
+                     let (text_new, tool_calls) =
+-                        parse_text_tools(this, text.as_str(), seq.tools.clone())
++                        parse_text_tools(text.as_str(), seq.tools.clone())
+                             .map_err(candle_core::Error::msg)?;
+                     (text_new.map(ToString::to_string), tool_calls, None)
+                 };
+@@ -350,22 +381,12 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+                 seq.add_completion_choice_to_group(choice);
+             }
+ 
+-            if use_prefix_cacher {
+-                let recurrent_snapshots = if this.cache().is_hybrid() {
+-                    seq.recurrent_state_idx()
+-                        .and_then(|idx| this.cache().hybrid().snapshot_recurrent_state(idx).ok())
+-                } else {
+-                    None
+-                };
+-                prefix_cacher.add_sequence(seq, recurrent_snapshots);
+-                prefix_cacher.evict_caches()?;
+-            }
+-
+             // Ensure timing info is synced to group before sending response
+             seq.update_time_info();
+ 
+             let group = seq.get_mut_group();
+-            if group.is_chat {
++            // A closed channel is a disconnected client, not a model error; the sequence is done, so drop the response.
++            let send_result = if group.is_chat {
+                 group
+                     .maybe_send_chat_done_response(
+                         crate::ChatCompletionResponse {
+@@ -380,7 +401,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+                         seq.responder(),
+                     )
+                     .await
+-                    .map_err(candle_core::Error::msg)?;
++                    .map_err(|e| e.to_string())
+             } else {
+                 group
+                     .maybe_send_completion_done_response(
+@@ -396,7 +417,23 @@ pub(crate) async fn finish_or_add_toks_to_seq(
+                         seq.responder(),
+                     )
+                     .await
+-                    .map_err(candle_core::Error::msg)?;
++                    .map_err(|e| e.to_string())
++            };
++            if send_result.is_err() {
++                tracing::info!(
++                    "client disconnected before final response delivered (sequence {})",
++                    seq.id()
++                );
++            }
++            drop(group);
++
++            // After the response is on the wire: the snapshot's device-to-CPU copies sync the queue per tensor.
++            if use_prefix_cacher {
++                prefix_cacher.add_sequence(seq, this.tokenizer().as_deref(), |seq| {
++                    let idx = seq.recurrent_state_idx().filter(|_| this.cache().is_hybrid())?;
++                    this.cache().hybrid().snapshot_recurrent_state(idx).ok()
++                });
++                prefix_cacher.evict_caches()?;
+             }
+         }
+         this.reset_non_granular_state();
+@@ -416,6 +453,10 @@ pub async fn sample_and_add_toks(
+     let seqs_len = seqs.len();
+     debug_assert_eq!(logits_seq.len(), seqs_len);
+ 
++    // Hold this step's logits only while a trace is recording, for the recorder below to pair with the token.
++    let eval_rec = logit_trace().filter(|_| seqs_len == 1);
++    let eval_logits = eval_rec.and_then(|_| logits_seq.first().cloned());
++
+     let use_async_pool = seqs_len > 1;
+ 
+     let sampling_futures: Vec<_> = std::iter::zip(logits_seq, seqs.iter_mut())
+@@ -435,7 +476,14 @@ pub async fn sample_and_add_toks(
+     let sampled_vec = futures::future::join_all(sampling_futures).await;
+ 
+     for (sampled, seq) in std::iter::zip(sampled_vec, seqs.iter_mut()) {
+-        let next_token = crate::handle_seq_error_stateaware_ok!(sampled, seq);
++        let mut next_token = crate::handle_seq_error_stateaware_ok!(sampled, seq);
++
++        if let (Some(d), Some(logits)) = (eval_rec, eval_logits.as_ref()) {
++            if let Some(forced) = d.note_step_logits(next_token.token, logits, seq.is_prompt()) {
++                // The recording's token, so the sequence follows the base trajectory; decoding reads `token`.
++                next_token.token = forced;
++            }
++        }
+ 
+         let metadata = this.get_metadata();
+         let eos_tok = if disable_eos_stop {
+@@ -465,7 +513,7 @@ pub async fn sample_sequence(
+ 
+     let sampler = seq.sampler();
+     let ctx_clone = seq.get_toks().to_vec();
+-    let rng_clone = rng.clone();
++    let rng_clone = seq.rng().unwrap_or_else(|| rng.clone());
+     let logits_clone = logits.clone();
+     let first_lobprobs_response = if use_async_pool {
+         tokio_rayon::spawn(move || {
+@@ -523,7 +571,7 @@ pub async fn sample_sequence(
+             let new_logits = (&logits + Tensor::from_slice(&acc, acc.len(), logits.device())?)?;
+ 
+             let ctx_clone = seq.get_toks().to_vec();
+-            let rng_clone = rng.clone();
++            let rng_clone = seq.rng().unwrap_or_else(|| rng.clone());
+             let sampler = seq.sampler();
+             if use_async_pool {
+                 tokio_rayon::spawn(move || {
+@@ -611,3 +659,41 @@ pub async fn sample_target_sequence_speculative(
+     }
+     Ok(sampled)
+ }
++
++// The seam a harness takes each step's sampled token and logits through; none installed, sampling runs unchanged.
++use std::sync::OnceLock;
++
++pub trait SampleTrace: Send + Sync {
++    /// Asked first: keeping a handle on the step's logits costs a clone.
++    fn records_step_logits(&self) -> bool {
++        false
++    }
++
++    /// `Some(forced)` under teacher-forced replay: the caller adds `forced` in place of the token it
++    /// sampled. `prompt` marks the prompt step's sample, the generation's step 0.
++    fn note_step_logits(&self, _sampled: u32, _logits: &Tensor, _prompt: bool) -> Option<u32> {
++        None
++    }
++
++    /// Whether the trace forces tokens: a device-sampled step then drains at its boundary, since a
++    /// queued step's token has fed the next forward before the host reads it.
++    fn forces_tokens(&self) -> bool {
++        false
++    }
++}
++
++/// The installed trace while it records each step's logits.
++pub fn logit_trace() -> Option<&'static Arc<dyn SampleTrace>> {
++    global_sample_trace().filter(|t| t.records_step_logits())
++}
++
++static GLOBAL_TRACE: OnceLock<Arc<dyn SampleTrace>> = OnceLock::new();
++
++/// First caller wins; intended for model-load time, before the first step.
++pub fn set_global_sample_trace(trace: Arc<dyn SampleTrace>) {
++    let _ = GLOBAL_TRACE.set(trace);
++}
++
++pub fn global_sample_trace() -> Option<&'static Arc<dyn SampleTrace>> {
++    GLOBAL_TRACE.get()
++}

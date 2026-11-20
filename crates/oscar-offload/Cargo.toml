@@ -1,0 +1,37 @@
+[package]
+name = "oscar-offload"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+# Expert offloading: the banks of slots, their segments, the working regions,
+# the machine's bounds and the NVMe readers.
+
+[dependencies]
+tracing = { workspace = true }
+# The pools are candle's one allocator, so the crate that owns memory owns
+# the face candle allocates through.
+candle-metal-kernels = { path = "../../third_party/oscar-candle/candle-metal-kernels" }
+# The test device every crate's GPU tests share.
+candle-core = { path = "../../third_party/oscar-candle/candle-core", features = ["metal"] }
+libc = "0.2"
+thiserror = "1"
+objc2 = "0.6"
+objc2-metal = { version = "0.3.1", features = [
+    "MTLDevice",
+    "MTLBuffer",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLComputePipeline",
+    "MTLComputeCommandEncoder",
+    "MTLLibrary",
+    "MTLResource",
+    "MTLPixelFormat",
+    "MTLTypes",
+] }
+
+[lib]
+path = "src/lib.rs"

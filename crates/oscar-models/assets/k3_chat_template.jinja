@@ -1,0 +1,351 @@
+{#- Kimi-K3 chat template — transcribed from the shipped 679-line original.
+
+    The original is a Jinja *program*: it implements a recursive-descent JSON
+    parser so it can re-serialise tool-call arguments handed over as JSON
+    STRINGS. That parser cannot run under the fork's minijinja — `int(base=16)`
+    does not exist, so `\uXXXX` unescaping is unfixable in-template — and is
+    not transcribed. It is also unnecessary here: the serve layer parses
+    argument strings into order-preserving maps before the template runs
+    (chat_completion.rs), so a string reaching the arguments branch below is
+    exactly the original's parse-failure case, rendered as its raw json block.
+    Everything else — text path and tool machinery — is transcribed VERBATIM
+    from the original's own macros so the model sees the token sequence it was
+    trained on. Structure preserved from the original:
+
+      otag(t, attrs) = '<|open|>'  + t + ' k="v"…' + '<|sep|>'
+      ctag(t)        = '<|close|>' + t             + '<|sep|>'
+      every message ends with '<|end_of_msg|>'
+      assistant bodies wrap content in think/response channels; tool calls
+        follow the response channel inside the assistant message
+      tool declarations are a system message of type "tool-declare"
+      tool results are role="tool" messages, re-ordered to the calling
+        assistant's tool_calls order where their ids resolve
+
+    Deliberately NOT supported, and loud rather than silently wrong:
+    media/images. Deliberate divergences from the original: unknown roles and
+    non-object messages raise here where the original skips them silently, and
+    an arguments STRING always renders as the raw json block (the original
+    additionally in-template-parses valid JSON strings — a case the serve
+    layer's pre-parse makes unreachable).
+-#}
+{%- macro attr(k, v) -%}
+{{- ' ' + k + '="' + (v | string | replace('&', '&amp;') | replace('"', '&quot;')) + '"' -}}
+{%- endmacro -%}
+
+{%- macro otag(tag, attrs=[]) -%}
+{{- '<|open|>' + tag -}}
+{%- for a in attrs -%}{{- attr(a[0], a[1]) -}}{%- endfor -%}
+{{- '<|sep|>' -}}
+{%- endmacro -%}
+
+{%- macro ctag(tag) -%}
+{{- '<|close|>' + tag + '<|sep|>' -}}
+{%- endmacro -%}
+
+{%- macro render_content(c) -%}
+{%- if c is string -%}
+{{- c -}}
+{%- elif c is mapping and (c | length) == 0 -%}
+{%- elif c is mapping -%}
+{{- raise_exception('Kimi K3 message content must be a string or a list of content parts.') -}}
+{%- elif c is defined and c is not none -%}
+{%- for part in c -%}
+{%- if part is not mapping or 'type' not in part -%}
+{{- raise_exception('Kimi K3 content parts must be objects carrying a `type`.') -}}
+{%- elif part['type'] in ['image', 'image_url'] -%}
+{{- raise_exception('Kimi K3: this build renders text only; image parts are not supported.') -}}
+{%- elif 'text' not in part -%}
+{{- raise_exception('Kimi K3 non-image content parts require a `text`.') -}}
+{%- else -%}
+{{- part['text'] -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro internal_msg(kind, body) -%}
+{{- otag('message', [['role', 'system'], ['type', kind]]) -}}
+{{- body | trim -}}
+{{- ctag('message') -}}
+{{- '<|end_of_msg|>' -}}
+{%- endmacro -%}
+
+{%- macro numstr(v) -%}
+{%- set s = v | tojson -%}
+{%- if v is float and '.' not in s and 'e' not in s and 'E' not in s
+       and 'n' not in s and 'N' not in s -%}
+{{- s ~ '.0' -}}
+{%- else -%}
+{{- s -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro jkey(k) -%}
+{%- if k is string -%}
+{{- k | tojson -}}
+{%- elif k is boolean -%}
+{{- ('true' if k else 'false') | tojson -}}
+{%- elif k is none -%}
+{{- 'null' | tojson -}}
+{%- elif k is number -%}
+{{- numstr(k) | tojson -}}
+{%- else -%}
+{{- raise_exception('keys must be str, int, float, bool or None') -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro jdump(v) -%}
+{%- if v is mapping -%}
+{{- '{' -}}
+{%- for k, val in v | dictsort(case_sensitive=true) -%}
+{%- if not loop.first -%}{{- ',' -}}{%- endif -%}
+{{- jkey(k) -}}{{- ':' -}}{{- jdump(val) -}}
+{%- endfor -%}
+{{- '}' -}}
+{%- elif v is string or v is boolean or v is none or v is number -%}
+{{- numstr(v) -}}
+{%- elif v is undefined -%}
+{{- 'null' -}}
+{%- else -%}
+{{- '[' -}}
+{%- for item in v -%}
+{%- if not loop.first -%}{{- ',' -}}{%- endif -%}
+{{- jdump(item) -}}
+{%- endfor -%}
+{{- ']' -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro jdumpsp(v) -%}
+{%- if v is mapping -%}
+{{- '{' -}}
+{%- for k, val in v | items -%}
+{%- if not loop.first -%}{{- ', ' -}}{%- endif -%}
+{{- jkey(k) -}}{{- ': ' -}}{{- jdumpsp(val) -}}
+{%- endfor -%}
+{{- '}' -}}
+{%- elif v is string or v is boolean or v is none or v is number -%}
+{{- numstr(v) -}}
+{%- elif v is undefined -%}
+{{- 'null' -}}
+{%- else -%}
+{{- '[' -}}
+{%- for item in v -%}
+{%- if not loop.first -%}{{- ', ' -}}{%- endif -%}
+{{- jdumpsp(item) -}}
+{%- endfor -%}
+{{- ']' -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro xtype(v) -%}
+{%- if v is boolean -%}boolean
+{%- elif v is none -%}null
+{%- elif v is number -%}number
+{%- elif v is string -%}string
+{%- elif v is mapping -%}object
+{%- else -%}array
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro xvalue(v) -%}
+{%- if v is string -%}{{- v -}}{%- else -%}{{- jdumpsp(v) -}}{%- endif -%}
+{%- endmacro -%}
+
+{%- macro render_tool_declare(tool_list, dynamic=false) -%}
+{{- otag('message', [['role', 'system'], ['type', 'tool-declare']]) -}}
+{%- if dynamic -%}
+{{- '## New Tools Available\nThe system dynamically extends the toolset via lazy-loading.\nYou have access to all existing and extended tools.\nHere are the specs for the extended tools.\n\n```json\n' -}}
+{%- else -%}
+{{- '# Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n' -}}
+{%- endif -%}
+{{- jdump(tool_list) -}}
+{{- '\n```' -}}
+{{- ctag('message') -}}
+{{- '<|end_of_msg|>' -}}
+{%- endmacro -%}
+
+{%- macro render_tool_msg(m, idx, forced, tcalls) -%}
+{%- set r = namespace(name = none) -%}
+{%- if forced is not none -%}
+{%- set r.name = forced -%}
+{%- elif 'tool' in m -%}
+{%- set r.name = m['tool'] -%}
+{%- else -%}
+{%- set r.name = m.get('name') -%}
+{%- endif -%}
+{%- if r.name is none and tcalls and idx <= (tcalls | length) -%}
+{%- set tc = tcalls[idx - 1] -%}
+{%- set fn = tc['function'] if ('function' in tc) else tc -%}
+{%- set r.name = fn['name'] -%}
+{%- endif -%}
+{%- if r.name is not defined or r.name is none -%}
+{{- raise_exception('Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, or match a preceding assistant tool_call by order.') -}}
+{%- endif -%}
+{{- otag('message', [['role', 'tool'], ['tool', r.name], ['index', idx]]) -}}
+{{- render_content(m.get('content')) -}}
+{{- ctag('message') -}}
+{{- '<|end_of_msg|>' -}}
+{%- endmacro -%}
+
+{#- Thinking defaults to ON, exactly as the original does. -#}
+{%- set rens = namespace(off = false, effort = none) -%}
+{%- if reasoning_effort is defined and reasoning_effort is not none -%}
+{%- if reasoning_effort == 'none' -%}
+{%- set rens.off = true -%}
+{%- elif reasoning_effort in ['low', 'high', 'max'] -%}
+{%- set rens.effort = reasoning_effort -%}
+{%- endif -%}
+{%- endif -%}
+{%- if thinking is not defined -%}
+{%- if enable_thinking is defined -%}
+{%- set thinking = enable_thinking -%}
+{%- elif rens.off -%}
+{%- set thinking = false -%}
+{%- else -%}
+{%- set thinking = true -%}
+{%- endif -%}
+{%- endif -%}
+{%- if thinking_effort is not defined -%}{%- set thinking_effort = rens.effort or 'max' -%}{%- endif -%}
+{%- if thinking and thinking_effort is not none and thinking_effort not in ['low', 'high', 'max'] -%}
+{{- raise_exception("Unsupported thinking_effort=" + (thinking_effort | string) + "; supported values are ['high', 'low', 'max'].") -}}
+{%- endif -%}
+
+{%- if tools is defined and tools -%}
+{{- render_tool_declare(tools) -}}
+{%- endif -%}
+
+{%- if thinking and thinking_effort in ['low', 'high', 'max'] -%}
+{{- internal_msg('thinking-effort', '`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=' + (thinking_effort | string) + '`.') -}}
+{%- endif -%}
+
+{%- set ns = namespace(tool_calls = none, tool_index = 0) -%}
+{%- for message in messages -%}
+{%- if message is not mapping -%}
+{{- raise_exception('Kimi K3 messages must be objects.') -}}
+{%- endif -%}
+{%- if 'role' not in message -%}
+{{- raise_exception('Kimi K3 messages require a `role`.') -}}
+{%- endif -%}
+{%- set role = message['role'] -%}
+
+{%- if role == 'system' and message.get('tools') -%}
+{{- render_tool_declare(message['tools'], true) -}}
+
+{%- elif role == 'user' or role == 'system' -%}
+{%- set attrs = [['role', role]] -%}
+{%- if message.get('name') -%}{%- set attrs = attrs + [['name', message['name']]] -%}{%- endif -%}
+{{- otag('message', attrs) -}}
+{{- render_content(message.get('content')) -}}
+{{- ctag('message') -}}
+{{- '<|end_of_msg|>' -}}
+
+{%- elif role == 'assistant' -%}
+{%- set ns.tool_calls = message.get('tool_calls') -%}
+{%- set ns.tool_index = 0 -%}
+{%- set attrs = [['role', 'assistant']] -%}
+{%- if message.get('name') -%}{%- set attrs = attrs + [['name', message['name']]] -%}{%- endif -%}
+{{- otag('message', attrs) -}}
+{%- if thinking -%}
+{%- set rc = message.get('reasoning_content') or message.get('reasoning') -%}
+{{- otag('think') -}}
+{%- if rc is not none and (rc | string | trim) -%}{{- rc -}}{%- endif -%}
+{{- ctag('think') -}}
+{%- endif -%}
+{{- otag('response') -}}
+{{- render_content(message.get('content')) -}}
+{{- ctag('response') -}}
+{%- set tcs = message.get('tool_calls') -%}
+{%- if tcs -%}
+{{- otag('tools') -}}
+{%- for tc in tcs -%}
+{%- set fn = tc['function'] if ('function' in tc) else tc -%}
+{%- if 'name' not in fn -%}
+{{- raise_exception('Kimi K3 tool calls require a function name.') -}}
+{%- endif -%}
+{{- otag('call', [['tool', fn['name']], ['index', loop.index]]) -}}
+{%- set args = fn['arguments'] if ('arguments' in fn) else none -%}{%- if args is mapping -%}
+{%- for key, val in args | items -%}
+{{- otag('argument', [['key', key], ['type', xtype(val)]]) -}}
+{{- xvalue(val) -}}
+{{- ctag('argument') -}}
+{%- endfor -%}
+{%- elif args is string -%}
+{%- if args | trim -%}
+{{- otag('json', [['type', 'object']]) -}}
+{{- args -}}
+{{- ctag('json') -}}
+{%- endif -%}
+{%- elif args is not none and args is defined -%}
+{{- raise_exception('Kimi K3 tool call arguments must be a dict or a JSON object string.') -}}
+{%- endif -%}
+{{- ctag('call') -}}
+{%- endfor -%}
+{{- ctag('tools') -}}
+{%- endif -%}
+{{- ctag('message') -}}
+{{- '<|end_of_msg|>' -}}
+
+{%- elif role == 'tool' -%}{%- set here = loop.index0 -%}
+{%- set start = namespace(is_first = true) -%}
+{%- if not loop.first -%}
+{%- if messages[here - 1] is mapping -%}
+{%- if messages[here - 1].get('role') == 'tool' -%}{%- set start.is_first = false -%}{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- if start.is_first -%}{%- set rl = namespace(n = 0, stop = false) -%}
+{%- for cand in messages[here:] -%}
+{%- if not rl.stop -%}
+{%- if cand is mapping and cand.get('role') == 'tool' -%}
+{%- set rl.n = rl.n + 1 -%}
+{%- else -%}
+{%- set rl.stop = true -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}{%- set rr = namespace(order = [], names = [], unresolved = false) -%}
+{%- for off in range(rl.n) -%}
+{%- set tm = messages[here + off] -%}
+{%- set cid = namespace(v = none) -%}
+{%- if 'tool_call_id' in tm -%}
+{%- set cid.v = tm['tool_call_id'] -%}
+{%- else -%}
+{%- set cid.v = tm.get('id') -%}
+{%- endif -%}
+{%- set mt = namespace(pos = none, name = none) -%}
+{%- if cid.v is not none and ns.tool_calls -%}
+{%- for tc in ns.tool_calls -%}
+{%- if mt.pos is none and tc is mapping and tc.get('id') is not none and (tc.get('id') | string) == (cid.v | string) -%}
+{%- set mt.pos = loop.index -%}
+{%- if tc.get('function') is mapping -%}
+{%- set mt.name = tc['function'].get('name') -%}
+{%- else -%}
+{%- set mt.name = tc.get('name') -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- if mt.pos is none -%}{%- set rr.unresolved = true -%}{%- endif -%}{%- set rr.order = rr.order + [(mt.pos if mt.pos is not none else 0) * 1000000 + off] -%}
+{%- set rr.names = rr.names + [mt.name] -%}
+{%- endfor -%}{%- if rr.unresolved -%}
+{%- for off in range(rl.n) -%}
+{%- set ns.tool_index = ns.tool_index + 1 -%}
+{{- render_tool_msg(messages[here + off], ns.tool_index, none, ns.tool_calls) -}}
+{%- endfor -%}
+{%- else -%}
+{%- for key in rr.order | sort -%}
+{%- set off = key % 1000000 -%}
+{%- set ns.tool_index = ns.tool_index + 1 -%}
+{{- render_tool_msg(messages[here + off], ns.tool_index, rr.names[off], ns.tool_calls) -}}
+{%- endfor -%}
+{%- endif -%}
+{%- endif -%}
+
+{%- else -%}
+{{- raise_exception('Kimi K3: role `' + (role | string) + '` is not supported.') -}}
+{%- endif -%}
+{%- endfor -%}
+
+{%- if add_generation_prompt -%}
+{{- otag('message', [['role', 'assistant']]) -}}
+{%- if thinking -%}{{- otag('think') -}}{%- else -%}{{- otag('response') -}}{%- endif -%}
+{%- endif -%}

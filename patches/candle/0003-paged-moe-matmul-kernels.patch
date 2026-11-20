@@ -1,0 +1,1145 @@
+Subject: [candle] paged-moe-matmul-kernels
+
+  The pooled and with-hids MoE variants, threaded inside upstream's own kernel_mul_mm / kernel_mul_mm_id bodies, and the tensor-op GEMM in MLX's NAX structure over the same dequantisers (dense and both routed entries, half activations the host casts once per input)
+  38e's target, and a rewrite rather than a move — nothing relocates these
+  Also the q8_0/q4_K matvec geometry, whose dispatch table disagreed with the kernel bodies it dispatches.
+
+Applies to: 0.10.2
+Files: 2
+
+---
+diff --git c/candle-metal-kernels/src/kernels/quantized.rs w/candle-metal-kernels/src/kernels/quantized.rs
+index d5b70662..4f30377e 100644
+--- c/candle-metal-kernels/src/kernels/quantized.rs
++++ w/candle-metal-kernels/src/kernels/quantized.rs
+@@ -63,13 +63,19 @@ pub fn call_quantized_matmul_mv_t(
+         | GgmlDType::Q4_1
+         | GgmlDType::Q5_0
+         | GgmlDType::Q5_1
+-        | GgmlDType::Q8_0
+         | GgmlDType::Q8_1 => {
+             let nth0 = 8;
+             let nth1 = 8;
+             let align = 8;
+             (nth0, nth1, align)
+         }
++        GgmlDType::Q8_0 => {
++            // NSG=4, NR0=2 → 8 rows/TG (llama.cpp `kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0=2>`).
++            let nth0 = 8;
++            let nth1 = 16;
++            let align = 8;
++            (nth0, nth1, align)
++        }
+         GgmlDType::Q2K => {
+             // Fixing a bug in Metal for GGML
+             // https://github.com/ggerganov/llama.cpp/blob/b8109bc0139f15a5b321909f47510b89dca47ffc/ggml-metal.m#L1576
+@@ -79,8 +85,9 @@ pub fn call_quantized_matmul_mv_t(
+             (nth0, nth1, align)
+         }
+         GgmlDType::Q4K => {
++            // NSG=2, NR0=2 → 4 rows/TG (llama.cpp `kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K=2>`).
+             let nth0 = 4;
+-            let nth1 = 8;
++            let nth1 = 16;
+             let align = 4;
+             (nth0, nth1, align)
+         }
+@@ -138,11 +145,11 @@ pub fn call_quantized_matmul_mv_t(
+         GgmlDType::F32 => "kernel_mul_mv_f32_f32",
+     };
+ 
+-    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+     let encoder = ep.encoder();
+     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+-    encoder.set_compute_pipeline_state(&pipeline);
+ 
++    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
++    encoder.set_compute_pipeline_state(&pipeline);
+     set_params!(
+         encoder,
+         (
+@@ -178,11 +185,24 @@ pub fn call_quantized_matmul_mv_t(
+ /// - src0 is usually weight
+ /// - src1 is usually xs
+ #[allow(clippy::too_many_arguments)]
++/// The tensor-op GEMM (a 64 x 64 tile over half activations, K steps of 64) takes a matmul
++/// where the device has Metal 4, K divides into its step and the token count fills a tile; the
++/// 64 x 32 tile kernel over f32 takes the rest. The caller casts the input to half for it.
++pub fn quantized_matmul_mm_nax(device: &Device, tokens: usize, k: usize) -> bool {
++    device.has_tensor_api() && k % 64 == 0 && tokens >= 64
++}
++
++/// The tensor-op GEMM's threadgroup bytes: the 64 x 72 half weight tile plus 64 row ids (routed; dense leaves them).
++pub const NAX_MM_TG_BYTES: usize = 64 * 72 * 2 + 64 * 4;
++
++/// `nax` per [`quantized_matmul_mm_nax`]: src1 is then half, else f32.
++#[allow(clippy::too_many_arguments)]
+ pub fn call_quantized_matmul_mm_t(
+     device: &Device,
+     ep: impl EncoderProvider,
+     kernels: &Kernels,
+     dtype: GgmlDType,
++    nax: bool,
+     src0_shape: &[usize],
+     src0_stride: &[usize],
+     src0: &Buffer,
+@@ -218,8 +238,13 @@ pub fn call_quantized_matmul_mm_t(
+     let r2 = (ne12 / ne02) as u32;
+     let r3 = (ne13 / ne03) as u32;
+ 
++    let (token_tile, tg_bytes) = if nax {
++        (64, NAX_MM_TG_BYTES)
++    } else {
++        (32, 8192)
++    };
+     let thread_groups_count = MTLSize {
+-        width: divide(ne11 as usize, 32),
++        width: divide(ne11 as usize, token_tile),
+         height: divide(ne01 as usize, 64),
+         depth: (ne12 * ne13) as usize,
+     };
+@@ -229,28 +254,33 @@ pub fn call_quantized_matmul_mm_t(
+         depth: 1,
+     };
+     let name = match dtype {
+-        GgmlDType::Q4_0 => "kernel_mul_mm_q4_0_f32",
+-        GgmlDType::Q4_1 => "kernel_mul_mm_q4_1_f32",
+-        GgmlDType::Q5_0 => "kernel_mul_mm_q5_0_f32",
+-        GgmlDType::Q5_1 => "kernel_mul_mm_q5_1_f32",
+-        GgmlDType::Q8_0 => "kernel_mul_mm_q8_0_f32",
+-        GgmlDType::Q2K => "kernel_mul_mm_q2_K_f32",
+-        GgmlDType::Q3K => "kernel_mul_mm_q3_K_f32",
+-        GgmlDType::Q4K => "kernel_mul_mm_q4_K_f32",
+-        GgmlDType::Q5K => "kernel_mul_mm_q5_K_f32",
+-        GgmlDType::Q6K => "kernel_mul_mm_q6_K_f32",
+-        GgmlDType::F16 => "kernel_mul_mm_f16_f32",
+-        GgmlDType::BF16 => "kernel_mul_mm_bf16_f32",
+-        GgmlDType::F32 => "kernel_mul_mm_f32_f32",
++        GgmlDType::Q4_0 => "q4_0",
++        GgmlDType::Q4_1 => "q4_1",
++        GgmlDType::Q5_0 => "q5_0",
++        GgmlDType::Q5_1 => "q5_1",
++        GgmlDType::Q8_0 => "q8_0",
++        GgmlDType::Q2K => "q2_K",
++        GgmlDType::Q3K => "q3_K",
++        GgmlDType::Q4K => "q4_K",
++        GgmlDType::Q5K => "q5_K",
++        GgmlDType::Q6K => "q6_K",
++        GgmlDType::F16 => "f16",
++        GgmlDType::BF16 => "bf16",
++        GgmlDType::F32 => "f32",
+         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
+         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
+     };
++    let name = if nax {
++        format!("kernel_mul_mm_nax_{name}_f32")
++    } else {
++        format!("kernel_mul_mm_{name}_f32")
++    };
+ 
+-    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+     let encoder = ep.encoder();
+     let encoder: &ComputeCommandEncoder = encoder.as_ref();
+-    encoder.set_compute_pipeline_state(&pipeline);
+ 
++    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
++    encoder.set_compute_pipeline_state(&pipeline);
+     set_params!(
+         encoder,
+         (
+@@ -277,7 +307,7 @@ pub fn call_quantized_matmul_mm_t(
+     encoder.use_resource(src1, MTLResourceUsage::Read);
+     encoder.use_resource(dst, MTLResourceUsage::Write);
+ 
+-    encoder.set_threadgroup_memory_length(0, 8192);
++    encoder.set_threadgroup_memory_length(0, tg_bytes);
+ 
+     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+     Ok(())
+diff --git c/candle-metal-kernels/src/metal_src/quantized.metal w/candle-metal-kernels/src/metal_src/quantized.metal
+index fcf1037a..f3c9ba27 100644
+--- c/candle-metal-kernels/src/metal_src/quantized.metal
++++ w/candle-metal-kernels/src/metal_src/quantized.metal
+@@ -1,5 +1,10 @@
+ #include <metal_stdlib>
+ 
++#ifdef GGML_METAL_HAS_TENSOR
++#include <metal_tensor>
++#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
++#endif
++
+ using namespace metal;
+ 
+ #define MAX(x, y) ((x) > (y) ? (x) : (y))
+@@ -8,6 +13,12 @@ using namespace metal;
+ 
+ #define N_SIMDWIDTH 32 // assuming SIMD group size is 32
+ 
++// One entry per expert id: the address of that expert's quantised bytes, or null where the id is not to be read.
++// The routed kernels take a row of these per projection per layer and resolve every routed id through it.
++struct ExpertRow {
++    device const char *base;
++};
++
+ #if defined(__HAVE_BFLOAT__)
+ typedef matrix<bfloat, 4, 4> bfloat4x4;
+ #endif
+@@ -2501,8 +2512,9 @@ void kernel_mul_mv_q8_0_f32_impl(
+                    uint3     tgpig,
+                    uint      tiisg,
+                    uint      sgitg) {
+-    const int nr  = N_DST;
+-    const int nsg = N_SIMDGROUP;
++    // Four simdgroups of 2 rows: more lanes per row's K-walk halves per-row latency. Needs 128 threads/TG.
++    const int nr  = 2;
++    const int nsg = 4;
+     const int nw  = N_SIMDWIDTH;
+ 
+     const int nb = ne00/QK8_0;
+@@ -4915,8 +4927,9 @@ void kernel_mul_mv_q4_K_f32_impl(
+     const int r0 = tgpig.x;
+     const int r1 = tgpig.y;
+     const int im = tgpig.z;
+-    //const int first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST;
+-    const int first_row = r0 * N_DST;
++    // Two simdgroups of 2 rows: the same 4 rows per TG as the legacy dispatch,
++    // but each row's K-walk uses 16 lanes instead of 8. Needs 64 threads/TG.
++    const int first_row = (r0 * 2 + (int)sgitg) * 2;
+     const int ib_row = first_row * nb;
+ 
+     const uint i12 = im%ne12;
+@@ -4929,7 +4942,8 @@ void kernel_mul_mv_q4_K_f32_impl(
+ 
+     float yl[16];
+     float yh[16];
+-    float sumf[N_DST]={0.f}, all_sum;
++    // NR0=2 rows per simdgroup (multi-simdgroup variant — see first_row above).
++    float sumf[2]={0.f}, all_sum;
+ 
+     const int step = sizeof(block_q4_K) * nb / 2;
+ 
+@@ -4952,7 +4966,7 @@ void kernel_mul_mv_q4_K_f32_impl(
+         device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
+         device const half     * dh = &x[ib].d;
+ 
+-        for (int row = 0; row < N_DST; row++) {
++        for (int row = 0; row < 2; row++) {
+ 
+             sc16[0] = sc[0] & kmask1;
+             sc16[1] = sc[2] & kmask1;
+@@ -4990,7 +5004,7 @@ void kernel_mul_mv_q4_K_f32_impl(
+         y4 += 4 * QK_K;
+     }
+ 
+-    for (int row = 0; row < N_DST; ++row) {
++    for (int row = 0; row < 2; ++row) {
+         all_sum = simd_sum(sumf[row]);
+         if (tiisg == 0) {
+             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
+@@ -6635,7 +6649,7 @@ void dequantize_q4_K(device const block_q4_K *xb, short il, thread type4x4 & reg
+     q = q + (il/4) * 32 + 16 * (il&1);
+     il = il & 3;
+     const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
++    const float d   = il < 2 ? xb->d : xb->d / 16.f;
+     const float min = xb->dmin;
+     const float dl = d * sc[0];
+     const float ml = min * sc[1];
+@@ -6992,6 +7006,31 @@ kernel void kernel_get_rows_i32(
+ #define SG_MAT_SIZE 64 // simdgroup matrix is of shape 8x8
+ #define SG_MAT_ROW 8
+ 
++// Body of `kernel_mul_mm` as a static helper, templated identically to the kernel itself.
++template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
++void mul_mm_body(
++        device const   uchar * src0,
++        device const   uchar * src1,
++        device         float * dst,
++                     int64_t   ne00,
++                     int64_t   ne02,
++                    uint64_t   nb01,
++                    uint64_t   nb02,
++                    uint64_t   nb03,
++                     int64_t   ne12,
++                    uint64_t   nb10,
++                    uint64_t   nb11,
++                    uint64_t   nb12,
++                    uint64_t   nb13,
++                     int64_t   ne0,
++                     int64_t   ne1,
++                        uint   r2,
++                        uint   r3,
++        threadgroup    uchar * shared_memory,
++                       uint3   tgpig,
++                        uint   tiitg,
++                        uint   sgitg);
++
+ // each block_q contains 16*nl weights
+ template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
+ kernel void kernel_mul_mm(device const  uchar * src0,
+@@ -7015,9 +7054,45 @@ kernel void kernel_mul_mm(device const  uchar * src0,
+                           uint3                 tgpig[[threadgroup_position_in_grid]],
+                           uint                  tiitg[[thread_index_in_threadgroup]],
+                           uint                  sgitg[[simdgroup_index_in_threadgroup]]) {
++    mul_mm_body<T, T4x4, simdgroup_T8x8, block_q, nl, dequantize_func>(
++        src0, src1, dst,
++        ne00, ne02, nb01, nb02, nb03, ne12, nb10, nb11, nb12, nb13, ne0, ne1, r2, r3,
++        shared_memory, tgpig, tiitg, sgitg);
++}
++
++template<typename T, typename T4x4, typename simdgroup_T8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
++void mul_mm_body(
++        device const   uchar * src0,
++        device const   uchar * src1,
++        device         float * dst,
++                     int64_t   ne00,
++                     int64_t   ne02,
++                    uint64_t   nb01,
++                    uint64_t   nb02,
++                    uint64_t   nb03,
++                     int64_t   ne12,
++                    uint64_t   nb10,
++                    uint64_t   nb11,
++                    uint64_t   nb12,
++                    uint64_t   nb13,
++                     int64_t   ne0,
++                     int64_t   ne1,
++                        uint   r2,
++                        uint   r3,
++        threadgroup    uchar * shared_memory,
++                       uint3   tgpig,
++                        uint   tiitg,
++                        uint   sgitg) {
+ 
+     threadgroup T     * sa = (threadgroup T     *)(shared_memory);
++#ifdef GGML_METAL_HAS_TENSOR
++    // matmul2d needs both inputs in one value type, so sb is T-typed here and
++    // stays float on the fallback path; sc aliases sa so the copy-out is shared.
++    threadgroup T     * sb = (threadgroup T     *)(shared_memory + 4096);
++    threadgroup float * sc = (threadgroup float *)(shared_memory);
++#else
+     threadgroup float * sb = (threadgroup float *)(shared_memory + 4096);
++#endif
+ 
+     const uint r0 = tgpig.y;
+     const uint r1 = tgpig.x;
+@@ -7031,6 +7106,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
+     short thread_row = ((short)tiitg/THREAD_PER_ROW) < n_rows ? ((short)tiitg/THREAD_PER_ROW) : n_rows - 1;
+     short thread_col = ((short)tiitg/THREAD_PER_COL) < n_cols ? ((short)tiitg/THREAD_PER_COL) : n_cols - 1;
+ 
++#ifndef GGML_METAL_HAS_TENSOR
+     simdgroup_T8x8     ma[4];
+     simdgroup_float8x8 mb[2];
+     simdgroup_float8x8 mc[8];
+@@ -7038,6 +7114,16 @@ kernel void kernel_mul_mm(device const  uchar * src0,
+     for (short i = 0; i < 8; i++){
+         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+     }
++#else
++    auto tA = tensor<threadgroup T, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(BLOCK_SIZE_K, BLOCK_SIZE_M));
++    auto tB = tensor<threadgroup T, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(BLOCK_SIZE_N, BLOCK_SIZE_K));
++
++    mpp::tensor_ops::matmul2d<
++        mpp::tensor_ops::matmul2d_descriptor(BLOCK_SIZE_N, BLOCK_SIZE_M, BLOCK_SIZE_K, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
++        execution_simdgroups<4>> mm;
++
++    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
++#endif
+ 
+     short il = (tiitg % THREAD_PER_ROW);
+ 
+@@ -7060,6 +7146,8 @@ kernel void kernel_mul_mm(device const  uchar * src0,
+         dequantize_func(x, il, temp_a);
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
++#ifndef GGML_METAL_HAS_TENSOR
++        // simdgroup-tile-packed sa/sb layouts for hand-rolled simdgroup_load.
+         #pragma unroll(16)
+         for (short i = 0; i < 16; i++) {
+             *(sa + SG_MAT_SIZE * ((tiitg/THREAD_PER_ROW/8) \
+@@ -7068,6 +7156,26 @@ kernel void kernel_mul_mm(device const  uchar * src0,
+         }
+ 
+         *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL)*8*32 + 8*(tiitg/THREAD_PER_COL)) = *((device float2x4 *) y);
++#else
++        // Row-major sa/sb layouts matching the tensor descriptors above.
++        {
++            const short il0 = (short)(tiitg % THREAD_PER_ROW);
++            for (short i = 0; i < 16; i++) {
++                const short sx = 2*il0 + i/8;
++                const short sy = ((short)tiitg / THREAD_PER_ROW) / 8;
++                const short lx = i%8;
++                const short ly = ((short)tiitg / THREAD_PER_ROW) % 8;
++                *(sa + BLOCK_SIZE_K*(8*sy + ly) + 8*sx + lx) = temp_a[i/4][i%4];
++            }
++        }
++        {
++            const short sx = (short)(tiitg % THREAD_PER_COL);
++            const short sy = ((short)tiitg / THREAD_PER_COL) / 8;
++            const short ly = ((short)tiitg / THREAD_PER_COL) % 8;
++            // sb is T-typed on this path, so narrow the device float as we stage it.
++            *(threadgroup half2x4 *)(sb + BLOCK_SIZE_K*(8*sy + ly) + 8*sx) = (half2x4)(*((device float2x4 *) y));
++        }
++#endif
+ 
+         il = (il + 2 < nl) ? il + 2 : il % 2;
+         x  = (il < 2) ? x + (2+nl-1)/nl : x;
+@@ -7075,6 +7183,7 @@ kernel void kernel_mul_mm(device const  uchar * src0,
+ 
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
++#ifndef GGML_METAL_HAS_TENSOR
+         // load matrices from threadgroup memory and conduct outer products
+         threadgroup T     * lsma = (sa + THREAD_MAT_M*SG_MAT_SIZE*(sgitg%2));
+         threadgroup float * lsmb = (sb + THREAD_MAT_N*SG_MAT_SIZE*(sgitg/2));
+@@ -7099,8 +7208,14 @@ kernel void kernel_mul_mm(device const  uchar * src0,
+                 simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+             }
+         }
++#else
++        auto sA = tA.slice(0, 0);
++        auto sB = tB.slice(0, 0);
++        mm.run(sB, sA, cT);
++#endif
+     }
+ 
++#ifndef GGML_METAL_HAS_TENSOR
+     if ((r0 + 1) * BLOCK_SIZE_M <= ne0 && (r1 + 1) * BLOCK_SIZE_N <= ne1) {
+         device float * C = dst + (BLOCK_SIZE_M * r0 + 32 * (sgitg &  1)) \
+                                + (BLOCK_SIZE_N * r1 + 16 * (sgitg >> 1)) * ne0 + im*ne1*ne0;
+@@ -7138,9 +7253,42 @@ kernel void kernel_mul_mm(device const  uchar * src0,
+             }
+         }
+     }
++#else
++    // Store the cooperative tensor to the shared tile, then copy it out across all four simdgroups.
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    {
++        auto tC = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(BLOCK_SIZE_M, BLOCK_SIZE_N));
++        cT.store(tC);
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    const ushort tiisg_local = (ushort)(tiitg % 32);
++    threadgroup float * tile_base = (threadgroup float *) shared_memory;
++    const int64_t im_off = (int64_t)im * ne1 * ne0;
++    for (short j = (short)sgitg; j < n_cols; j += 4) {
++        device float  * D  = dst + (r0 * BLOCK_SIZE_M) + (int64_t)(r1 * BLOCK_SIZE_N + j) * ne0 + im_off;
++        device float4 * D4 = (device float4 *) D;
++
++        threadgroup float  * C  = tile_base + (j * BLOCK_SIZE_M);
++        threadgroup float4 * C4 = (threadgroup float4 *) C;
++
++        int i = (int) tiisg_local;
++        for (; i < n_rows / 4; i += 32) {
++            *(D4 + i) = *(C4 + i);
++        }
++
++        i = 4 * (n_rows / 4) + (int) tiisg_local;
++        for (; i < n_rows; i += 32) {
++            *(D + i) = *(C + i);
++        }
++    }
++#endif
+ }
+ 
+ // same as kernel_mul_mm_impl, but src1 and dst are accessed via indices stored in rowids
++//
++// On M4+ the inner matmul runs on the hardware tensor cores; the hand-rolled
++// simdgroup path is the fallback, and both leave the same tile in shared memory.
+ template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+ void kernel_mul_mm_id_impl(
+         device const  uchar * src0,
+@@ -7165,7 +7313,13 @@ void kernel_mul_mm_id_impl(
+         uint                  sgitg[[simdgroup_index_in_threadgroup]]) {
+ 
+     threadgroup half  * sa = (threadgroup half  *)(shared_memory);
++#ifdef GGML_METAL_HAS_TENSOR
++    // matmul2d needs both inputs in one value type, so sb is half-typed here and stays float on the fallback path.
++    threadgroup half  * sb = (threadgroup half  *)(shared_memory + 4096);
++    threadgroup float * sc = (threadgroup float *)(shared_memory);
++#else
+     threadgroup float * sb = (threadgroup float *)(shared_memory + 4096);
++#endif
+ 
+     const uint r0 = tgpig.y;
+     const uint r1 = tgpig.x;
+@@ -7180,12 +7334,24 @@ void kernel_mul_mm_id_impl(
+     short thread_row = ((short)tiitg/THREAD_PER_ROW) < n_rows ? ((short)tiitg/THREAD_PER_ROW) : n_rows - 1;
+     short thread_col = ((short)tiitg/THREAD_PER_COL) < n_cols ? ((short)tiitg/THREAD_PER_COL) : n_cols - 1;
+ 
++#ifndef GGML_METAL_HAS_TENSOR
+     simdgroup_half8x8  ma[4];
+     simdgroup_float8x8 mb[2];
+     simdgroup_float8x8 c_res[8];
+     for (int i = 0; i < 8; i++){
+         c_res[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+     }
++#else
++    auto tA = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(BLOCK_SIZE_K, BLOCK_SIZE_M));
++    auto tB = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(BLOCK_SIZE_N, BLOCK_SIZE_K));
++
++    mpp::tensor_ops::matmul2d<
++        mpp::tensor_ops::matmul2d_descriptor(BLOCK_SIZE_N, BLOCK_SIZE_M, BLOCK_SIZE_K, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
++        execution_simdgroups<4>> mm;
++
++    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
++#endif
++
+     short il = (tiitg % THREAD_PER_ROW);
+ 
+     ushort offset1 = il/nl;
+@@ -7204,6 +7370,8 @@ void kernel_mul_mm_id_impl(
+         dequantize_func(x, il, temp_a);
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
++#ifndef GGML_METAL_HAS_TENSOR
++        // simdgroup-tile-packed sa/sb layouts for hand-rolled simdgroup_load.
+         for (int i = 0; i < 16; i++) {
+             *(sa + SG_MAT_SIZE * ((tiitg / THREAD_PER_ROW / 8) \
+             +                     (tiitg % THREAD_PER_ROW) * 16 + (i / 8) * 8) \
+@@ -7211,6 +7379,25 @@ void kernel_mul_mm_id_impl(
+         }
+ 
+         *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL) * 8 * 32 + 8 * (tiitg / THREAD_PER_COL)) = *((device float2x4 *)y);
++#else
++        // Row-major sa/sb layouts matching the tensor descriptors declared above (as llama.cpp's).
++        {
++            const short il0 = (short)(tiitg % THREAD_PER_ROW);
++            for (short i = 0; i < 16; i++) {
++                const short sx = 2*il0 + i/8;
++                const short sy = ((short)tiitg / THREAD_PER_ROW) / 8;
++                const short lx = i%8;
++                const short ly = ((short)tiitg / THREAD_PER_ROW) % 8;
++                *(sa + BLOCK_SIZE_K*(8*sy + ly) + 8*sx + lx) = temp_a[i/4][i%4];
++            }
++        }
++        {
++            const short sx = (short)(tiitg % THREAD_PER_COL);
++            const short sy = ((short)tiitg / THREAD_PER_COL) / 8;
++            const short ly = ((short)tiitg / THREAD_PER_COL) % 8;
++            *(threadgroup half2x4 *)(sb + BLOCK_SIZE_K*(8*sy + ly) + 8*sx) = (half2x4)(*((device float2x4 *) y));
++        }
++#endif
+ 
+         il = (il + 2 < nl) ? il + 2 : il % 2;
+         x  = (il < 2) ? x + (2+nl-1)/nl : x;
+@@ -7218,15 +7405,19 @@ void kernel_mul_mm_id_impl(
+ 
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
++#ifndef GGML_METAL_HAS_TENSOR
+         // load matrices from threadgroup memory and conduct outer products
+         threadgroup half  * lsma = (sa + THREAD_MAT_M * SG_MAT_SIZE * (sgitg % 2));
+         threadgroup float * lsmb = (sb + THREAD_MAT_N * SG_MAT_SIZE * (sgitg / 2));
+ 
++        #pragma unroll(BLOCK_SIZE_K/8)
+         for (int ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {
++            #pragma unroll(4)
+             for (int i = 0; i < 4; i++) {
+                 simdgroup_load(ma[i], lsma + SG_MAT_SIZE * i);
+             }
+             simdgroup_barrier(mem_flags::mem_none);
++            #pragma unroll(2)
+             for (int i = 0; i < 2; i++) {
+                 simdgroup_load(mb[i], lsmb + SG_MAT_SIZE * i);
+             }
+@@ -7234,30 +7425,55 @@ void kernel_mul_mm_id_impl(
+             lsma += BLOCK_SIZE_M / SG_MAT_ROW * SG_MAT_SIZE;
+             lsmb += BLOCK_SIZE_N / SG_MAT_ROW * SG_MAT_SIZE;
+ 
++            #pragma unroll(8)
+             for (int i = 0; i < 8; i++){
+                 simdgroup_multiply_accumulate(c_res[i], mb[i/4], ma[i%4], c_res[i]);
+             }
+         }
++#else
++        auto sA = tA.slice(0, 0);
++        auto sB = tB.slice(0, 0);
++        mm.run(sB, sA, cT);
++#endif
+     }
+ 
+     {
+         threadgroup_barrier(mem_flags::mem_threadgroup);
++#ifndef GGML_METAL_HAS_TENSOR
+         threadgroup float * temp_str = ((threadgroup float *)shared_memory) \
+                                       + 32 * (sgitg&1) + (16 * (sgitg>>1)) * BLOCK_SIZE_M;
+         for (int i = 0; i < 8; i++) {
+             simdgroup_store(c_res[i], temp_str + 8 * (i%4) + 8 * BLOCK_SIZE_M * (i/4), BLOCK_SIZE_M);
+         }
++#else
++        auto tC = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>(sc, dextents<int32_t, 2>(BLOCK_SIZE_M, BLOCK_SIZE_N));
++        cT.store(tC);
++#endif
+ 
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-        device float * C = dst + (BLOCK_SIZE_M * r0);
+-        if (sgitg == 0) {
+-            for (int j = tiitg; j < n_cols; j += BLOCK_SIZE_N) {
+-                threadgroup const auto & jid = rowids[r1 * BLOCK_SIZE_N + j];
+-                int joff =  jid[0] * ne0 + jid[1] * ne0ne1;
+-                for (int i = 0; i < n_rows; i++) {
+-                    *(C + i + joff) = *(temp_str + i + j * BLOCK_SIZE_M);
+-                }
++        // Copy the tile out across all four simdgroups rather than one: with many
++        // TGs producing small tiles, these writes dominate.
++        const ushort tiisg_local = (ushort)(tiitg % 32);
++        threadgroup float * tile_base = (threadgroup float *) shared_memory;
++        for (short j = (short)sgitg; j < n_cols; j += 4) {
++            threadgroup const auto & jid = rowids[r1 * BLOCK_SIZE_N + j];
++            int64_t joff = (int64_t)jid[0] * ne0 + (int64_t)jid[1] * ne0ne1;
++
++            device float  * D  = (device float  *) dst + (r0 * BLOCK_SIZE_M) + joff;
++            device float4 * D4 = (device float4 *) D;
++
++            threadgroup float  * C  = tile_base + (j * BLOCK_SIZE_M);
++            threadgroup float4 * C4 = (threadgroup float4 *) C;
++
++            int i = (int) tiisg_local;
++            for (; i < n_rows / 4; i += 32) {
++                *(D4 + i) = *(C4 + i);
++            }
++
++            i = 4 * (n_rows / 4) + (int) tiisg_local;
++            for (; i < n_rows; i += 32) {
++                *(D + i) = *(C + i);
+             }
+         }
+     }
+@@ -7304,9 +7520,9 @@ kernel void kernel_mul_mm_id(
+         for (ushort ii0 = 0; ii0 < nei0; ii0++) {
+             int32_t id = ((device int32_t *) (ids + ii1*nbi1))[ii0];
+             if (id == i02) {
+-                //if (tiitg == 0) {
++                if (tiitg == 0) {
+                     rowids[_ne1] = ushort2(ii0, ii1);
+-                //}
++                }
+                 _ne1++;
+             }
+         }
+@@ -7337,6 +7553,361 @@ kernel void kernel_mul_mm_id(
+         sgitg);
+ }
+ 
++// Takes a precomputed sorted-by-expert routing table rather than scanning per tile, so threadgroup memory scales with
++// the tile, not the table. The experts are read through the address row: column z serves `expert_list[z]`, null none.
++template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
++kernel void kernel_mul_mm_id_with_hids(
++        device const ExpertRow * experts,
++        device const   uchar * src1,
++        device         float * dst,
++        device const   uchar * htpe,
++        device const   uchar * hids,
++        device const uint32_t * expert_list,
++        constant     int64_t & nei0,
++        constant     int64_t & nei1,
++        constant     int64_t & ne00,
++        constant     int64_t & ne02,
++        constant    uint64_t & nb01,
++        constant    uint64_t & nb02,
++        constant     int64_t & ne11,
++        constant     int64_t & ne12,
++        constant     int64_t & ne13,
++        constant    uint64_t & nb10,
++        constant    uint64_t & nb11,
++        constant    uint64_t & nb12,
++        constant     int64_t & ne0,
++        constant     int64_t & ne1,
++        constant    uint64_t & nb1,
++        threadgroup    uchar * shared_memory [[threadgroup(0)]],
++        uint3                  tgpig[[threadgroup_position_in_grid]],
++        uint                   tiitg[[thread_index_in_threadgroup]],
++        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
++
++    const int32_t i02 = tgpig.z;
++    const int64_t r1_off = (int64_t)tgpig.x * BLOCK_SIZE_N;
++
++    // Per-expert match count from htpe.
++    device const uint32_t * tpe_u32 = (device const uint32_t *) htpe;
++    const int64_t neh1 = (int64_t) tpe_u32[i02];
++
++    // Tile is past the matched-row range for this expert — return early.
++    if (r1_off >= neh1) {
++        return;
++    }
++    device const uchar * src0 = (device const uchar *) experts[expert_list[i02]].base;
++    if (src0 == nullptr) {
++        return;
++    }
++
++    tgpig.z = 0;
++
++    // Materialise only this tile's slice of the routing table into the buffer the
++    // impl already consumes — this is what keeps TG memory tile-sized.
++    threadgroup ushort2 * rowids = (threadgroup ushort2 *)(shared_memory + 8192);
++
++    device const int32_t * ids_i32 = (device const int32_t *) hids;
++    const int64_t this_expert_base = (int64_t)i02 * nei1;
++
++    // One entry per thread; threads past `nr1` write out of bounds, but the impl clamps `n_cols` so none is read.
++    const int64_t nr1 = (neh1 - r1_off < BLOCK_SIZE_N) ? (neh1 - r1_off) : BLOCK_SIZE_N;
++    if (tiitg < (uint) nr1) {
++        const int32_t id = ids_i32[this_expert_base + r1_off + tiitg];
++        rowids[tiitg] = ushort2((ushort)(id % nei0), (ushort)(id / nei0));
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    // The impl indexes `rowids` from `r1`, and our slice starts at 0; the outer grid drives the routing axis instead.
++    tgpig.x = 0;
++
++    kernel_mul_mm_id_impl<block_q, nl, dequantize_func>(
++        src0,
++        src1,
++        rowids,
++        dst,
++        ne00,
++        ne02,
++        nb01,
++        nb02,
++        ne11,
++        ne12,
++        nb10,
++        nb11,
++        nb12,
++        ne0,
++        nr1,
++        ne0*ne1,
++        shared_memory,
++        tgpig,
++        tiitg,
++        sgitg);
++}
++
++#ifdef GGML_METAL_HAS_TENSOR
++// The tensor-op GEMM in MLX's qmm_t_nax structure (b6368984, quantized_nax.h): a 64 x 64 tile
++// per threadgroup of four simdgroups, a K step of 64, the weight tile dequantised into
++// threadgroup memory, half activations (cast by the host) in 16 x 16 fragments, f32 accumulation.
++
++#define NAX_MM_BM 64   // tokens per threadgroup
++#define NAX_MM_BN 64   // weight rows per threadgroup
++#define NAX_MM_BK 64   // K per threadgroup step
++#define NAX_MM_BK_PADDED (NAX_MM_BK + 8)
++#define NAX_MM_WS_BYTES (NAX_MM_BN * NAX_MM_BK_PADDED * 2)
++
++// A thread's four rows of the tile: the activation row (half), the output row and whether the row is stored
++// (rows past the tile's count are clamped to the last valid one for the loads and never stored).
++struct mul_mm_nax_rows {
++    device const half * y[4];
++    device float * d[4];
++    bool valid[4];
++};
++
++// Four output floats to a row, the weight-row tail masked per element.
++METAL_FUNC void mul_mm_nax_store4(device float * drow, bool valid, short col, short n_rows, float4 v) {
++    if (!valid) return;
++    if (col + 4 <= n_rows) {
++        *(device float4 *)(drow + col) = v;
++    } else {
++        if (col < n_rows) drow[col] = v.x;
++        if (col + 1 < n_rows) drow[col + 1] = v.y;
++        if (col + 2 < n_rows) drow[col + 2] = v.z;
++        if (col + 3 < n_rows) drow[col + 3] = v.w;
++    }
++}
++
++template<typename T, typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
++METAL_FUNC void mul_mm_nax_body(
++        device const   uchar * w0,        // the weight rows this tile starts at
++                    uint64_t   nb01,      // the weight row stride in bytes
++                     int64_t   ne00,      // K
++                       short   n_rows,    // weight rows in this tile (≤ 64)
++        thread const mul_mm_nax_rows & rows,
++        threadgroup    uchar * shared_memory,
++                        uint   tiitg,
++                        uint   sgitg) {
++    using namespace nax;
++    threadgroup T * Ws = (threadgroup T *)(shared_memory);
++
++    constexpr short SM = NAX_MM_BM / 2, SN = NAX_MM_BN / 2, SK = 32;
++    constexpr short TM = SM / 16, TN = SN / 16, TK = SK / 16;
++
++    const short tn = SN * (short)(sgitg % 2);
++
++    // The weight loader: thread t dequantises two 16-value chunks of row t/2
++    // per K step — chunk index c = K/16, block c / nl, il c % nl.
++    const short w_row = min((short)(tiitg / 2), (short)(n_rows - 1));
++    const short w_chunk0 = (short)(tiitg % 2) * 2;
++    device const block_q * w_blocks = (device const block_q *)(w0 + (uint64_t)w_row * nb01);
++    threadgroup T * ws_row = Ws + w_row * NAX_MM_BK_PADDED + w_chunk0 * 16;
++
++    const short fn = BaseNAXFrag::get_coord().x;   // this lane's column base within a fragment
++
++    device const half * yr[4] = {rows.y[0], rows.y[1], rows.y[2], rows.y[3]};
++
++    NAXTile<float, TM, TN> Dtile;
++    Dtile.clear();
++
++    for (int k0 = 0; k0 < ne00; k0 += NAX_MM_BK) {
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        {
++            const int chunk = (k0 / 16) + w_chunk0;
++            for (short c = 0; c < 2; c++) {
++                T4x4 temp;
++                dequantize_func(w_blocks + (chunk + c) / nl, (short)((chunk + c) % nl), temp);
++                threadgroup vec<T, 4> * dst4 = (threadgroup vec<T, 4> *)(ws_row + c * 16);
++                dst4[0] = temp[0]; dst4[1] = temp[1]; dst4[2] = temp[2]; dst4[3] = temp[3];
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        STEEL_PRAGMA_NO_UNROLL
++        for (short kk1 = 0; kk1 < NAX_MM_BK; kk1 += SK) {
++            NAXTile<T, TM, TK> Atile;
++            NAXTile<T, TN, TK> Btile;
++
++            volatile int compiler_barrier;
++
++            // A: this thread's four rows, four halves per fragment row
++            STEEL_PRAGMA_UNROLL
++            for (short iq = 0; iq < TM; iq++) {
++                STEEL_PRAGMA_UNROLL
++                for (short ik = 0; ik < TK; ik++) {
++                    thread auto & f = Atile.frag_at(iq, ik);
++                    const int col = k0 + kk1 + ik * 16 + fn;
++                    const half4 v0 = *(device const half4 *)(yr[iq * 2 + 0] + col);
++                    const half4 v1 = *(device const half4 *)(yr[iq * 2 + 1] + col);
++                    f[0] = T(v0.x); f[1] = T(v0.y); f[2] = T(v0.z); f[3] = T(v0.w);
++                    f[4] = T(v1.x); f[5] = T(v1.y); f[6] = T(v1.z); f[7] = T(v1.w);
++                }
++            }
++            Btile.template load<T, NAX_MM_BK_PADDED, 1>(Ws + tn * NAX_MM_BK_PADDED + kk1);
++
++            tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
++
++            (void)compiler_barrier;
++        }
++    }
++
++    // Store this thread's four output rows, four floats per fragment row;
++    // every fragment index is literal so the accumulator stays in registers.
++    STEEL_PRAGMA_UNROLL
++    for (short iq = 0; iq < TM; iq++) {
++        STEEL_PRAGMA_UNROLL
++        for (short in = 0; in < TN; in++) {
++            const thread auto & f = Dtile.frag_at(iq, in);
++            const short col = tn + in * 16 + fn;
++            mul_mm_nax_store4(rows.d[iq * 2 + 0], rows.valid[iq * 2 + 0], col, n_rows, float4(f[0], f[1], f[2], f[3]));
++            mul_mm_nax_store4(rows.d[iq * 2 + 1], rows.valid[iq * 2 + 1], col, n_rows, float4(f[4], f[5], f[6], f[7]));
++        }
++    }
++}
++
++// The row a thread's fragment row i (0..3) maps to within the 64-row tile: its simdgroup's 32-row half, the
++// fragment (0, 1), the element row (0, 8) and the lane's row within the fragment.
++METAL_FUNC short mul_mm_nax_tile_row(uint sgitg, short i) {
++    return 32 * (short)(sgitg / 2) + (i / 2) * 16 + (i % 2) * 8 + nax::BaseNAXFrag::get_coord().y;
++}
++
++// Dense: the tile kernel's arguments with src1 half, the tensor-op body.
++template<typename T, typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
++kernel void kernel_mul_mm_nax(device const  uchar * src0,
++                              device const  uchar * src1,
++                              device        float * dst,
++                              constant    int64_t & ne00,
++                              constant    int64_t & ne02,
++                              constant   uint64_t & nb01,
++                              constant   uint64_t & nb02,
++                              constant   uint64_t & nb03,
++                              constant    int64_t & ne12,
++                              constant   uint64_t & nb10,
++                              constant   uint64_t & nb11,
++                              constant   uint64_t & nb12,
++                              constant   uint64_t & nb13,
++                              constant    int64_t & ne0,
++                              constant    int64_t & ne1,
++                              constant       uint & r2,
++                              constant       uint & r3,
++                              threadgroup   uchar * shared_memory [[threadgroup(0)]],
++                              uint3                 tgpig[[threadgroup_position_in_grid]],
++                              uint                  tiitg[[thread_index_in_threadgroup]],
++                              uint                  sgitg[[simdgroup_index_in_threadgroup]]) {
++    const uint r0 = tgpig.y;
++    const uint r1 = tgpig.x;
++    const uint im = tgpig.z;
++
++    const short n_rows = (short)MIN(ne0 - (int64_t)r0 * NAX_MM_BN, NAX_MM_BN);
++    const short n_cols = (short)MIN(ne1 - (int64_t)r1 * NAX_MM_BM, NAX_MM_BM);
++
++    const uint i12 = im % ne12;
++    const uint i13 = im / ne12;
++    const uint64_t offset0 = (i12 / r2) * nb02 + (i13 / r3) * nb03;
++    device const uchar * w0 = src0 + (uint64_t)r0 * NAX_MM_BN * nb01 + offset0;
++    const int64_t im_off = (int64_t)im * ne1 * ne0;
++
++    mul_mm_nax_rows rows;
++    for (short i = 0; i < 4; i++) {
++        const short row = mul_mm_nax_tile_row(sgitg, i);
++        rows.valid[i] = row < n_cols;
++        const int64_t rowc = (int64_t)r1 * NAX_MM_BM + MIN(row, n_cols - 1);
++        rows.y[i] = (device const half *)(src1 + nb13 * i13 + nb12 * i12 + nb11 * rowc);
++        rows.d[i] = dst + rowc * ne0 + (int64_t)r0 * NAX_MM_BN + im_off;
++    }
++    mul_mm_nax_body<T, T4x4, block_q, nl, dequantize_func>(w0, nb01, ne00, n_rows, rows, shared_memory, tiitg, sgitg);
++}
++
++// Routed: one expert per tgpig.z, its matched rows from hids in tiles of 64; addresses as kernel_mul_mm_id_impl's.
++template<typename T, typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
++METAL_FUNC void mul_mm_id_nax_tile(
++        device const   uchar * src0,
++        device const   uchar * src1,
++        device         float * dst,
++        device const   uchar * hids,
++                     int32_t   i02,
++                     int64_t   r1_off,
++                     int64_t   neh1,
++                     int64_t   nei0,
++                     int64_t   nei1,
++                     int64_t   ne00,
++                    uint64_t   nb01,
++                     int64_t   ne11,
++                    uint64_t   nb11,
++                    uint64_t   nb12,
++                     int64_t   ne0,
++                     int64_t   ne1,
++        threadgroup    uchar * shared_memory,
++                        uint   r0,
++                        uint   tiitg,
++                        uint   sgitg) {
++    threadgroup ushort2 * rowids = (threadgroup ushort2 *)(shared_memory + NAX_MM_WS_BYTES);
++    device const int32_t * ids_i32 = (device const int32_t *) hids;
++    const int64_t this_expert_base = (int64_t)i02 * nei1;
++    const short nr1 = (short)MIN(neh1 - r1_off, NAX_MM_BM);
++    if (tiitg < (uint) nr1) {
++        const int32_t id = ids_i32[this_expert_base + r1_off + tiitg];
++        rowids[tiitg] = ushort2((ushort)(id % nei0), (ushort)(id / nei0));
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    const short n_rows = (short)MIN(ne0 - (int64_t)r0 * NAX_MM_BN, NAX_MM_BN);
++    device const uchar * w0 = src0 + (uint64_t)r0 * NAX_MM_BN * nb01;
++    const int64_t ne0ne1 = ne0 * ne1;
++
++    mul_mm_nax_rows rows;
++    for (short i = 0; i < 4; i++) {
++        const short row = mul_mm_nax_tile_row(sgitg, i);
++        rows.valid[i] = row < nr1;
++        const ushort2 id = rowids[MIN(row, nr1 - 1)];
++        rows.y[i] = (device const half *)(src1 + nb12 * id[1] + nb11 * (id[0] % ne11));
++        rows.d[i] = dst + (int64_t)id[0] * ne0 + (int64_t)id[1] * ne0ne1 + (int64_t)r0 * NAX_MM_BN;
++    }
++    mul_mm_nax_body<T, T4x4, block_q, nl, dequantize_func>(w0, nb01, ne00, n_rows, rows, shared_memory, tiitg, sgitg);
++}
++
++template<typename T, typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
++kernel void kernel_mul_mm_id_with_hids_nax(
++        device const ExpertRow * experts,
++        device const   uchar * src1,
++        device         float * dst,
++        device const   uchar * htpe,
++        device const   uchar * hids,
++        device const uint32_t * expert_list,
++        constant     int64_t & nei0,
++        constant     int64_t & nei1,
++        constant     int64_t & ne00,
++        constant     int64_t & ne02,
++        constant    uint64_t & nb01,
++        constant    uint64_t & nb02,
++        constant     int64_t & ne11,
++        constant     int64_t & ne12,
++        constant     int64_t & ne13,
++        constant    uint64_t & nb10,
++        constant    uint64_t & nb11,
++        constant    uint64_t & nb12,
++        constant     int64_t & ne0,
++        constant     int64_t & ne1,
++        constant    uint64_t & nb1,
++        threadgroup    uchar * shared_memory [[threadgroup(0)]],
++        uint3                  tgpig[[threadgroup_position_in_grid]],
++        uint                   tiitg[[thread_index_in_threadgroup]],
++        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
++    const int32_t i02 = tgpig.z;
++    const int64_t r1_off = (int64_t)tgpig.x * NAX_MM_BM;
++    device const uint32_t * tpe_u32 = (device const uint32_t *) htpe;
++    const int64_t neh1 = (int64_t) tpe_u32[i02];
++    if (r1_off >= neh1) {
++        return;
++    }
++    device const uchar * src0 = (device const uchar *) experts[expert_list[i02]].base;
++    if (src0 == nullptr) {
++        return;
++    }
++    mul_mm_id_nax_tile<T, T4x4, block_q, nl, dequantize_func>(
++        src0, src1, dst, hids, i02, r1_off, neh1, nei0, nei1, ne00, nb01, ne11, nb11, nb12, ne0, ne1,
++        shared_memory, tgpig.y, tiitg, sgitg);
++}
++
++#endif // GGML_METAL_HAS_TENSOR
++
+ #define QK_NL 16
+ 
+ //
+@@ -7432,6 +8003,48 @@ template [[host_name("kernel_mul_mm_id_iq1_m_f32")]]   kernel mat_mm_id_t kernel
+ template [[host_name("kernel_mul_mm_id_iq4_nl_f32")]]  kernel mat_mm_id_t kernel_mul_mm_id<block_iq4_nl,  2,     dequantize_iq4_nl>;
+ template [[host_name("kernel_mul_mm_id_iq4_xs_f32")]]  kernel mat_mm_id_t kernel_mul_mm_id<block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
+ 
++// Instantiations for the hids variant, which lifts the routing cap of the in-kernel-scan form at large prefill.
++typedef decltype(kernel_mul_mm_id_with_hids<block_q4_K, QK_NL, dequantize_q4_K>) mat_mm_id_with_hids_t;
++
++template [[host_name("kernel_mul_mm_id_with_hids_q4_K_f32")]] kernel mat_mm_id_with_hids_t kernel_mul_mm_id_with_hids<block_q4_K, QK_NL, dequantize_q4_K>;
++template [[host_name("kernel_mul_mm_id_with_hids_q6_K_f32")]] kernel mat_mm_id_with_hids_t kernel_mul_mm_id_with_hids<block_q6_K, QK_NL, dequantize_q6_K>;
++template [[host_name("kernel_mul_mm_id_with_hids_q5_0_f32")]] kernel mat_mm_id_with_hids_t kernel_mul_mm_id_with_hids<block_q5_0, 2, dequantize_q5_0>;
++// Requantisation: sub-Q4 expert stacks.
++template [[host_name("kernel_mul_mm_id_with_hids_q3_K_f32")]] kernel mat_mm_id_with_hids_t kernel_mul_mm_id_with_hids<block_q3_K, QK_NL, dequantize_q3_K>;
++// I-quant expert stacks. UD-IQ1_M mixes all three formats.
++template [[host_name("kernel_mul_mm_id_with_hids_iq1_s_f32")]] kernel mat_mm_id_with_hids_t kernel_mul_mm_id_with_hids<block_iq1_s, QK_NL, dequantize_iq1_s>;
++template [[host_name("kernel_mul_mm_id_with_hids_iq2_xxs_f32")]] kernel mat_mm_id_with_hids_t kernel_mul_mm_id_with_hids<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
++template [[host_name("kernel_mul_mm_id_with_hids_iq3_xxs_f32")]] kernel mat_mm_id_with_hids_t kernel_mul_mm_id_with_hids<block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
++
++#ifdef GGML_METAL_HAS_TENSOR
++// The tensor-op GEMMs, the same formats as the tile kernels above.
++typedef decltype(kernel_mul_mm_nax<half, half4x4, float4x4, 1, dequantize_f32>) mat_mm_nax_t;
++template [[host_name("kernel_mul_mm_nax_f32_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, float4x4, 1, dequantize_f32>;
++template [[host_name("kernel_mul_mm_nax_f16_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, half4x4, 1, dequantize_f16>;
++#if defined(__HAVE_BFLOAT__)
++template [[host_name("kernel_mul_mm_nax_bf16_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<bfloat, bfloat4x4, bfloat4x4, 1, dequantize_bf16>;
++#endif
++template [[host_name("kernel_mul_mm_nax_q5_0_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, block_q5_0, 2, dequantize_q5_0>;
++template [[host_name("kernel_mul_mm_nax_q8_0_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, block_q8_0, 2, dequantize_q8_0>;
++template [[host_name("kernel_mul_mm_nax_q3_K_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, block_q3_K, QK_NL, dequantize_q3_K>;
++template [[host_name("kernel_mul_mm_nax_q4_K_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, block_q4_K, QK_NL, dequantize_q4_K>;
++template [[host_name("kernel_mul_mm_nax_q5_K_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, block_q5_K, QK_NL, dequantize_q5_K>;
++template [[host_name("kernel_mul_mm_nax_q6_K_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, block_q6_K, QK_NL, dequantize_q6_K>;
++template [[host_name("kernel_mul_mm_nax_iq2_xxs_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
++template [[host_name("kernel_mul_mm_nax_iq3_xxs_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
++template [[host_name("kernel_mul_mm_nax_iq1_s_f32")]] kernel mat_mm_nax_t kernel_mul_mm_nax<half, half4x4, block_iq1_s, QK_NL, dequantize_iq1_s>;
++
++typedef decltype(kernel_mul_mm_id_with_hids_nax<half, half4x4, block_q4_K, QK_NL, dequantize_q4_K>) mat_mm_id_with_hids_nax_t;
++template [[host_name("kernel_mul_mm_id_with_hids_nax_q4_K_f32")]] kernel mat_mm_id_with_hids_nax_t kernel_mul_mm_id_with_hids_nax<half, half4x4, block_q4_K, QK_NL, dequantize_q4_K>;
++template [[host_name("kernel_mul_mm_id_with_hids_nax_q6_K_f32")]] kernel mat_mm_id_with_hids_nax_t kernel_mul_mm_id_with_hids_nax<half, half4x4, block_q6_K, QK_NL, dequantize_q6_K>;
++template [[host_name("kernel_mul_mm_id_with_hids_nax_q5_0_f32")]] kernel mat_mm_id_with_hids_nax_t kernel_mul_mm_id_with_hids_nax<half, half4x4, block_q5_0, 2, dequantize_q5_0>;
++template [[host_name("kernel_mul_mm_id_with_hids_nax_q3_K_f32")]] kernel mat_mm_id_with_hids_nax_t kernel_mul_mm_id_with_hids_nax<half, half4x4, block_q3_K, QK_NL, dequantize_q3_K>;
++template [[host_name("kernel_mul_mm_id_with_hids_nax_iq1_s_f32")]] kernel mat_mm_id_with_hids_nax_t kernel_mul_mm_id_with_hids_nax<half, half4x4, block_iq1_s, QK_NL, dequantize_iq1_s>;
++template [[host_name("kernel_mul_mm_id_with_hids_nax_iq2_xxs_f32")]] kernel mat_mm_id_with_hids_nax_t kernel_mul_mm_id_with_hids_nax<half, half4x4, block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
++template [[host_name("kernel_mul_mm_id_with_hids_nax_iq3_xxs_f32")]] kernel mat_mm_id_with_hids_nax_t kernel_mul_mm_id_with_hids_nax<half, half4x4, block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
++
++#endif // GGML_METAL_HAS_TENSOR
++
+ //
+ // matrix-vector multiplication
+ //
+@@ -7617,6 +8230,90 @@ kernel void kernel_mul_mv_id(
+         sgitg);
+ }
+ 
++// The routed matvec over the address row: `ids` are expert ids, `ne02` the row's length, and an id past it or a
++// null row entry contributes nothing (the kernel writes nothing on that branch).
++template<mul_mv_impl_fn_t impl_fn>
++kernel void kernel_mul_mv_id_addressed(
++        device const ExpertRow * experts,
++        device const    char * src1,
++        device         float * dst,
++        device const    char * ids,
++        constant     int64_t & nei0,
++        constant     int64_t & nei1,
++        constant    uint64_t & nbi1,
++        constant     int64_t & ne00,
++        constant     int64_t & ne01,
++        constant     int64_t & ne02,
++        constant    uint64_t & nb00,
++        constant    uint64_t & nb01,
++        constant    uint64_t & nb02,
++        constant     int64_t & ne10,
++        constant     int64_t & ne11,
++        constant     int64_t & ne12,
++        constant     int64_t & ne13,
++        constant    uint64_t & nb10,
++        constant    uint64_t & nb11,
++        constant    uint64_t & nb12,
++        constant     int64_t & ne0,
++        constant     int64_t & ne1,
++        constant    uint64_t & nb1,
++        threadgroup int8_t   * shared_values [[threadgroup(0)]],
++        uint3                  tgpig[[threadgroup_position_in_grid]],
++        uint                   tiitg[[thread_index_in_threadgroup]],
++        uint                   tiisg[[thread_index_in_simdgroup]],
++        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
++    const int iid1 = tgpig.z/nei0;
++    const int idx = tgpig.z%nei0;
++
++    tgpig.z = 0;
++
++    const uint32_t e = ((device const uint32_t *) (ids + iid1*nbi1))[idx];
++    if ((int64_t)e >= ne02) {
++        return;
++    }
++    device const char * src0_cur = experts[e].base;
++    if (src0_cur == nullptr) {
++        return;
++    }
++
++    const int64_t i11 = idx % ne11;
++    const int64_t i12 = iid1;
++
++    const int64_t i1 = idx;
++    const int64_t i2 = i12;
++
++    device const char * src1_cur = src1 + i11*nb11 + i12*nb12;
++    device      float * dst_cur  = dst + i1*ne0 + i2*ne1*ne0;
++
++    impl_fn(
++        /* src0 */ src0_cur,
++        /* src1 */ src1_cur,
++        /* dst  */ dst_cur,
++        /* ne00 */ ne00,
++        /* ne01 */ ne01,
++        /* ne02 */ 1,
++        /* nb00 */ nb00,
++        /* nb01 */ nb01,
++        /* nb02 */ nb02,
++        /* ne10 */ ne10,
++        /* ne11 */ 1,
++        /* ne12 */ 1,
++        /* ne13 */ 1,
++        /* nb10 */ nb10,
++        /* nb11 */ nb11,
++        /* nb12 */ nb12,
++        /* ne0  */ ne0,
++        /* ne1  */ 1,
++        /* nb1  */ nb1,
++        /* r2   */ 1,
++        /* r3   */ 1,
++        shared_values,
++        tgpig,
++        tiitg,
++        tiisg,
++        sgitg);
++}
++
+ typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_impl<float, float4, float, float4>>>) kernel_mul_mv_id_t;
+ 
+ template [[host_name("kernel_mul_mv_id_f32_f32")]]     kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_impl<float, float4, float, float4>>>;
+@@ -7641,6 +8338,20 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
+ template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl>>;
+ template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl>>;
+ 
++// The same set again over the address row.
++typedef decltype(kernel_mul_mv_id_addressed<mmv_fn<kernel_mul_mv_q4_K_f32_impl>>) kernel_mul_mv_id_addressed_t;
++
++template [[host_name("kernel_mul_mv_id_addressed_q4_K_f32")]] kernel kernel_mul_mv_id_addressed_t kernel_mul_mv_id_addressed<mmv_fn<kernel_mul_mv_q4_K_f32_impl>>;
++template [[host_name("kernel_mul_mv_id_addressed_q6_K_f32")]] kernel kernel_mul_mv_id_addressed_t kernel_mul_mv_id_addressed<mmv_fn<kernel_mul_mv_q6_K_f32_impl>>;
++// Requantisation: sub-Q4 expert stacks.
++template [[host_name("kernel_mul_mv_id_addressed_q3_K_f32")]] kernel kernel_mul_mv_id_addressed_t kernel_mul_mv_id_addressed<mmv_fn<kernel_mul_mv_q3_K_f32_impl>>;
++// Q5_0: the 32-block form for expert rows no 256-superblock quant can hold.
++template [[host_name("kernel_mul_mv_id_addressed_q5_0_f32")]] kernel kernel_mul_mv_id_addressed_t kernel_mul_mv_id_addressed<mmv_fn<mul_vec_q_n_f32_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH>>>;
++// I-quant expert stacks; iq2_xxs/iq3_xxs stage a codebook through `shared_values`, so their dispatch sets TG memory.
++template [[host_name("kernel_mul_mv_id_addressed_iq1_s_f32")]] kernel kernel_mul_mv_id_addressed_t kernel_mul_mv_id_addressed<mmv_fn<kernel_mul_mv_iq1_s_f32_impl>>;
++template [[host_name("kernel_mul_mv_id_addressed_iq2_xxs_f32")]] kernel kernel_mul_mv_id_addressed_t kernel_mul_mv_id_addressed<mmv_fn<kernel_mul_mv_iq2_xxs_f32_impl>>;
++template [[host_name("kernel_mul_mv_id_addressed_iq3_xxs_f32")]] kernel kernel_mul_mv_id_addressed_t kernel_mul_mv_id_addressed<mmv_fn<kernel_mul_mv_iq3_xxs_f32_impl>>;
++
+ kernel void kernel_pool_2d_max_f32(
+         device  const float * src0,
+         device        float * dst,

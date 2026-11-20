@@ -1,0 +1,75 @@
+[package]
+name = "oscar-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+# Boot + integration: connects oscar-offload's caching layer and the overlap
+# drafter to the engine through the seams mistralrs-core declares.
+
+[dependencies]
+oscar-offload = { path = "../oscar-offload" }
+oscar-models = { path = "../oscar-models" }
+mistralrs-core = { workspace = true, features = ["metal"] }
+oscar-kernels = { path = "../oscar-kernels" }
+candle-core = { path = "../../third_party/oscar-candle/candle-core", features = ["metal"] }
+candle-nn = { path = "../../third_party/oscar-candle/candle-nn", features = ["metal"] }
+candle-metal-kernels = { path = "../../third_party/oscar-candle/candle-metal-kernels" }
+objc2 = "0.6"
+# The menu bar app: the status item, its menu and images; the timer and strings; a drawing handler's block.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "block2", "NSApplication", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSImage", "NSImageRep", "NSBezierPath", "NSColor", "NSGraphics", "NSResponder", "NSView", "NSControl", "NSButton", "NSCell", "NSAlert", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSWindow", "NSWorkspace", "NSRunningApplication", "NSEvent", "NSFont", "NSAttributedString", "NSStringDrawing"] }
+objc2-foundation = { version = "0.3.2", features = ["block2", "NSError", "NSBundle", "NSTimer", "NSString", "NSArray", "NSGeometry", "NSThread", "NSRunLoop", "NSDate", "NSURL", "NSAttributedString", "NSDictionary", "NSObject", "NSValue"] }
+block2 = "0.6"
+objc2-metal = { version = "0.3.1", features = ["MTLBuffer", "MTLResource", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLBlitCommandEncoder", "MTLDevice", "MTLEvent", "block2"] }
+# pressure module: sysctlbyname/sysconf (libdispatch + mach come from libSystem).
+libc = "0.2"
+# The overlap drafter samples with the engine's own RNG type.
+rand = "0.9"
+rand_isaac = "0.4.0"
+async-trait = "0.1.89"
+thiserror = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# The fork's model builder and engine, which the CLI drives.
+mistralrs = { workspace = true, features = ["metal"] }
+# `serve` subcommand: the fork's OpenAI-compatible router over the same
+# built model (swagger-ui off — API only).
+mistralrs-server-core = { workspace = true, features = ["metal"] }
+axum = "0.8"
+anyhow = { workspace = true }
+tokio = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+# `~/.oscar/settings.toml`, what the menu bar's pick remembers.
+toml = "0.9"
+terminal_size = "0.4"
+# `download` subcommand: the Hugging Face tree/resolve endpoints, integrity
+# of fetched shards, progress, and the API's JSON.
+reqwest = { version = "0.12", features = ["stream"] }
+indicatif = "0.18"
+sha2 = "0.10"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Tokenizer prefetch into the cache the serve path reads.
+hf-hub = "0.4"
+
+[dev-dependencies]
+# The K3 render tests build serve-shaped messages for apply_chat_template_to.
+either = "1"
+indexmap = "2"
+# The chat-template test splits a render with a tokenizer of its own; the default features select the onig regex
+# backend, under which the kimi-k2 split pattern does not compile.
+tokenizers = { version = "0.21.4", default-features = false }
+
+[build-dependencies]
+# Compiles the vendored ggml k-quant reference quantisers
+# (third_party/ggml-quants) that `download`'s re-quantisation runs on.
+cc = "1"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "oscar-runtime"
+path = "src/main.rs"

@@ -1,0 +1,653 @@
+Subject: [mistral.rs] vendor-sampling-defaults
+
+  A sampling field the client omitted is answered by the MODEL's own shipped `generation_config.json` before the API's default can stand in for it, applied once on the single path every HTTP handler already sends through
+  Without it an OpenAI client that sends no temperature is served at 1.0 with every truncation disabled, which it cannot see and did not ask for.
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 2
+
+---
+diff --git c/mistralrs-core/src/sampler.rs w/mistralrs-core/src/sampler.rs
+index 43564cd4..8e78c1da 100644
+--- c/mistralrs-core/src/sampler.rs
++++ w/mistralrs-core/src/sampler.rs
+@@ -2,7 +2,7 @@
+ 
+ use std::{
+     collections::{HashMap, HashSet},
+-    sync::{Arc, LazyLock, Mutex},
++    sync::{Arc, LazyLock, Mutex, OnceLock},
+ };
+ 
+ use candle_core::{DType, Device, Error, Result, Tensor, D};
+@@ -30,6 +30,7 @@ pub struct ModelGenerationDefaults {
+     pub top_k: Option<usize>,
+     pub top_p: Option<f64>,
+     pub min_p: Option<f64>,
++    pub presence_penalty: Option<f32>,
+     pub repetition_penalty: Option<f32>,
+     pub max_new_tokens: Option<usize>,
+     pub max_length: Option<usize>,
+@@ -42,12 +43,41 @@ impl ModelGenerationDefaults {
+             && self.top_k.is_none()
+             && self.top_p.is_none()
+             && self.min_p.is_none()
++            && self.presence_penalty.is_none()
+             && self.repetition_penalty.is_none()
+             && self.max_new_tokens.is_none()
+             && self.max_length.is_none()
+     }
+ }
+ 
++/// The most complete row the model's authors published per generation mode, each whole on its own: the
++/// embedder installs what it has; the shipped `generation_config.json` stands in for a mode with no row.
++#[derive(Clone, Debug, Default)]
++pub struct ModeGenerationDefaults {
++    pub thinking: Option<ModelGenerationDefaults>,
++    pub non_thinking: Option<ModelGenerationDefaults>,
++}
++
++impl ModeGenerationDefaults {
++    /// The row for the mode the request carries, or `None` when its authors
++    /// published none and the shipped file should stand in.
++    pub fn row(&self, thinking: bool) -> Option<&ModelGenerationDefaults> {
++        [&self.non_thinking, &self.thinking][usize::from(thinking)].as_ref()
++    }
++}
++
++static MODE_DEFAULTS: OnceLock<ModeGenerationDefaults> = OnceLock::new();
++
++/// Install the per-mode rows before the first request; later calls are ignored. Unset, the shipped row covers both.
++pub fn set_mode_generation_defaults(defaults: ModeGenerationDefaults) {
++    let _ = MODE_DEFAULTS.set(defaults);
++}
++
++/// The installed per-mode rows, or `None` when the embedder installed none.
++pub fn mode_generation_defaults() -> Option<&'static ModeGenerationDefaults> {
++    MODE_DEFAULTS.get()
++}
++
+ #[derive(Clone, Debug, Serialize, Deserialize)]
+ /// Stop sequences or ids.
+ pub enum StopTokens {
+@@ -71,6 +101,8 @@ pub struct SamplingParams {
+     pub logits_bias: Option<HashMap<u32, f32>>,
+     pub n_choices: usize,
+     pub dry_params: Option<DrySamplingParams>,
++    /// Seeds the request's own sampler RNG, so the same request draws the same tokens; unset, the engine's shared one.
++    pub seed: Option<u64>,
+ }
+ 
+ impl SamplingParams {
+@@ -95,6 +127,7 @@ impl SamplingParams {
+             logits_bias: None,
+             n_choices: 1,
+             dry_params: None,
++            seed: None,
+         }
+     }
+ 
+@@ -117,41 +150,34 @@ impl SamplingParams {
+             logits_bias: None,
+             n_choices: 1,
+             dry_params: None,
++            seed: None,
+         }
+     }
+ 
+-    /// Applies model-level generation defaults onto this request-local sampler config.
++    /// Fills the fields the caller left unset from the model's shipped generation defaults; what the caller
++    /// set always wins, so a client's temperature is never replaced by the model's.
+     ///
+-    /// This is opt-in and only updates fields that the model default explicitly provides.
++    /// `do_sample: false` is a model shipping greedy decoding, so only `top_k = 1` is taken from it. A zero
++    /// temperature or top_k needs no special case: the sampler reads them as argmax and as no truncation.
+     pub fn apply_model_defaults(&mut self, defaults: &ModelGenerationDefaults) {
+         if defaults.do_sample == Some(false) {
+-            self.temperature = None;
+-            self.top_k = Some(1);
+-            self.top_p = None;
+-            self.min_p = None;
++            self.top_k = self.top_k.or(Some(1));
++        } else {
++            self.temperature = self.temperature.or(defaults.temperature);
++            self.top_k = self.top_k.or(defaults.top_k);
++            self.top_p = self.top_p.or(defaults.top_p);
++            self.min_p = self.min_p.or(defaults.min_p);
+         }
++        self.presence_penalty = self.presence_penalty.or(defaults.presence_penalty);
++        self.repetition_penalty = self.repetition_penalty.or(defaults.repetition_penalty);
++        self.max_len = self.max_len.or(defaults.max_new_tokens);
++    }
+ 
+-        if let Some(temperature) = defaults.temperature {
+-            self.temperature = if temperature == 0.0 {
+-                None
+-            } else {
+-                Some(temperature)
+-            };
+-        }
+-        if let Some(top_k) = defaults.top_k {
+-            self.top_k = if top_k == 0 { None } else { Some(top_k) };
+-        }
+-        if let Some(top_p) = defaults.top_p {
+-            self.top_p = Some(top_p);
+-        }
+-        if let Some(min_p) = defaults.min_p {
+-            self.min_p = Some(min_p);
+-        }
+-        if let Some(repetition_penalty) = defaults.repetition_penalty {
+-            self.repetition_penalty = Some(repetition_penalty);
+-        }
+-        if let Some(max_new_tokens) = defaults.max_new_tokens {
+-            self.max_len = Some(max_new_tokens);
++    /// The row a generation runs at, for the mode it carries: the embedder's row for that mode, else the
++    /// model's `shipped` file. What the caller set stays, as `apply_model_defaults` says.
++    pub fn apply_mode_defaults(&mut self, thinking: bool, shipped: Option<&ModelGenerationDefaults>) {
++        if let Some(row) = mode_generation_defaults().and_then(|m| m.row(thinking)).or(shipped) {
++            self.apply_model_defaults(row);
+         }
+     }
+ }
+@@ -404,6 +430,25 @@ impl Sampler {
+         })
+     }
+ 
++    fn decode(&self, token: u32) -> Result<Option<String>> {
++        let decode = |t: &Arc<Tokenizer>| t.decode(&[token], false).map_err(|e| Error::Msg(e.to_string()));
++        self.tokenizer.as_ref().map(decode).transpose()
++    }
++
++    /// A token as every path reports it, the device sampler included: natural log probabilities, the alternatives
++    /// the first `top_n_logprobs` of `ranked` (best first) when asked.
++    fn logprobs(&self, token: u32, logprob: f32, ranked: Option<impl Iterator<Item = (u32, f32)>>) -> Result<Logprobs> {
++        let top_logprobs = ranked
++            .map(|r| {
++                r.take(self.top_n_logprobs)
++                    .map(|(token, logprob)| Ok(TopLogprob { token, logprob, bytes: self.decode(token)? }))
++                    .collect::<Result<Vec<_>>>()
++            })
++            .transpose()?;
++        Ok(Logprobs { token, logprob, bytes: self.decode(token)?, top_logprobs })
++    }
++
++    #[allow(dead_code)]
+     fn get_top_logprobs(&self, probs: &[f32]) -> Result<Vec<TopLogprob>> {
+         let k = self.top_n_logprobs.min(probs.len());
+         if k == 0 {
+@@ -439,36 +484,62 @@ impl Sampler {
+         Ok(result)
+     }
+ 
++    /// The greedy token, its probability the softmax's at temperature 1.
+     fn sample_argmax(&self, logits: Tensor, return_logprobs: bool) -> Result<Logprobs> {
+-        let probs: Vec<f32> = logits.to_vec1()?;
+-        let next_token = argmax_f32(&probs);
+-        let logprob = probs[next_token as usize].log(10.0);
++        let mut logits: Vec<f32> = logits.to_vec1()?;
++        let next_token = argmax_f32(&logits);
++        let m = logits[next_token as usize];
++        let ln_z = logits.iter().map(|x| (x - m).exp()).sum::<f32>().ln();
++        let ranked = return_logprobs.then(|| partial_sort_top_k(&mut logits, self.top_n_logprobs, false));
++        self.logprobs(next_token, -ln_z, ranked.map(|r| r.into_iter().map(move |(t, x)| (t, x - m - ln_z))))
++    }
+ 
+-        let top_logprobs = if return_logprobs {
+-            Some(self.get_top_logprobs(&probs)?)
+-        } else {
+-            None
+-        };
++    /// `probs` cut in place as the device sampler cuts them: top-k, then top-p and min-p over the top-k's order,
++    /// returned best first before the later cuts.
++    fn cut(&self, probs: &mut [f32]) -> Vec<(u32, f32)> {
++        let k = if self.top_k > 0 { self.top_k as usize } else { probs.len() };
++        let ranked = partial_sort_top_k(probs, k, true);
++        let (top_p, min_p) = (self.top_p as f32, self.min_p as f32);
++        let floor = ranked.first().map_or(0.0, |r| r.1) * min_p;
++        let mut cum = 0.0;
++        for &(i, p) in &ranked {
++            let mut keep = true;
++            if top_p > 0.0 && top_p < 1.0 {
++                if cum >= top_p {
++                    keep = false;
++                } else {
++                    cum += p;
++                }
++            }
++            if min_p > 0.0 && min_p < 1.0 && floor >= p {
++                keep = false;
++            }
++            if !keep {
++                probs[i as usize] = 0.0;
++            }
++        }
++        ranked
++    }
+ 
+-        let bytes = if let Some(tokenizer) = &self.tokenizer {
+-            Some(
+-                tokenizer
+-                    .decode(&[next_token], false)
+-                    .map_err(|x| Error::Msg(x.to_string()))?,
+-            )
+-        } else {
+-            None
+-        };
+-
+-        Ok(Logprobs {
+-            token: next_token,
+-            logprob,
+-            top_logprobs,
+-            bytes,
+-        })
++    /// A draw over `probs`; a distribution they cannot make names the probability at fault.
++    fn draw_multinomial(&self, probs: &[f32], rng: Arc<Mutex<Isaac64Rng>>) -> Result<u32> {
++        let distr = WeightedIndex::new(probs).map_err(|e| {
++            let bad = probs.iter().enumerate().find(|(_, p)| !p.is_finite() || **p < 0.0);
++            Error::Msg(match bad {
++                Some((idx, prob)) => {
++                    format!("Invalid sampling probability at index {idx}: {prob}. The model likely produced NaN/Inf logits.")
++                }
++                None if probs.iter().all(|p| *p <= 0.0) => {
++                    "All sampling probabilities are zero after filtering (top-k/top-p/min-p).".to_string()
++                }
++                None => format!("Failed to construct multinomial sampler: {e}"),
++            })
++        })?;
++        Ok(distr.sample(&mut *rng.lock().expect("could not lock rng mutex")) as u32)
+     }
+ 
+     #[allow(unused)]
++    #[allow(dead_code)]
+     fn sample_fast(
+         &self,
+         logits: Tensor,
+@@ -654,6 +725,8 @@ impl Sampler {
+             bytes,
+         })
+     }
++
++    #[allow(dead_code)]
+     fn sample_speculative_top_kp_min_p(
+         &self,
+         logits: Tensor,
+@@ -732,6 +805,7 @@ impl Sampler {
+         })
+     }
+ 
++    #[allow(dead_code)]
+     fn sample_multinomial(
+         &self,
+         probs: &[f32],
+@@ -800,6 +874,7 @@ impl Sampler {
+     }
+ 
+     #[allow(clippy::too_many_arguments)]
++    #[allow(dead_code)]
+     fn sample_top_kp_min_p(
+         &self,
+         probs: &mut [f32],
+@@ -1009,7 +1084,6 @@ impl Sampler {
+     /// Sample the provided tokens.
+     ///
+     /// If the temperature is `None`, argmax sampling is used. Otherwise, the selected sampling is used.
+-    /// With `top-p` sampling, if the `top-p` value is `<= 0.0` or `>= 1.0`, multinomial sampling is used.
+     pub fn sample(
+         &self,
+         logits: Tensor,
+@@ -1019,64 +1093,20 @@ impl Sampler {
+         sample_speculative: bool,
+         multiple_sequences: bool,
+     ) -> Result<Logprobs> {
+-        // if cfg!(feature = "metal") && !multiple_sequences {
+-        //     return self.sample_fast(
+-        //         logits,
+-        //         context,
+-        //         return_logprobs,
+-        //         self.top_k,
+-        //         self.top_p,
+-        //         self.min_p,
+-        //     );
+-        // }
+-
+         let logits = logits.to_vec1()?;
+         let mut logits = self.apply_penalties(logits, context)?;
+         for processor in &self.logits_processors {
+             logits = processor.apply(&logits, context)?;
+         }
+-        let next_token = if sample_speculative {
+-            match self.temperature {
+-                None => self.sample_speculative_top_kp_min_p(
+-                    logits,
+-                    return_logprobs,
+-                    self.top_k,
+-                    self.top_p as f32,
+-                    self.min_p as f32,
+-                )?,
+-                Some(temperature) => {
+-                    let logits = (&logits / temperature)?;
+-                    let probs = candle_nn::ops::softmax_last_dim(&logits)?;
+-
+-                    self.sample_speculative_top_kp_min_p(
+-                        probs,
+-                        return_logprobs,
+-                        self.top_k,
+-                        self.top_p as f32,
+-                        self.min_p as f32,
+-                    )?
+-                }
+-            }
+-        } else {
+-            match self.temperature {
+-                None => self.sample_argmax(logits, return_logprobs)?,
+-                Some(temperature) => {
+-                    let logits = (&logits / temperature)?;
+-                    let probs = candle_nn::ops::softmax_last_dim(&logits)?;
+-                    let mut probs: Vec<f32> = probs.to_vec1()?;
+-
+-                    self.sample_top_kp_min_p(
+-                        &mut probs,
+-                        self.top_k,
+-                        self.top_p as f32,
+-                        self.min_p as f32,
+-                        return_logprobs,
+-                        rng,
+-                    )?
+-                }
+-            }
++        let Some(temperature) = self.temperature else {
++            return self.sample_argmax(logits, return_logprobs);
+         };
+-        Ok(next_token)
++        let probs = candle_nn::ops::softmax_last_dim(&(&logits / temperature)?)?;
++        let mut probs: Vec<f32> = probs.to_vec1()?;
++        let ranked = self.cut(&mut probs);
++        let next_token = if sample_speculative { argmax_f32(&probs) } else { self.draw_multinomial(&probs, rng)? };
++        let ranked = return_logprobs.then(|| ranked.into_iter().map(|(t, p)| (t, p.ln())));
++        self.logprobs(next_token, probs[next_token as usize].ln(), ranked)
+     }
+ }
+ 
+@@ -1084,84 +1114,30 @@ impl Sampler {
+ mod tests {
+     use super::{ModelGenerationDefaults, SamplingParams};
+ 
++    /// Every path reports the softmax's natural log: over logits 0..1023 the top holds 1 - 1/e, each next 1/e of it.
+     #[test]
+-    fn test_argmax() {
++    fn every_path_reports_natural_log_probabilities() {
+         use super::Sampler;
+         use candle_core::{Device, Tensor};
+         use rand::SeedableRng;
+         use rand_isaac::Isaac64Rng;
+-        use std::sync::Arc;
+-        use std::sync::Mutex;
++        use std::sync::{Arc, Mutex};
+ 
+-        let sampler = Sampler::new(
+-            None,
+-            10,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            32,
+-            0.1,
+-            0.05,
+-            vec![],
+-        )
+-        .unwrap();
+-        let logits = Tensor::arange(0f32, 1024f32, &Device::Cpu).unwrap();
+-        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(42)));
+-        let res = sampler
+-            .sample(
+-                logits,
+-                &(0..1024).collect::<Vec<_>>(),
+-                false,
+-                rng,
+-                false,
+-                false,
+-            )
+-            .unwrap();
+-        assert_eq!(res.token, 1023);
+-        assert_eq!(res.top_logprobs, None);
+-        assert_eq!(res.logprob, 1023f64.log(10.) as f32)
+-    }
+-
+-    #[test]
+-    fn test_gumbel_speculative() {
+-        use super::Sampler;
+-        use candle_core::{Device, Tensor};
+-        use rand::SeedableRng;
+-        use rand_isaac::Isaac64Rng;
+-        use std::sync::Arc;
+-        use std::sync::Mutex;
+-
+-        let sampler = Sampler::new(
+-            None,
+-            10,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            32,
+-            0.1,
+-            0.05,
+-            vec![],
+-        )
+-        .unwrap();
+-        let logits = Tensor::arange(0f32, 1024f32, &Device::Cpu).unwrap();
+-        let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(42)));
+-        let res = sampler
+-            .sample(
+-                logits,
+-                &(0..1024).collect::<Vec<_>>(),
+-                false,
+-                rng,
+-                true,
+-                false,
+-            )
+-            .unwrap();
+-        assert_eq!(res.token, 1023);
+-        assert_eq!(res.top_logprobs, None);
+-        assert_eq!(res.logprob, 1023f64.log(10.) as f32)
++        let top = (1.0 - (-1f32).exp()).ln();
++        for (temperature, speculative) in [(None, false), (None, true), (Some(1.0), false), (Some(1.0), true)] {
++            let sampler = Sampler::new(temperature, 10, None, None, None, None, None, 32, 0.1, 0.05, vec![]).unwrap();
++            let logits = Tensor::arange(0f32, 1024f32, &Device::Cpu).unwrap();
++            let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(42)));
++            let res = sampler.sample(logits, &[0], true, rng, speculative, false).unwrap();
++            assert_eq!(res.token, 1023);
++            assert!((res.logprob - top).abs() < 1e-5, "{temperature:?} {speculative}: {}", res.logprob);
++            let alternatives = res.top_logprobs.unwrap();
++            assert_eq!(alternatives.len(), 10);
++            for (i, a) in alternatives.iter().enumerate() {
++                assert_eq!(a.token, 1023 - i as u32);
++                assert!((a.logprob - (top - i as f32)).abs() < 1e-4, "{temperature:?} {speculative} {i}");
++            }
++        }
+     }
+ 
+     #[test]
+@@ -1173,6 +1149,7 @@ mod tests {
+             top_k: Some(32),
+             top_p: Some(0.9),
+             min_p: Some(0.05),
++            presence_penalty: Some(1.2),
+             repetition_penalty: Some(1.1),
+             max_new_tokens: Some(256),
+             max_length: None,
+@@ -1182,27 +1159,109 @@ mod tests {
+         assert_eq!(params.top_k, Some(32));
+         assert_eq!(params.top_p, Some(0.9));
+         assert_eq!(params.min_p, Some(0.05));
++        assert_eq!(params.presence_penalty, Some(1.2));
+         assert_eq!(params.repetition_penalty, Some(1.1));
+         assert_eq!(params.max_len, Some(256));
+     }
+ 
+     #[test]
+-    fn test_apply_model_defaults_disables_sampling_when_requested() {
++    fn test_apply_model_defaults_never_overrides_the_caller() {
+         let mut params = SamplingParams {
+             temperature: Some(0.7),
+             top_k: Some(40),
+-            top_p: Some(0.9),
+-            min_p: Some(0.1),
+             ..SamplingParams::neutral()
+         };
+         params.apply_model_defaults(&ModelGenerationDefaults {
++            do_sample: Some(true),
++            temperature: Some(0.6),
++            top_k: Some(20),
++            top_p: Some(0.95),
++            ..Default::default()
++        });
++
++        // What the caller sent survives; only the gaps are filled.
++        assert_eq!(params.temperature, Some(0.7));
++        assert_eq!(params.top_k, Some(40));
++        assert_eq!(params.top_p, Some(0.95));
++    }
++
++    #[test]
++    fn test_apply_model_defaults_greedy_model_fills_top_k_only() {
++        let mut params = SamplingParams::neutral();
++        params.apply_model_defaults(&ModelGenerationDefaults {
+             do_sample: Some(false),
++            temperature: Some(0.7),
++            top_p: Some(0.9),
+             ..Default::default()
+         });
+ 
+-        assert_eq!(params.temperature, None);
+         assert_eq!(params.top_k, Some(1));
++        assert_eq!(params.temperature, None);
+         assert_eq!(params.top_p, None);
+-        assert_eq!(params.min_p, None);
++    }
++}
++
++/// A row's sampling parameters a device sampler can take: no temperature is greedy, a temperature samples under
++/// top-k, top-p, then min-p; a presence penalty (0 for none) comes off every held token's logit first.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct DeviceSampleSpec {
++    pub temperature: Option<f32>,
++    pub top_k: u32,
++    pub top_p: f32,
++    pub min_p: f32,
++    pub presence_penalty: f32,
++}
++
++/// The sampler a runtime installs on the device: one row of logits sampled into a two-word tensor (the token and
++/// its log-probability's bits) the next step's embedding reads in place, read back once the step's buffer completed.
++pub trait DeviceSampler: Send + Sync {
++    /// Whether a decode step may queue ahead now; no while a drafter is live, whose lead the queued step would eat.
++    fn active(&self) -> bool {
++        true
++    }
++    fn supports(&self, spec: &DeviceSampleSpec) -> bool;
++    /// A two-word output the caller keeps across steps.
++    fn output(&self, device: &Device) -> Result<Tensor>;
++    /// The presence penalty's context: the sequence's tokens so far over `vocab` entries; the sampler adds
++    /// each token it decides, so the caller builds it once per sequence.
++    fn context(&self, device: &Device, vocab: usize, tokens: &[u32]) -> Result<Tensor>;
++    fn sample(
++        &self,
++        logits: &Tensor,
++        spec: &DeviceSampleSpec,
++        seed: u64,
++        position: u64,
++        out: &Tensor,
++        seen: Option<&Tensor>,
++    ) -> Result<()>;
++    fn read(&self, out: &Tensor) -> Result<(u32, f32)>;
++}
++
++static DEVICE_SAMPLER: std::sync::RwLock<Option<Arc<dyn DeviceSampler>>> =
++    std::sync::RwLock::new(None);
++
++pub fn register_device_sampler(sampler: Arc<dyn DeviceSampler>) {
++    *DEVICE_SAMPLER.write().expect("device sampler registry") = Some(sampler);
++}
++
++pub(crate) fn device_sampler() -> Option<Arc<dyn DeviceSampler>> {
++    DEVICE_SAMPLER.read().expect("device sampler registry").clone()
++}
++
++impl Sampler {
++    /// This sampler as a device spec, when it has one: no frequency or
++    /// repetition penalty in force, no DRY, no logits processors.
++    pub fn device_spec(&self) -> Option<DeviceSampleSpec> {
++        let plain = self.frequency_penalty.is_none_or(|v| v == 0.0)
++            && self.repetition_penalty.is_none_or(|v| v == 1.0)
++            && self.dry_params.is_none()
++            && self.logits_processors.is_empty();
++        plain.then(|| DeviceSampleSpec {
++            temperature: self.temperature.map(|t| t as f32),
++            top_k: u32::try_from(self.top_k).unwrap_or(0),
++            top_p: self.top_p as f32,
++            min_p: self.min_p as f32,
++            presence_penalty: self.presence_penalty.unwrap_or(0.0),
++        })
+     }
+ }
+diff --git c/mistralrs-server-core/src/handler_core.rs w/mistralrs-server-core/src/handler_core.rs
+index fccd2387..e7f73f4a 100644
+--- c/mistralrs-server-core/src/handler_core.rs
++++ w/mistralrs-server-core/src/handler_core.rs
+@@ -2,7 +2,11 @@
+ 
+ use anyhow::{Context, Result};
+ use axum::{extract::Json, http::StatusCode, response::IntoResponse};
+-use mistralrs_core::{Request, Response};
++use either::Either;
++use indexmap::IndexMap;
++use mistralrs_core::{
++    default_system_prompt, Request, RequestMessage, Response, DEFAULT_ENABLE_THINKING,
++};
+ use serde::Serialize;
+ use tokio::sync::mpsc::{channel, Receiver, Sender};
+ 
+@@ -93,9 +97,38 @@ pub async fn send_request(state: &SharedMistralRsState, request: Request) -> Res
+ 
+ pub async fn send_request_with_model(
+     state: &SharedMistralRsState,
+-    request: Request,
++    mut request: Request,
+     model_id: Option<&str>,
+ ) -> Result<()> {
++    // A sampling field the client omitted takes the model's published row for the mode `enable_thinking`
++    // chose, before the API's default (temperature 1.0, no truncation). What the client sent always wins.
++    if let Request::Normal(normal) = &mut request {
++        let thinking = match &normal.messages {
++            RequestMessage::Chat { enable_thinking, .. }
++            | RequestMessage::MultimodalChat { enable_thinking, .. } => *enable_thinking,
++            _ => None,
++        }
++        .unwrap_or(DEFAULT_ENABLE_THINKING);
++        let shipped = state.config(model_id).ok().and_then(|cfg| cfg.generation_defaults);
++        normal.sampling_params.apply_mode_defaults(thinking, shipped.as_ref());
++        // A chat with no system message gets the embedder's default ahead of the client's messages.
++        if let Some(system) = default_system_prompt() {
++            if let RequestMessage::Chat { messages, .. } | RequestMessage::MultimodalChat { messages, .. } =
++                &mut normal.messages
++            {
++                let has_system = messages
++                    .iter()
++                    .any(|m| matches!(m.get("role"), Some(Either::Left(r)) if r == "system"));
++                if !has_system {
++                    let mut m = IndexMap::new();
++                    m.insert("role".to_string(), Either::Left("system".to_string()));
++                    m.insert("content".to_string(), Either::Left(system.to_string()));
++                    messages.insert(0, m);
++                }
++            }
++        }
++    }
++
+     let sender = state
+         .get_sender(model_id)
+         .context("mistral.rs sender not available.")?;

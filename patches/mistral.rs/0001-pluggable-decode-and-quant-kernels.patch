@@ -1,0 +1,200 @@
+Subject: [mistral.rs] pluggable-decode-and-quant-kernels
+
+  The APIs the fork opens so oscar can drive it: the engine's step taken through oscar's own round, where prefill may break, and the quant-side kernels oscar's models reach.
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 6
+
+---
+diff --git c/mistralrs/src/lib.rs w/mistralrs/src/lib.rs
+index 451bdf43..dc4e312e 100644
+--- c/mistralrs/src/lib.rs
++++ w/mistralrs/src/lib.rs
+@@ -247,7 +247,7 @@ pub use mistralrs_core::{
+     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
+ };
+ pub use mistralrs_core::{SearchCallback, SearchResult, ToolCallback};
+-pub use model::{best_device, Model};
++pub use model::{best_device, Model, Stream};
+ pub use model_builder_trait::{AnyModelBuilder, MultiModelBuilder};
+ pub use multimodal_model::{MultimodalModelBuilder, UqffMultimodalModelBuilder};
+ pub use speculative::TextSpeculativeBuilder;
+@@ -283,7 +283,7 @@ pub use mistralrs_core::{
+ 
+ // ========== Config Types ==========
+ pub use mistralrs_core::{
+-    DefaultSchedulerMethod, IsqType, MemoryGpuConfig, MistralRsConfig, ModelDType,
++    CacheConfig, DefaultSchedulerMethod, IsqType, MemoryGpuConfig, MistralRsConfig, ModelDType,
+     PagedAttentionConfig, PagedCacheType, SchedulerConfig, WebSearchOptions,
+ };
+ 
+diff --git c/mistralrs/src/gguf.rs w/mistralrs/src/gguf.rs
+index 53d1cbed..097407ad 100644
+--- c/mistralrs/src/gguf.rs
++++ w/mistralrs/src/gguf.rs
+@@ -208,6 +208,15 @@ impl GgufModelBuilder {
+         self
+     }
+ 
++    /// Turn the prefix cacher on or off. Under paged attention `with_prefix_cache_n`'s count bounds nothing:
++    /// its map is written only when paging is off, and a freed block keeps its hash until reallocated.
++    pub fn with_prefix_cache(mut self, enabled: bool) -> Self {
++        if !enabled {
++            self.prefix_cache_n = None;
++        }
++        self
++    }
++
+     /// Enable logging.
+     pub fn with_logging(mut self) -> Self {
+         self.with_logging = true;
+diff --git c/mistralrs-quant/src/lib.rs w/mistralrs-quant/src/lib.rs
+index 90985c92..a61e899d 100644
+--- c/mistralrs-quant/src/lib.rs
++++ w/mistralrs-quant/src/lib.rs
+@@ -835,6 +835,14 @@ impl TryFrom<GgmlDType> for IsqType {
+             GgmlDType::Q8_0 => Ok(Self::Q8_0),
+             GgmlDType::Q8_1 => Ok(Self::Q8_1),
+             GgmlDType::Q8K => Ok(Self::Q8K),
++            // Encoding an i-quant is an importance-matrix codebook search, not a
++            // rounding rule, so it can never be an in-situ target.
++            GgmlDType::Iq1S | GgmlDType::Iq2XXS | GgmlDType::Iq3XXS => {
++                candle_core::bail!(
++                    "{value:?} cannot be ISQ target: i-quant encoding needs importance \
++                     matrix, not implemented (dequantise only)"
++                )
++            }
+             GgmlDType::BF16 | GgmlDType::F32 | GgmlDType::F16 => {
+                 candle_core::bail!("Expected valid GGML ISQ type.")
+             }
+@@ -1047,6 +1055,21 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
+     fn is_distributed(&self) -> Option<DistributedKind> {
+         None
+     }
++
++    /// Borrows the Metal-backed weight when the method holds a single `(N, K)` stack, as the fused matvec needs.
++    #[cfg(feature = "metal")]
++    fn metal_quant_weight_view(&self) -> Option<MetalQuantWeightView<'_>> {
++        None
++    }
++
++}
++
++/// Read-only view over a Metal-resident `(N, K)` quantised weight, for the fused matvec fast paths.
++#[cfg(feature = "metal")]
++pub struct MetalQuantWeightView<'a> {
++    pub storage: &'a candle_core::quantized::metal::QMetalStorage,
++    pub n: usize,
++    pub k: usize,
+ }
+ 
+ impl Module for dyn QuantMethod {
+diff --git c/mistralrs-quant/src/gguf/mod.rs w/mistralrs-quant/src/gguf/mod.rs
+index 6a99ab5c..4d7fcec8 100644
+--- c/mistralrs-quant/src/gguf/mod.rs
++++ w/mistralrs-quant/src/gguf/mod.rs
+@@ -130,6 +130,27 @@ impl QuantMethod for GgufMatMul {
+         }
+     }
+ 
++
++    #[cfg(feature = "metal")]
++    fn metal_quant_weight_view(&self) -> Option<crate::MetalQuantWeightView<'_>> {
++        // fused-matvec path folds matvec only, no bias broadcast.
++        if self.b.is_some() {
++            return None;
++        }
++        match &self.w {
++            QMatMul::QTensor(q) => {
++                let storage = q.metal_storage()?;
++                let dims = q.shape().dims();
++                let (n, k) = match dims {
++                    [n, k] => (*n, *k),
++                    _ => return None,
++                };
++                Some(crate::MetalQuantWeightView { storage, n, k })
++            }
++            QMatMul::Tensor(_) | QMatMul::TensorF16(_) => None,
++        }
++    }
++
+     fn apply_isq(
+         self: Arc<Self>,
+         dtype: Option<IsqType>,
+@@ -241,6 +262,10 @@ impl QuantizedSerde for GgufMatMul {
+                     GgmlDType::Q5K => 13,
+                     GgmlDType::Q6K => 14,
+                     GgmlDType::Q8K => 15,
++                    // Dequantise-only here, but the tags belong to the same ggml enumeration and round-trip for free.
++                    GgmlDType::Iq2XXS => 16,
++                    GgmlDType::Iq3XXS => 18,
++                    GgmlDType::Iq1S => 19,
+                     // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
+                     GgmlDType::BF16 => 30,
+                 };
+diff --git c/mistralrs-quant/src/unquantized/mod.rs w/mistralrs-quant/src/unquantized/mod.rs
+index 704b5b33..ee389846 100644
+--- c/mistralrs-quant/src/unquantized/mod.rs
++++ w/mistralrs-quant/src/unquantized/mod.rs
+@@ -191,6 +191,7 @@ impl QuantMethod for UnquantLinear {
+                     .reshape((b_size * seq_len * num_experts_per_tok, hidden_dim))?;
+ 
+                 // Matmul: [b*s*k, hidden_dim] @ [b*s*k, hidden_dim, out_features] -> [b*s*k, out_features]
++                // Matmul: [n*k, hidden] @ [n*k, hidden, out] -> [n*k, out]
+                 let result = a_expanded
+                     .unsqueeze(1)?
+                     .matmul(&selected_w.transpose(1, 2)?)?
+@@ -199,9 +200,16 @@ impl QuantMethod for UnquantLinear {
+                 // Reshape back to [b, s, k, out_features]
+                 result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+             }
+-            // CUDA path: 3D input (num_tokens, 1, hidden_dim)
+-            &[num_tokens, 1, hidden_dim] => {
++            // CUDA path: (num_tokens, mid, hidden_dim). mid==1 → gate/up (broadcast);
++            // mid==num_experts_per_tok → down (per-expert intermediate).
++            &[num_tokens, mid, hidden_dim] => {
+                 let (_, num_experts_per_tok) = indices.dims2()?;
++                if mid != 1 && mid != num_experts_per_tok {
++                    candle_core::bail!(
++                        "UnquantLinear::gather_forward: middle dim {mid} must be 1 (broadcast) \
++                         or num_experts_per_tok ({num_experts_per_tok})"
++                    );
++                }
+ 
+                 // Flatten indices
+                 let flat_indices = indices.reshape((num_tokens * num_experts_per_tok,))?;
+@@ -209,12 +217,15 @@ impl QuantMethod for UnquantLinear {
+                 // Select expert weights: [n*k, out_features, in_features]
+                 let selected_w = w.index_select(&flat_indices, 0)?;
+ 
+-                // Broadcast input: [n, 1, hidden] -> [n, k, hidden] -> [n*k, hidden]
+-                let a_expanded = a
+-                    .broadcast_as((num_tokens, num_experts_per_tok, hidden_dim))?
+-                    .reshape((num_tokens * num_experts_per_tok, hidden_dim))?;
++                let a_expanded = if mid == 1 {
++                    // Broadcast: [n, 1, hidden] -> [n, k, hidden] -> [n*k, hidden]
++                    a.broadcast_as((num_tokens, num_experts_per_tok, hidden_dim))?
++                        .reshape((num_tokens * num_experts_per_tok, hidden_dim))?
++                } else {
++                    // Already expanded: [n, k, hidden] -> [n*k, hidden]
++                    a.reshape((num_tokens * num_experts_per_tok, hidden_dim))?
++                };
+ 
+-                // Matmul: [n*k, hidden] @ [n*k, hidden, out] -> [n*k, out]
+                 let result = a_expanded
+                     .unsqueeze(1)?
+                     .matmul(&selected_w.transpose(1, 2)?)?
+diff --git c/mistralrs-quant/src/metal_kernels/mod.rs w/mistralrs-quant/src/metal_kernels/mod.rs
+index 467573dc..94c443cf 100644
+--- c/mistralrs-quant/src/metal_kernels/mod.rs
++++ w/mistralrs-quant/src/metal_kernels/mod.rs
+@@ -330,7 +330,8 @@ impl Kernels {
+             let func = self.load_function(device, &name, None)?;
+             let pipeline = device
+                 .new_compute_pipeline_state_with_function(&func)
+-                .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
++                .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?
++                .with_name(&name);
+             pipelines.insert(name, pipeline.clone());
+ 
+             Ok(pipeline)

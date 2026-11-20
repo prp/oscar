@@ -1,0 +1,12 @@
+[submodule "third_party/oscar-mistral.rs"]
+	path = third_party/oscar-mistral.rs
+	url = https://github.com/EricLBuehler/mistral.rs.git
+	# Applying patches/ dirties the working tree by design, so a dirty
+	# submodule is the NORMAL state here and must not be reported as a
+	# change. Without this every `git status` is noise and a stray
+	# `git add` can commit a patched tree back as if it were the pin.
+	ignore = dirty
+[submodule "third_party/oscar-candle"]
+	path = third_party/oscar-candle
+	url = https://github.com/huggingface/candle.git
+	ignore = dirty

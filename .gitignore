@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local environment / secrets
+.env
+.env.local
+*.local.toml
+
+# Model weights: large, and downloaded rather than tracked
+*.gguf
+*.safetensors
+
+# Profiler traces
+*.trace
+*.prof
+
+__pycache__/
+*.pyc
+
+# Claude Code local state
+.claude/

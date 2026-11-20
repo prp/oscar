@@ -1,0 +1,3 @@
+# `cargo app`: the release runtime built and Oscar.app written around it (crates/oscar-app).
+[alias]
+app = "run -q --release -p oscar-app --"

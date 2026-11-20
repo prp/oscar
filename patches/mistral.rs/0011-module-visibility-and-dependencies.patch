@@ -1,0 +1,723 @@
+Subject: [mistral.rs] module-visibility-and-dependencies
+
+  Where the architectures are named to the rest of the crate, and the dependency edges that make oscar reachable from the fork.
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 7
+
+---
+diff --git c/Cargo.toml w/Cargo.toml
+index 648dc842..f2fe7134 100644
+--- c/Cargo.toml
++++ w/Cargo.toml
+@@ -29,21 +29,12 @@ license = "MIT"
+ rust-version = "1.88"
+ 
+ [workspace.dependencies]
+-candle-core = { version = "0.10.2" }
+-candle-nn = { version = "0.10.2" }
+-candle-flash-attn-v3 = { version = "0.10.2" }
+-candle-flash-attn = { version = "0.10.2" }
+-candle-metal-kernels = { version = "0.10.2" }
+-# candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "1f67d14" }
+-# candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "1f67d14" }
+-# candle-flash-attn-v3 = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "1f67d14" }
+-# candle-flash-attn = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "1f67d14" }
+-# candle-metal-kernels = { git = "https://github.com/huggingface/candle.git", version = "0.10.2", rev = "1f67d14" }
+-# candle-core = { path = "../candle/candle-core" }
+-# candle-nn = { path = "../candle/candle-nn" }
+-# candle-flash-attn-v3 = { path = "../candle/candle-flash-attn-v3" }
+-# candle-flash-attn = { path = "../candle/candle-flash-attn" }
+-# candle-metal-kernels = { path = "../candle/candle-metal-kernels" }
++# candle 0.10.2 plus oscar's patch series, checked out beside this one.
++candle-core = { path = "../oscar-candle/candle-core" }
++candle-nn = { path = "../oscar-candle/candle-nn" }
++candle-flash-attn-v3 = { path = "../oscar-candle/candle-flash-attn-v3" }
++candle-flash-attn = { path = "../oscar-candle/candle-flash-attn" }
++candle-metal-kernels = { path = "../oscar-candle/candle-metal-kernels" }
+ 
+ axum = "0.8.8"
+ anyhow = "1.0.100"
+@@ -93,6 +84,7 @@ float8 = "0.7.0"
+ regex = "1.12.2"
+ objc2-metal = "0.3.2"
+ objc2-foundation = "0.3.2"
++objc2 = "0.6.3"
+ dispatch2 = { version = "0.3.0", default-features = false, features = ["block2"] }
+ safetensors = "0.7.0"
+ toml = "0.9.11"
+@@ -111,7 +103,7 @@ tokenizers = { version = "0.21.4", default-features = false }
+ tokio-tungstenite = "0.28.0"
+ tqdm = "0.8.0"
+ chrono = "0.4.43"
+-minijinja = { version = "2.14.0", features = ["builtins", "json"] }
++minijinja = { version = "2.14.0", features = ["builtins", "json", "preserve_order"] }
+ minijinja-contrib = { version = "2.14.0", features = ["pycompat"] }
+ regex-automata = { version = "0.4.13", features = ["meta"] }
+ rustc-hash = "2.1.1"
+diff --git c/mistralrs-cli/Cargo.toml w/mistralrs-cli/Cargo.toml
+index ceb2a050..78632289 100644
+--- c/mistralrs-cli/Cargo.toml
++++ w/mistralrs-cli/Cargo.toml
+@@ -24,6 +24,9 @@ mistralrs-server-core = { workspace = true }
+ mistralrs = { workspace = true }
+ candle-core = { workspace = true }
+ 
++[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
++candle-metal-kernels = { workspace = true, optional = true }
++
+ clap = { workspace = true }
+ clap_complete = "4.5"
+ tokio = { workspace = true }
+@@ -59,6 +62,6 @@ cudnn = ["mistralrs-core/cudnn", "mistralrs-server-core/cudnn"]
+ flash-attn = ["cuda", "mistralrs-core/flash-attn", "mistralrs-server-core/flash-attn"]
+ flash-attn-v3 = ["cuda", "mistralrs-core/flash-attn-v3", "mistralrs-server-core/flash-attn-v3"]
+ accelerate = ["mistralrs-core/accelerate", "mistralrs-server-core/accelerate"]
+-metal = ["mistralrs-core/metal", "mistralrs-server-core/metal"]
++metal = ["mistralrs-core/metal", "mistralrs-server-core/metal", "dep:candle-metal-kernels"]
+ mkl = ["mistralrs-core/mkl", "mistralrs-server-core/mkl"]
+ ring = ["mistralrs-core/ring", "mistralrs-server-core/ring"]
+diff --git c/mistralrs-core/Cargo.toml w/mistralrs-core/Cargo.toml
+index c551ca2e..f4da66f0 100644
+--- c/mistralrs-core/Cargo.toml
++++ w/mistralrs-core/Cargo.toml
+@@ -109,7 +109,9 @@ openai-harmony = "0.0.8"
+ 
+ [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
+ objc = { workspace = true, optional = true }
++objc2 = { workspace = true, optional = true }
+ objc2-metal = { workspace = true, optional = true }
++objc2-foundation = { workspace = true, optional = true }
+ candle-metal-kernels = { workspace = true, optional = true }
+ 
+ [features]
+@@ -131,7 +133,9 @@ metal = [
+     "dep:objc",
+     "dep:mistralrs-paged-attn",
+     "mistralrs-paged-attn/metal",
+-    "dep:objc2-metal"
++    "dep:objc2",
++    "dep:objc2-metal",
++    "dep:objc2-foundation"
+ ]
+ flash-attn = ["cuda", "dep:candle-flash-attn"]
+ flash-attn-v3 = ["cuda", "dep:candle-flash-attn-v3"]
+diff --git c/mistralrs-core/build.rs w/mistralrs-core/build.rs
+index 4aa36d5c..128b4eac 100644
+--- c/mistralrs-core/build.rs
++++ w/mistralrs-core/build.rs
+@@ -89,12 +89,15 @@ fn set_git_revision() {
+         .unwrap_or_else(|| "unknown".to_string());
+ 
+     println!("cargo:rustc-env=MISTRALRS_GIT_REVISION={commit}");
+-    println!("cargo:rerun-if-changed=.git/HEAD");
+-    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+-        if let Some(ref_path) = head.strip_prefix("ref:") {
+-            let ref_path = ref_path.trim();
+-            if !ref_path.is_empty() {
+-                println!("cargo:rerun-if-changed=.git/{}", ref_path);
++    // Guard the rerun trigger: a missing `.git/HEAD` (path-dep consumers) would force a full rebuild every invocation.
++    if std::path::Path::new(".git/HEAD").exists() {
++        println!("cargo:rerun-if-changed=.git/HEAD");
++        if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
++            if let Some(ref_path) = head.strip_prefix("ref:") {
++                let ref_path = ref_path.trim();
++                if !ref_path.is_empty() {
++                    println!("cargo:rerun-if-changed=.git/{}", ref_path);
++                }
+             }
+         }
+     }
+diff --git c/mistralrs-core/src/lib.rs w/mistralrs-core/src/lib.rs
+index 580cd32b..d8a241ac 100644
+--- c/mistralrs-core/src/lib.rs
++++ w/mistralrs-core/src/lib.rs
+@@ -2,14 +2,22 @@
+ use candle_core::Device;
+ use engine::Engine;
+ pub use engine::{
+-    get_engine_terminate_flag, reset_engine_terminate_flag, should_terminate_engine_sequences,
+-    EngineInstruction, IntervalLogger, SearchEmbeddingModel, ENGINE_INSTRUCTIONS,
+-    TERMINATE_ALL_NEXT_STEP,
++    get_engine_terminate_flag, paged_deposit_cuts, reset_engine_terminate_flag,
++    set_prefill_chunk_policy, set_step_round, should_terminate_engine_sequences,
++    EngineInstruction, IntervalLogger, PrefillChunkPolicy, SearchEmbeddingModel, StepRound,
++    ENGINE_INSTRUCTIONS, TERMINATE_ALL_NEXT_STEP,
+ };
+ use hf_hub::Cache;
+ pub use lora::Ordering;
++pub use pipeline::chat_template::{apply_chat_template_to, ChatTemplateValue, DEFAULT_ENABLE_THINKING};
+ pub use pipeline::ModelCategory;
++pub use pipeline::set_global_sample_trace;
+ pub use pipeline::Pipeline;
++pub use pipeline::{
++    extract_logits, text_models_inputs_processor, AnyMoePipelineMixin, CacheBackendMetadata,
++    CacheInstruction, CacheManagerMixin, ForwardInputsResult, GeneralMetadata, IsqPipelineMixin,
++    MetadataMixin, PreProcessingMixin, SampleTrace,
++};
+ #[cfg(feature = "pyo3_macros")]
+ use pyo3::exceptions::PyValueError;
+ use std::collections::{HashMap, HashSet};
+@@ -34,20 +42,20 @@ pub const MISTRALRS_GIT_REVISION: &str = match option_env!("MISTRALRS_GIT_REVISI
+ };
+ 
+ mod cuda;
+-mod device_map;
++pub mod device_map;
+ mod engine;
+ mod lora;
+ mod metal;
+ mod model_loader;
+ mod moe;
+-mod ops;
++pub mod ops;
+ mod video_input;
+ pub use model_loader::{
+     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, LoaderBuilder,
+ };
+ pub use video_input::{sample_frame_indices, VideoInput};
+ mod embedding_models;
+-mod kv_cache;
++pub mod kv_cache;
+ mod search;
+ 
+ mod model_selected;
+@@ -55,31 +63,32 @@ pub use model_selected::ModelSelected;
+ pub use toml_selector::{get_toml_selected_model_device_map_params, get_toml_selected_model_dtype};
+ 
+ mod amoe;
+-mod attention;
++pub mod attention;
+ mod diagnostics;
+ mod diffusion_models;
+ pub mod distributed;
+-mod gguf;
++pub mod gguf;
+ pub mod layers;
+-mod layers_masker;
++pub mod layers_masker;
++pub mod live;
+ mod layers_utils;
+ pub mod matformer;
+ mod mla;
+ mod models;
+-mod paged_attention;
++pub mod paged_attention;
+ mod pipeline;
+-mod prefix_cacher;
++pub mod prefix_cacher;
+ pub mod reasoning_parsers;
+ mod request;
+ mod response;
+-mod sampler;
++pub mod sampler;
+ mod scheduler;
+-mod sequence;
++pub mod sequence;
+ mod speech_models;
+ mod toml_selector;
+-mod tools;
++pub mod tools;
+ mod topology;
+-mod utils;
++pub mod utils;
+ mod vision_models;
+ mod xlora_models;
+ 
+@@ -105,7 +114,7 @@ pub use mistralrs_mcp::{
+     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
+ };
+ pub use mistralrs_quant::{IsqBits, IsqType, MULTI_LORA_DELIMITER};
+-pub use paged_attention::{MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
++pub use paged_attention::{CacheConfig, MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
+ pub use pipeline::hf::{hf_home_dir, hf_hub_cache_dir, hf_token_path};
+ pub use pipeline::{
+     chat_template::ChatTemplate, expand_isq_value, parse_isq_value, AdapterPaths, AnyMoeLoader,
+@@ -123,13 +132,16 @@ pub use pipeline::{
+     UQFF_MULTI_FILE_DELIMITER,
+ };
+ pub use request::{
+-    ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
+-    LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,
+-    SearchContextSize, TokenizationRequest, WebSearchOptions, WebSearchUserLocation,
++    default_system_prompt, set_default_system_prompt, ApproximateUserLocation, Constraint,
++    DetokenizationRequest, ImageGenerationResponseFormat, LlguidanceGrammar, MessageContent,
++    NormalRequest, ReasoningEffort, Request, RequestMessage, SearchContextSize,
++    TokenizationRequest, WebSearchOptions, WebSearchUserLocation,
+ };
+ pub use response::*;
+ pub use sampler::{
+-    CustomLogitsProcessor, DrySamplingParams, ModelGenerationDefaults, SamplingParams, StopTokens,
++    register_device_sampler, DeviceSampleSpec, DeviceSampler,
++    mode_generation_defaults, set_mode_generation_defaults, CustomLogitsProcessor,
++    DrySamplingParams, ModeGenerationDefaults, ModelGenerationDefaults, SamplingParams, StopTokens,
+     TopLogprob,
+ };
+ pub use scheduler::{DefaultSchedulerMethod, SchedulerConfig};
+@@ -222,6 +234,8 @@ pub struct MistralRsConfig {
+     pub modalities: Modalities,
+     pub max_seq_len: Option<usize>,
+     pub generation_defaults: Option<ModelGenerationDefaults>,
++    /// The resolved PagedAttention pool (`None` without): what the caller's byte budget allocated, read back.
++    pub cache_config: Option<paged_attention::CacheConfig>,
+ }
+ 
+ /// Configuration for recreating a model loader when reloading an unloaded model.
+@@ -547,6 +561,7 @@ impl MistralRs {
+         };
+         let generation_defaults = pipeline_guard.generation_defaults();
+         let encoder_cache_counters = pipeline_guard.encoder_cache_counters();
++        let cache_config = metadata.cache_config.clone();
+         drop(pipeline_guard);
+ 
+         let logger = Arc::new(IntervalLogger::new(
+@@ -565,6 +580,7 @@ impl MistralRs {
+             modalities,
+             max_seq_len,
+             generation_defaults,
++            cache_config,
+         };
+ 
+         let tx_for_engine = tx.clone();
+diff --git c/mistralrs-core/src/pipeline/mod.rs w/mistralrs-core/src/pipeline/mod.rs
+index 2e4ff994..7f176d1e 100644
+--- c/mistralrs-core/src/pipeline/mod.rs
++++ w/mistralrs-core/src/pipeline/mod.rs
+@@ -17,6 +17,7 @@ mod paths;
+ mod processing;
+ mod response;
+ mod sampling;
++pub use sampling::{set_global_sample_trace, SampleTrace};
+ mod speculative;
+ mod speech;
+ 
+@@ -104,6 +105,7 @@ use tokenizers::Tokenizer;
+ use anyhow::Result;
+ use candle_core::{DType, Device, IndexOp, Tensor, Var};
+ 
++use crate::sampler::Logprobs;
+ use crate::sequence::Sequence;
+ 
+ pub use self::inputs_processor::{
+@@ -111,7 +113,7 @@ pub use self::inputs_processor::{
+ };
+ use self::text_models_inputs_processor::PagedAttentionMeta;
+ pub use crate::kv_cache::{
+-    Cache, CacheManager, EitherCache, HybridLayerCache, KvCache, LayerCaches, NormalCache,
++    Cache, CacheManager, EitherCache, KvCache, LayerCaches, NormalCache,
+     NormalCacheType,
+ };
+ 
+@@ -172,9 +174,7 @@ impl GeneralMetadata {
+ pub enum CacheInstruction {
+     In,
+     Out,
+-    /// load_preallocated_cache means to load the preallocated cache, if applicable.
+     Reset {
+-        load_preallocated_cache: bool,
+         reset_non_granular: bool,
+     },
+     Nothing,
+@@ -208,7 +208,6 @@ pub trait CacheManagerMixin {
+         seqs: &mut [&mut Sequence],
+         reset_non_granular: bool,
+         modify_draft_cache: bool,
+-        load_preallocated_cache: bool,
+     );
+     fn cache(&self) -> &EitherCache;
+ }
+@@ -428,6 +427,27 @@ pub(crate) struct FileListCache {
+     files: Vec<String>,
+ }
+ 
++/// A device-sampled step's logits row, brought to the host while a trace records: the row's buffer goes
++/// back to the pool with the step, and the trace reads the copy when the token is read.
++fn traced_logits(logits: &Tensor) -> Result<Option<Tensor>, candle_core::Error> {
++    sampling::logit_trace().map(|_| logits.to_device(&Device::Cpu)).transpose()
++}
++
++/// A device-sampled token as the trace leaves it: recorded beside its step's logits, under teacher forcing the
++/// base recording's token instead; a forced token cannot sit in a presence penalty's context (the drawn one's).
++fn traced_token(token: u32, logits: Option<&Tensor>, penalised: bool) -> Result<u32, candle_core::Error> {
++    let (Some(trace), Some(logits)) = (sampling::logit_trace(), logits) else {
++        return Ok(token);
++    };
++    match trace.note_step_logits(token, logits, false) {
++        Some(forced) if penalised => candle_core::bail!(
++            "teacher forcing under presence penalty: context would mark sampler's {token}, not forced {forced}"
++        ),
++        Some(forced) => Ok(forced),
++        None => Ok(token),
++    }
++}
++
+ #[async_trait::async_trait]
+ pub trait Pipeline:
+     Send
+@@ -444,8 +464,236 @@ pub trait Pipeline:
+         return_raw_logits: bool,
+     ) -> Result<ForwardInputsResult, candle_core::Error>;
+ 
++    /// Whether the engine may split a prompt step at the template-suffix boundary; false for whole-`step` pipelines.
++    fn supports_prefill_split(&self) -> bool {
++        true
++    }
++
+     /// Returns the total of model execution time.
+     #[allow(clippy::too_many_arguments)]
++
++    /// The hybrid models' recurrent layers read their pool slots through the state-indices tensor; paged
++    /// attention keeps KV apart, so the indices are set here for every decode forward.
++    fn set_recurrent_state_indices(&self, input_seqs: &[&mut Sequence]) {
++        if !self.cache().is_hybrid() {
++            return;
++        }
++        let mut hybrid_cache = self.cache().hybrid();
++        let Some(device) = hybrid_cache.recurrent_device().cloned() else {
++            return;
++        };
++        #[allow(clippy::cast_possible_truncation)]
++        let indices: Vec<u32> = input_seqs.iter().filter_map(|seq| seq.recurrent_state_idx().map(|idx| idx as u32)).collect();
++        if indices.len() == input_seqs.len() {
++            let _ = hybrid_cache.set_state_indices_from_host(indices, &device);
++        }
++    }
++
++    /// The device sampler for a sequence whose decode step samples on the device: on Metal, a sampler the device
++    /// covers, no logprobs, no constrained decoding. Whether the step may queue ahead is the sampler's `active()`.
++    fn device_sampler_for(
++        &self,
++        seq: &mut Sequence,
++    ) -> Option<(Arc<dyn crate::sampler::DeviceSampler>, crate::sampler::DeviceSampleSpec)> {
++        if !matches!(self.device(), Device::Metal(_))
++            || seq.return_logprobs()
++            || !matches!(seq.recognizer, crate::sequence::SequenceRecognizer::None)
++            || self.get_metadata().is_xlora
++        {
++            return None;
++        }
++        let sampler = crate::sampler::device_sampler()?;
++        let spec = seq.sampler().device_spec()?;
++        sampler.supports(&spec).then_some((sampler, spec))
++    }
++
++    /// A device-sampled token as the host sampler would report it.
++    fn device_logprobs(&self, token: u32, logprob: f32) -> Logprobs {
++        let bytes = self
++            .tokenizer()
++            .and_then(|t| t.decode(&[token], false).ok());
++        Logprobs { token, logprob, top_logprobs: None, bytes }
++    }
++
++    /// One decode step with the sampler on the device, the host reading only the token. Drained (`queue_ahead`
++    /// false) the step commits before the next encodes, keeping a drafter's lead; pipelined, the next encodes first.
++    async fn step_device(
++        &mut self,
++        input_seqs: &mut [&mut Sequence],
++        metadata: PagedAttentionMeta,
++        prefix_cacher: &mut PrefixCacheManagerV2,
++        disable_eos_stop: bool,
++        rng: Arc<std::sync::Mutex<Isaac64Rng>>,
++        sampler: Arc<dyn crate::sampler::DeviceSampler>,
++        spec: crate::sampler::DeviceSampleSpec,
++        queue_ahead: bool,
++    ) -> Result<Duration, candle_core::Error> {
++        use crate::sequence::{InFlightStep, SampleBuffers};
++        let device = self.device();
++        let Device::Metal(metal) = &device else {
++            candle_core::bail!("device-sampled step: Metal only");
++        };
++        let t0 = Instant::now();
++        // Drained, a step the pipelined path left queued (the regime moved under the sequence) is retired first, alone.
++        if !queue_ahead {
++            if let Some(cur) = input_seqs[0].in_flight.take() {
++                metal.flush_commands()?;
++                metal.wait_for_completion(cur.generation)?;
++                let (token, logprob) = sampler.read(&cur.out)?;
++                let token = traced_token(token, cur.logits.as_ref(), cur.seen.is_some())?;
++                input_seqs[0].sample_buffers = Some(SampleBuffers { out: cur.out, seen: cur.seen });
++                let logprobs = self.device_logprobs(token, logprob);
++                self.commit_sampled_tok(input_seqs[0], logprobs, prefix_cacher, disable_eos_stop)
++                    .await?;
++                return Ok(t0.elapsed());
++            }
++        }
++        if input_seqs[0].device_seed == 0 {
++            let seed = rand::RngCore::next_u64(&mut *rng.lock().unwrap());
++            input_seqs[0].device_seed = seed | 1;
++        }
++        let seed = input_seqs[0].device_seed;
++        if !queue_ahead {
++            let logits = self.forward_decode(input_seqs, metadata, None)?;
++            let kept = input_seqs[0].sample_buffers.take();
++            let out = match &kept {
++                Some(k) => k.out.clone(),
++                None => sampler.output(&device)?,
++            };
++            let seen = match kept.and_then(|k| k.seen) {
++                Some(seen) => Some(seen),
++                None => (spec.presence_penalty != 0.0)
++                    .then(|| sampler.context(&device, logits.elem_count(), input_seqs[0].get_toks()))
++                    .transpose()?,
++            };
++            let position = input_seqs[0].len() as u64;
++            let generation = metal.next_completion_generation()?;
++            sampler.sample(&logits, &spec, seed, position, &out, seen.as_ref())?;
++            metal.flush_commands()?;
++            metal.wait_for_completion(generation)?;
++            let (token, logprob) = sampler.read(&out)?;
++            let token = traced_token(token, Some(&logits), seen.is_some())?;
++            input_seqs[0].sample_buffers = Some(SampleBuffers { out, seen });
++            let logprobs = self.device_logprobs(token, logprob);
++            self.commit_sampled_tok(input_seqs[0], logprobs, prefix_cacher, disable_eos_stop)
++                .await?;
++            return Ok(t0.elapsed());
++        }
++        // Nothing queued: this position's step from the committed token, the penalty's context from the tokens so far.
++        if input_seqs[0].in_flight.is_none() {
++            let logits = self.forward_decode(input_seqs, metadata.clone(), None)?;
++            let position = input_seqs[0].len() as u64;
++            let out = sampler.output(&device)?;
++            let seen = (spec.presence_penalty != 0.0)
++                .then(|| sampler.context(&device, logits.elem_count(), input_seqs[0].get_toks()))
++                .transpose()?;
++            // The generation the open buffer signals; the sampler stays in it and the next step's dispatches
++            // commit it, so no boundary sits between the sampler and the embedding that reads its token.
++            let generation = metal.next_completion_generation()?;
++            sampler.sample(&logits, &spec, seed, position, &out, seen.as_ref())?;
++            let logits = traced_logits(&logits)?;
++            input_seqs[0].in_flight = Some(InFlightStep { out, generation, consumed: None, seen, logits });
++        }
++        // The next position's step, its token the queued sampler's output; it writes the buffer the queued
++        // step's embedding has read by then: two outputs alternate for the sequence's life.
++        let mut cur = input_seqs[0].in_flight.take().expect("a queued step");
++        let ids = cur.out.narrow(0, 0, 1)?.unsqueeze(0)?;
++        let next_out = match cur.consumed.take() {
++            Some(free) => free,
++            None => sampler.output(&device)?,
++        };
++        input_seqs[0].in_flight = Some(InFlightStep {
++            out: cur.out.clone(),
++            generation: cur.generation,
++            consumed: None,
++            seen: None,
++            logits: None,
++        });
++        let logits = self.forward_decode(input_seqs, metadata, Some(ids))?;
++        let position = (input_seqs[0].len() + 1) as u64;
++        let next_generation = metal.next_completion_generation()?;
++        sampler.sample(&logits, &spec, seed, position, &next_out, cur.seen.as_ref())?;
++        let logits = traced_logits(&logits)?;
++        // Retire the queued token while the next step runs; its buffer stays
++        // referenced until the step reading it has completed.
++        input_seqs[0].in_flight = Some(InFlightStep {
++            out: next_out,
++            generation: next_generation,
++            consumed: Some(cur.out.clone()),
++            seen: cur.seen,
++            logits,
++        });
++        // The queued step's buffer committed under this step's dispatches; the flush covers a short step.
++        metal.flush_commands()?;
++        metal.wait_for_completion(cur.generation)?;
++        let (token, logprob) = sampler.read(&cur.out)?;
++        let token = traced_token(token, cur.logits.as_ref(), false)?;
++        let logprobs = self.device_logprobs(token, logprob);
++        self.commit_sampled_tok(input_seqs[0], logprobs, prefix_cacher, disable_eos_stop)
++            .await?;
++        if matches!(input_seqs[0].getstate(), crate::sequence::SequenceState::Done(_)) {
++            // The step past the final token: let it land before its buffers go.
++            metal.flush_commands()?;
++            metal.wait_for_completion(next_generation)?;
++            input_seqs[0].in_flight = None;
++        }
++        Ok(t0.elapsed())
++    }
++
++    /// One decode forward under paged attention for the sequences' next position (one ahead while a step is
++    /// queued), the ids swapped for `ids` when given; the last row's logits.
++    fn forward_decode(
++        &mut self,
++        input_seqs: &mut [&mut Sequence],
++        metadata: PagedAttentionMeta,
++        ids: Option<Tensor>,
++    ) -> Result<Tensor, candle_core::Error> {
++        self.set_recurrent_state_indices(input_seqs);
++        let InputProcessorOutput { inputs, .. } = self
++            .get_processor()
++            .inputs_processor()
++            .process_inputs(
++                self.tokenizer(),
++                input_seqs,
++                false,
++                self.get_metadata().is_xlora,
++                &self.device(),
++                self.get_metadata().no_kv_cache,
++                None,
++                false,
++                self.get_metadata().sliding_window,
++                self.get_input_processor_config(),
++                Some(metadata),
++                self.device_mapper(),
++            )
++            .map_err(candle_core::Error::msg)?;
++        let inputs: Box<dyn Any> = match ids {
++            Some(ids) => {
++                let mut model_inputs = inputs
++                    .downcast::<text_models_inputs_processor::ModelInputs>()
++                    .map_err(|_| candle_core::Error::Msg("pipelined step: text inputs expected".into()))?;
++                model_inputs.input_ids = ids;
++                model_inputs
++            }
++            None => inputs,
++        };
++        match self.forward_inputs(inputs, false)? {
++            ForwardInputsResult::CausalGeneration { logits } => Ok(logits),
++            _ => candle_core::bail!("pipelined step: causal generation expected"),
++        }
++    }
++
++    /// Append a token the device sampled, with the stop and streaming work the host sampler's path does.
++    async fn commit_sampled_tok(
++        &self,
++        _seq: &mut Sequence,
++        _logprobs: Logprobs,
++        _prefix_cacher: &mut PrefixCacheManagerV2,
++        _disable_eos_stop: bool,
++    ) -> Result<(), candle_core::Error> {
++        candle_core::bail!("pipeline has no device-sampled commit")
++    }
++
+     async fn step(
+         &mut self,
+         input_seqs: &mut [&mut Sequence],
+@@ -456,6 +704,16 @@ pub trait Pipeline:
+         rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+         backend_metadata: CacheBackendMetadata,
+     ) -> Result<Duration, candle_core::Error> {
++        crate::paged_attention::note_step_kind(&crate::paged_attention::StepKind {
++            prompt: is_prompt,
++            tokens: input_seqs.iter().map(|s| s.step_tokens()).max().unwrap_or(0),
++            device: &self.device(),
++            drop_state_indices: &|| {
++                if self.cache().is_hybrid() {
++                    self.cache().hybrid().set_state_indices(None);
++                }
++            },
++        })?;
+         match backend_metadata {
+             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
+                 let inputs_iter =
+@@ -489,15 +747,9 @@ pub trait Pipeline:
+                         match pre_op {
+                             CacheInstruction::In => self.clone_in_cache(input_seqs),
+                             CacheInstruction::Nothing => (),
+-                            CacheInstruction::Reset {
+-                                load_preallocated_cache,
+-                                reset_non_granular,
+-                            } => self.set_none_cache(
+-                                input_seqs,
+-                                reset_non_granular,
+-                                false,
+-                                load_preallocated_cache,
+-                            ),
++                            CacheInstruction::Reset { reset_non_granular } => {
++                                self.set_none_cache(input_seqs, reset_non_granular, false)
++                            }
+                             _ => unreachable!("Unreachable PRE cache op."),
+                         }
+                     }
+@@ -523,15 +775,9 @@ pub trait Pipeline:
+                 match post_op {
+                     CacheInstruction::Out => self.clone_out_cache(input_seqs),
+                     CacheInstruction::Nothing => (),
+-                    CacheInstruction::Reset {
+-                        load_preallocated_cache,
+-                        reset_non_granular,
+-                    } => self.set_none_cache(
+-                        input_seqs,
+-                        reset_non_granular,
+-                        false,
+-                        load_preallocated_cache,
+-                    ),
++                    CacheInstruction::Reset { reset_non_granular } => {
++                        self.set_none_cache(input_seqs, reset_non_granular, false)
++                    }
+                     _ => unreachable!("Unreachable POST cache op."),
+                 }
+ 
+@@ -682,33 +928,25 @@ pub trait Pipeline:
+                 Ok(exec_duration)
+             }
+             CacheBackendMetadata::PagedAttention { metadata } => {
+-                // For hybrid models, build state_indices tensor from sequences'
+-                // recurrent_state_idx so recurrent layers are active during forward.
+-                // Paged attention manages KV caches separately, but recurrent state
+-                // pool access still needs the indices tensor to be set.
+-                if self.cache().is_hybrid() {
+-                    let mut hybrid_cache = self.cache().hybrid();
+-                    let recurrent_device = hybrid_cache.caches.iter().find_map(|c| {
+-                        if let HybridLayerCache::Recurrent(pool) = c {
+-                            Some(pool.device().clone())
+-                        } else {
+-                            None
+-                        }
+-                    });
+-                    if let Some(device) = recurrent_device {
+-                        #[allow(clippy::cast_possible_truncation)]
+-                        let indices: Vec<u32> = input_seqs
+-                            .iter()
+-                            .filter_map(|seq| seq.recurrent_state_idx().map(|idx| idx as u32))
+-                            .collect();
+-                        if indices.len() == input_seqs.len() {
+-                            if let Ok(si) = Tensor::from_vec(indices, (input_seqs.len(),), &device)
+-                            {
+-                                hybrid_cache.set_state_indices(Some(si));
+-                            }
+-                        }
++                if !is_prompt && !return_raw_logits && input_seqs.len() == 1 {
++                    if let Some((sampler, spec)) = self.device_sampler_for(input_seqs[0]) {
++                        let forcing = sampling::logit_trace().is_some_and(|t| t.forces_tokens());
++                        let queue_ahead = sampler.active() && !forcing;
++                        return self
++                            .step_device(
++                                input_seqs,
++                                metadata,
++                                prefix_cacher,
++                                disable_eos_stop,
++                                rng,
++                                sampler,
++                                spec,
++                                queue_ahead,
++                            )
++                            .await;
+                     }
+                 }
++                self.set_recurrent_state_indices(input_seqs);
+ 
+                 let inputs_iter =
+                     std::iter::once(self.get_processor().inputs_processor().process_inputs(
+@@ -920,7 +1158,7 @@ pub trait Pipeline:
+     }
+ }
+ 
+-pub(crate) fn extract_logits(
++pub fn extract_logits(
+     logits: &Tensor,
+     context_lens: Vec<(usize, usize)>,
+ ) -> candle_core::Result<Tensor> {
+diff --git c/mistralrs/src/model.rs w/mistralrs/src/model.rs
+index e665173b..f6b7be17 100644
+--- c/mistralrs/src/model.rs
++++ w/mistralrs/src/model.rs
+@@ -815,4 +815,10 @@ impl Model {
+     pub fn inner(&self) -> &MistralRs {
+         &self.runner
+     }
++
++    /// Get a shared handle to the underlying MistralRs instance, e.g. to hand
++    /// the built model to `mistralrs-server-core`'s router.
++    pub fn inner_arc(&self) -> Arc<MistralRs> {
++        self.runner.clone()
++    }
+ }

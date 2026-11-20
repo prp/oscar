@@ -1,0 +1,1324 @@
+Subject: [mistral.rs] kv-offload-and-recurrent-state
+
+  The KV spill seam, and the recurrent-state pool the hybrid models carry beside their KV.
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 6
+
+---
+diff --git c/mistralrs-core/src/kv_cache/mod.rs w/mistralrs-core/src/kv_cache/mod.rs
+index 0cbb72f7..d6a11ead 100644
+--- c/mistralrs-core/src/kv_cache/mod.rs
++++ w/mistralrs-core/src/kv_cache/mod.rs
+@@ -15,8 +15,18 @@ mod single_cache;
+ 
+ pub use full_cache::{EitherCache, LayerCaches};
+ pub use hybrid_cache::{
+-    HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
+-    RecurrentStateSnapshot,
++    HybridCache,
++    HybridCacheConfig,
++    HybridLayerCache,
++    HybridLayerType,
++    RecurrentLayerConfig,
++    RecurrentStateDtypes,
++    RecurrentStatePool,
++    RecurrentState,
++    RecurrentStateMemory,
++    RecurrentStateLayout,
++    set_recurrent_state_memory,
++    recurrent_state_memory,
+ };
+ pub use rotating_cache::RotatingCache;
+ pub use single_cache::SingleCache;
+@@ -34,7 +44,6 @@ pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
+         pipeline: &T,
+         seqs: &mut [&mut Sequence],
+         modify_draft_cache: bool,
+-        load_preallocated_cache: bool,
+     );
+ }
+ 
+@@ -499,131 +508,11 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
+     fn set_none_cache(
+         &self,
+         pipeline: &T,
+-        seqs: &mut [&mut Sequence],
++        _seqs: &mut [&mut Sequence],
+         _modify_draft_cache: bool,
+-        load_preallocated_cache: bool,
+     ) {
+-        if seqs.iter().any(|seq| seq.preallocated_cache().is_none()) {
+-            for layer in pipeline.cache().normal().0.iter_mut() {
+-                layer.reset();
+-            }
+-            return;
+-        }
+-
+-        let layer_devices = pipeline.device_mapper().map(|device_mapper| {
+-            let total_layers = pipeline.cache().normal().0.len();
+-            let mut layer_devices = Vec::with_capacity(total_layers);
+-            for layer in 0..total_layers {
+-                let device = device_mapper
+-                    .device_for(layer, false)
+-                    .cloned()
+-                    .expect("Internal bug, layer out of range!");
+-                layer_devices.push(device);
+-            }
+-            layer_devices
+-        });
+-
+-        let old_caches = pipeline.cache().normal().0.clone();
+-
+-        for (layer_idx, layer) in pipeline.cache().normal().0.iter_mut().enumerate() {
+-            if !load_preallocated_cache {
+-                layer.reset();
+-                continue;
+-            }
+-
+-            match &old_caches[layer_idx] {
+-                KvCache::Rotating { k, .. } => {
+-                    *layer = KvCache::Rotating {
+-                        k: RotatingCache {
+-                            all_data: None,
+-                            dim: k.dim,
+-                            current_seq_len: 0,
+-                            max_seq_len: k.max_seq_len,
+-                            capacity_seq_len: k.capacity_seq_len,
+-                        },
+-                        v: RotatingCache {
+-                            all_data: None,
+-                            dim: k.dim,
+-                            current_seq_len: 0,
+-                            max_seq_len: k.max_seq_len,
+-                            capacity_seq_len: k.capacity_seq_len,
+-                        },
+-                    };
+-                    continue;
+-                }
+-                KvCache::Shared { owner } => {
+-                    *layer = KvCache::Shared { owner: *owner };
+-                    continue;
+-                }
+-                KvCache::Normal { .. } => {}
+-            }
+-
+-            let mut k_caches = Vec::new();
+-            let mut v_caches = Vec::new();
+-            let mut missing_preallocated = false;
+-            for seq in seqs.iter_mut() {
+-                let Some((mut k_preallocated_cache, mut v_preallocated_cache)) = seq
+-                    .preallocated_cache()
+-                    .and_then(|cache| cache.get(layer_idx))
+-                    .cloned()
+-                    .flatten()
+-                else {
+-                    missing_preallocated = true;
+-                    break;
+-                };
+-                if let Some(layer_devices) = &layer_devices {
+-                    let layer_dev = &layer_devices[layer_idx];
+-                    k_preallocated_cache = k_preallocated_cache
+-                        .to_device(layer_dev)
+-                        .expect("Could not prepare cache");
+-                    v_preallocated_cache = v_preallocated_cache
+-                        .to_device(layer_dev)
+-                        .expect("Could not prepare cache");
+-                }
+-                k_caches.push(k_preallocated_cache);
+-                v_caches.push(v_preallocated_cache);
+-            }
+-            if missing_preallocated {
+-                layer.reset();
+-                continue;
+-            }
+-            let k_cache = if k_caches.len() > 1 {
+-                Tensor::cat(&k_caches, 0).unwrap()
+-            } else {
+-                k_caches[0].clone()
+-            };
+-            let v_cache = if v_caches.len() > 1 {
+-                Tensor::cat(&v_caches, 0).unwrap()
+-            } else {
+-                v_caches[0].clone()
+-            };
+-
+-            // Use this for the various parameters. Assumes all seqs are from one model.
+-            match &old_caches[layer_idx] {
+-                KvCache::Normal { k, .. } => {
+-                    let template_cache_dim = k.dim;
+-                    let template_cache_msl = k.max_seq_len;
+-
+-                    let cache = KvCache::Normal {
+-                        k: SingleCache {
+-                            all_data: Some(k_cache.zeros_like().unwrap()),
+-                            dim: template_cache_dim,
+-                            current_seq_len: 0,
+-                            max_seq_len: template_cache_msl,
+-                            capacity_seq_len: k_cache.dims()[template_cache_dim],
+-                        },
+-                        v: SingleCache {
+-                            all_data: Some(v_cache.zeros_like().unwrap()),
+-                            dim: template_cache_dim,
+-                            current_seq_len: 0,
+-                            max_seq_len: template_cache_msl,
+-                            capacity_seq_len: k_cache.dims()[template_cache_dim],
+-                        },
+-                    };
+-                    *layer = cache;
+-                }
+-                KvCache::Rotating { .. } | KvCache::Shared { .. } => unreachable!(),
+-            }
++        for layer in pipeline.cache().normal().0.iter_mut() {
++            layer.reset();
+         }
+     }
+ }
+@@ -918,7 +807,6 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for FullCach
+         pipeline: &T,
+         _seqs: &mut [&mut Sequence],
+         modify_draft_cache: bool,
+-        _load_preallocated_cache: bool,
+     ) {
+         let mut new_cache = Vec::new();
+         for _ in 0..pipeline.get_metadata().num_hidden_layers {
+@@ -970,7 +858,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
+         let mut newly_allocated = Vec::new();
+         for (seq_idx, seq) in seqs.iter_mut().enumerate() {
+             if seq.recurrent_state_idx().is_none() {
+-                if let Some(slot_idx) = hybrid_cache.allocate_seq() {
++                if let Ok(Some(slot_idx)) = hybrid_cache.allocate_seq() {
+                     seq.set_recurrent_state_idx(Some(slot_idx));
+                     newly_allocated.push((seq_idx, slot_idx));
+                 } else {
+@@ -1009,9 +897,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
+                         return;
+                     }
+                 }
+-                if let Ok(state_indices) = Tensor::from_vec(indices, (seqs.len(),), &device) {
+-                    hybrid_cache.set_state_indices(Some(state_indices));
+-                } else {
++                if hybrid_cache
++                    .set_state_indices_from_host(indices, &device)
++                    .is_err()
++                {
+                     hybrid_cache.set_state_indices(None);
+                 }
+             }
+@@ -1156,7 +1045,6 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
+         pipeline: &T,
+         seqs: &mut [&mut Sequence],
+         modify_draft_cache: bool,
+-        _load_preallocated_cache: bool,
+     ) {
+         // Reset attention KV caches in sequences
+         for seq in seqs.iter_mut() {
+@@ -1189,9 +1077,7 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
+                 .filter_map(|seq| seq.recurrent_state_idx().map(|idx| idx as u32))
+                 .collect();
+             if indices.len() == seqs.len() {
+-                if let Ok(state_indices) = Tensor::from_vec(indices, (seqs.len(),), &device) {
+-                    hybrid_cache.set_state_indices(Some(state_indices));
+-                }
++                let _ = hybrid_cache.set_state_indices_from_host(indices, &device);
+             }
+         }
+     }
+diff --git c/mistralrs-core/src/kv_cache/hybrid_cache.rs w/mistralrs-core/src/kv_cache/hybrid_cache.rs
+index 9fb78f0f..386d5170 100644
+--- c/mistralrs-core/src/kv_cache/hybrid_cache.rs
++++ w/mistralrs-core/src/kv_cache/hybrid_cache.rs
+@@ -7,221 +7,320 @@
+ //! The key insight is that recurrent state is accessed via `state_indices` which map
+ //! each sequence in the current batch to its slot in the pool.
+ 
+-use candle_core::{Device, IndexOp, Result, Tensor};
++use std::sync::Arc;
++
++use candle_core::backend::BackendStorage;
++use candle_core::{Device, IndexOp, Result, Storage, Tensor};
+ 
+ use super::KvCache;
+ use crate::layers_masker::PastKvLenCache;
+ 
+-/// Pool-based recurrent state cache for continuous batching.
++/// State indices kept GPU + host in lockstep so per-layer dispatch avoids `to_vec1` sync.
++#[derive(Clone, Debug)]
++pub struct HybridStateIndices {
++    pub tensor: Tensor,
++    pub host: Arc<[u32]>,
++}
++
++/// One sequence's recurrent state: every recurrent layer's conv and recurrent tensor, in layer order. On
++/// the device they are storages over one buffer (`bytes`), one blit to copy; off it (`None`) one copy per layer.
++#[derive(Clone)]
++pub struct RecurrentState(Arc<StateInner>);
++
++struct StateInner {
++    bytes: Option<Tensor>,
++    layers: Vec<(Tensor, Tensor)>,
++    /// The position the state is valid at, fixed when a snapshot is taken; zero on a live slot (the pools carry it).
++    seqlen_offset: usize,
++    /// The memory's hold on the object, released with the last handle.
++    _hold: Box<dyn std::any::Any + Send + Sync>,
++}
++
++impl std::fmt::Debug for RecurrentState {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "RecurrentState({} layers at {})", self.0.layers.len(), self.0.seqlen_offset)
++    }
++}
++
++impl RecurrentState {
++    /// A state over `layers`, `bytes` their one device buffer, `hold` what keeps the memory's object alive.
++    pub fn new(bytes: Option<Tensor>, layers: Vec<(Tensor, Tensor)>, hold: Box<dyn std::any::Any + Send + Sync>) -> Self {
++        Self(Arc::new(StateInner { bytes, layers, seqlen_offset: 0, _hold: hold }))
++    }
++
++    /// A state of its own tensors, one per layer: a memory for tests.
++    pub fn from_layers(layers: Vec<(Tensor, Tensor)>, seqlen_offset: usize) -> Self {
++        Self(Arc::new(StateInner { bytes: None, layers, seqlen_offset, _hold: Box::new(()) }))
++    }
++
++    /// Each recurrent layer's `(conv, recurrent)` tensors, in layer order.
++    pub fn layers(&self) -> &[(Tensor, Tensor)] {
++        &self.0.layers
++    }
++
++    /// The position the state is valid at.
++    pub fn seqlen_offset(&self) -> usize {
++        self.0.seqlen_offset
++    }
++
++    /// The same object marked valid at `seqlen_offset`: a freshly taken state, one handle on it.
++    pub fn at(mut self, seqlen_offset: usize) -> Self {
++        Arc::get_mut(&mut self.0).expect("a freshly taken state has one handle").seqlen_offset = seqlen_offset;
++        self
++    }
++
++    /// The object's bytes as the device holds them, page-rounded: zero off the device.
++    pub fn bytes(&self) -> usize {
++        self.0.bytes.as_ref().map_or(0, Tensor::elem_count)
++    }
++
++    /// Every layer's tensors become `src`'s: one blit on the device.
++    pub fn copy_from(&self, src: &RecurrentState) -> Result<()> {
++        match (&self.0.bytes, &src.0.bytes) {
++            (Some(dst), Some(from)) => blit(dst, from),
++            _ => {
++                if self.0.layers.len() != src.0.layers.len() {
++                    candle_core::bail!("state of {} layers cannot take one of {}", self.0.layers.len(), src.0.layers.len());
++                }
++                for ((c, r), (sc, sr)) in self.0.layers.iter().zip(&src.0.layers) {
++                    c.slice_set(&sc.to_device(c.device())?, 0, 0)?;
++                    r.slice_set(&sr.to_device(r.device())?, 0, 0)?;
++                }
++                Ok(())
++            }
++        }
++    }
++
++    /// Every layer's tensors zeroed: one fill on the device.
++    pub fn zero(&self) -> Result<()> {
++        match &self.0.bytes {
++            Some(bytes) => fill(bytes, 0),
++            None => {
++                for (c, r) in &self.0.layers {
++                    c.slice_set(&c.zeros_like()?, 0, 0)?;
++                    r.slice_set(&r.zeros_like()?, 0, 0)?;
++                }
++                Ok(())
++            }
++        }
++    }
++}
++
++/// `dst`'s bytes become `src`'s: a blit between two contiguous runs of one length, `dst` a storage over its buffer.
++fn blit(dst: &Tensor, src: &Tensor) -> Result<()> {
++    let n = dst.elem_count();
++    if src.elem_count() != n {
++        candle_core::bail!("state of {n} bytes cannot take one of {}", src.elem_count());
++    }
++    let (sg, sl) = src.storage_and_layout();
++    let (dg, dl) = dst.storage_and_layout();
++    let (Storage::Metal(from), Storage::Metal(to)) = (&*sg, &*dg) else {
++        candle_core::bail!("state's bytes live on Metal device");
++    };
++    let mut to = candle_core::MetalStorage::new(Arc::new(to.buffer().clone()), to.device().clone(), n, dst.dtype());
++    from.copy2d(&mut to, 1, n, n, n, sl.start_offset(), dl.start_offset())
++}
++
++/// Every byte of `bytes` set to `value`: one blit fill.
++fn fill(bytes: &Tensor, value: u8) -> Result<()> {
++    let (guard, layout) = bytes.storage_and_layout();
++    let Storage::Metal(ms) = &*guard else {
++        candle_core::bail!("state's bytes live on Metal device");
++    };
++    let blit = ms.device().blit_command_encoder()?;
++    blit.set_label("sequence-state-zero");
++    blit.fill_buffer(ms.buffer(), (layout.start_offset(), bytes.elem_count()), value);
++    blit.end_encoding();
++    Ok(())
++}
++
++/// How a sequence's state is laid out: per recurrent layer, the conv tensor's shape and dtype and the recurrent's.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct RecurrentStateLayout {
++    pub layers: Vec<((usize, usize, usize), candle_core::DType, Vec<usize>, candle_core::DType)>,
++}
++
++/// Where a sequence's state comes from: the host's pool, its count the plan's; a take past it is the pool's refusal.
++pub trait RecurrentStateMemory: Send + Sync {
++    /// A state laid out as `layout` on `device`, its bytes unspecified.
++    fn take(&self, layout: &RecurrentStateLayout, device: &Device) -> Result<RecurrentState>;
++}
++
++static MEMORY: std::sync::OnceLock<Arc<dyn RecurrentStateMemory>> = std::sync::OnceLock::new();
++
++/// Install the memory before the first sequence; later calls are ignored.
++pub fn set_recurrent_state_memory(memory: Arc<dyn RecurrentStateMemory>) {
++    let _ = MEMORY.set(memory);
++}
++
++/// The installed memory: the cache's states come from it, and a store's rebuilt snapshot.
++pub fn recurrent_state_memory() -> Result<&'static Arc<dyn RecurrentStateMemory>> {
++    MEMORY.get().ok_or_else(|| candle_core::Error::Msg("no sequence-state memory installed".into()))
++}
++
++/// Recurrent state for continuous batching: a slot per sequence.
+ ///
+-/// Works for both Mamba SSM and GDN (Gated Delta Net) recurrent layers.
+-/// Instead of dynamically sized state tensors, we maintain a pool of
+-/// state slots that grows dynamically. Each sequence is assigned a slot index,
+-/// and the forward pass uses `index_select` (gather) and index assignment (scatter)
+-/// to access the correct states.
+-#[derive(Debug)]
++/// For Mamba SSM and GDN (Gated Delta Net) layers alike: a sequence holds a slot index, and this layer's conv
++/// and recurrent tensors of it are views into its one [`RecurrentState`] ([`HybridCache::allocate_seq`]).
++#[derive(Debug, Clone)]
+ pub struct RecurrentStatePool {
+-    /// Convolution state pool: (capacity, conv_dim, conv_width)
+-    pub conv_state: Tensor,
+-    /// Recurrent state pool: (capacity, ...state_dims)
+-    /// For Mamba: (capacity, n_heads, head_dim, d_state)
+-    /// For GDN: (capacity, n_v_heads, key_dim, value_dim)
+-    pub recurrent_state: Tensor,
+-    /// Per-slot sequence length offsets (for tracking generation position)
+-    seqlen_offsets: Vec<usize>,
+-    /// Stack of free slot indices (for allocation)
+-    free_slots: Vec<usize>,
+-    /// Current capacity (grows dynamically)
+-    capacity: usize,
+-    /// Shape parameters for growing
++    /// Each slot's state while a sequence holds it.
++    slots: Vec<Option<SlotState>>,
+     conv_dim: usize,
+     conv_width: usize,
++    /// Shape of the recurrent state per slot: Mamba (n_heads, head_dim, d_state), GDN (n_v_heads, key_dim, value_dim).
+     state_dims: Vec<usize>,
+     dtype: candle_core::DType,
++    recurrent_dtype: candle_core::DType,
+     device: Device,
+ }
+ 
+-/// Initial pool capacity before dynamic growth.
+-const INITIAL_POOL_CAPACITY: usize = 4;
++/// One sequence's recurrent state in this layer.
++#[derive(Debug, Clone)]
++pub struct SlotState {
++    /// (1, conv_dim, conv_width)
++    pub conv: Tensor,
++    /// (1, ...state_dims)
++    pub recurrent: Tensor,
++    /// Tokens the state has consumed.
++    seqlen_offset: usize,
++}
+ 
+ impl RecurrentStatePool {
+-    /// Create a new recurrent state pool.
++    /// Create a pool that holds no state until a sequence takes a slot.
+     ///
+     /// - `conv_dim`: dimension of the convolution state
+     /// - `conv_width`: kernel size / d_conv for causal conv1d
+     /// - `state_dims`: shape of the recurrent state per slot (e.g. `[n_heads, head_dim, d_state]`)
++    /// The two split because GDN and KDA carry recurrent state in F32 while the model runs in BF16.
+     pub fn new(
+         conv_dim: usize,
+         conv_width: usize,
+         state_dims: Vec<usize>,
+         dtype: candle_core::DType,
++        recurrent_dtype: Option<candle_core::DType>,
+         device: &Device,
+     ) -> Result<Self> {
+-        let capacity = INITIAL_POOL_CAPACITY;
+-
+-        let conv_state = Tensor::zeros((capacity, conv_dim, conv_width), dtype, device)?;
+-
+-        let mut recurrent_shape = vec![capacity];
+-        recurrent_shape.extend_from_slice(&state_dims);
+-        let recurrent_state = Tensor::zeros(recurrent_shape, dtype, device)?;
+-
+-        let free_slots: Vec<usize> = (0..capacity).rev().collect();
+-        let seqlen_offsets = vec![0; capacity];
+-
+         Ok(Self {
+-            conv_state,
+-            recurrent_state,
+-            seqlen_offsets,
+-            free_slots,
+-            capacity,
++            slots: Vec::new(),
+             conv_dim,
+             conv_width,
+             state_dims,
+             dtype,
++            recurrent_dtype: recurrent_dtype.unwrap_or(dtype),
+             device: device.clone(),
+         })
+     }
+ 
+-    /// Grow the pool by doubling capacity.
+-    fn grow(&mut self) -> Result<()> {
+-        let new_capacity = self.capacity * 2;
+-
+-        // Allocate new larger conv_state and copy existing data
+-        let new_conv = Tensor::zeros(
+-            (new_capacity, self.conv_dim, self.conv_width),
+-            self.dtype,
+-            &self.device,
+-        )?;
+-        new_conv.slice_set(&self.conv_state, 0, 0)?;
+-
+-        // Allocate new larger recurrent_state and copy existing data
+-        let mut recurrent_shape = vec![new_capacity];
++    /// This layer's part of a state's layout.
++    fn layout(&self) -> ((usize, usize, usize), candle_core::DType, Vec<usize>, candle_core::DType) {
++        let mut recurrent_shape = vec![1usize];
+         recurrent_shape.extend_from_slice(&self.state_dims);
+-        let new_recurrent = Tensor::zeros(recurrent_shape, self.dtype, &self.device)?;
+-        new_recurrent.slice_set(&self.recurrent_state, 0, 0)?;
+-
+-        // Add new slots to free list
+-        self.free_slots.extend((self.capacity..new_capacity).rev());
+-        self.seqlen_offsets.resize(new_capacity, 0);
+-
+-        self.conv_state = new_conv;
+-        self.recurrent_state = new_recurrent;
+-        self.capacity = new_capacity;
+-
+-        tracing::info!("Recurrent state pool grew to capacity {new_capacity}");
+-        Ok(())
++        ((1, self.conv_dim, self.conv_width), self.dtype, recurrent_shape, self.recurrent_dtype)
+     }
+ 
+-    /// Allocate a state slot for a new sequence. Returns the slot index.
+-    /// The pool grows dynamically if no free slots are available.
+-    /// The slot's state is reset to zeros to prevent state bleeding.
+-    pub fn allocate(&mut self) -> Option<usize> {
+-        if self.free_slots.is_empty() {
+-            if let Err(e) = self.grow() {
+-                tracing::error!("Failed to grow recurrent state pool: {e}");
+-                return None;
+-            }
++    /// Slot `slot_idx` holds `conv` and `recurrent`, a sequence's own views, at position zero.
++    pub fn hold(&mut self, slot_idx: usize, conv: Tensor, recurrent: Tensor) {
++        if slot_idx >= self.slots.len() {
++            self.slots.resize(slot_idx + 1, None);
+         }
+-        let slot_idx = self.free_slots.pop()?;
+-        if self.reset_slot(slot_idx).is_err() {
+-            tracing::warn!("Failed to reset recurrent state slot {slot_idx}, state may be stale");
+-        }
+-        Some(slot_idx)
++        self.slots[slot_idx] = Some(SlotState { conv, recurrent, seqlen_offset: 0 });
+     }
+ 
+-    /// Free a state slot when a sequence completes.
++    /// The lowest slot no sequence holds.
++    fn free_slot(&self) -> usize {
++        self.slots.iter().position(Option::is_none).unwrap_or(self.slots.len())
++    }
++
++    /// A sequence completed: its state goes with it.
+     pub fn free(&mut self, slot_idx: usize) {
+-        debug_assert!(slot_idx < self.capacity);
+-        self.seqlen_offsets[slot_idx] = 0;
+-        self.free_slots.push(slot_idx);
++        if let Some(slot) = self.slots.get_mut(slot_idx) {
++            *slot = None;
++        }
+     }
+ 
+-    /// Get the seqlen offset for a slot
++    /// The state a sequence holds in `slot_idx`.
++    pub fn state(&self, slot_idx: usize) -> Result<&SlotState> {
++        self.slots
++            .get(slot_idx)
++            .and_then(Option::as_ref)
++            .ok_or_else(|| candle_core::Error::Msg(format!("recurrent slot {slot_idx} held by no sequence")))
++    }
++
++    fn state_mut(&mut self, slot_idx: usize) -> Result<&mut SlotState> {
++        self.slots
++            .get_mut(slot_idx)
++            .and_then(Option::as_mut)
++            .ok_or_else(|| candle_core::Error::Msg(format!("recurrent slot {slot_idx} held by no sequence")))
++    }
++
++    /// Get the seqlen offset for a slot; 0 for a slot no sequence holds.
+     pub fn get_seqlen_offset(&self, slot_idx: usize) -> usize {
+-        self.seqlen_offsets[slot_idx]
++        self.state(slot_idx).map_or(0, |s| s.seqlen_offset)
+     }
+ 
+     /// Set the seqlen offset for a slot
+     pub fn set_seqlen_offset(&mut self, slot_idx: usize, offset: usize) {
+-        self.seqlen_offsets[slot_idx] = offset;
++        if let Ok(s) = self.state_mut(slot_idx) {
++            s.seqlen_offset = offset;
++        }
+     }
+ 
+     /// Increment seqlen offset for a slot
+     pub fn increment_seqlen_offset(&mut self, slot_idx: usize, delta: usize) {
+-        self.seqlen_offsets[slot_idx] += delta;
+-    }
+-
+-    /// Gather conv states for the given slot indices
+-    pub fn gather_conv_state(&self, state_indices: &Tensor) -> Result<Tensor> {
+-        self.conv_state.index_select(state_indices, 0)
+-    }
+-
+-    /// Gather recurrent states for the given slot indices
+-    pub fn gather_recurrent_state(&self, state_indices: &Tensor) -> Result<Tensor> {
+-        self.recurrent_state.index_select(state_indices, 0)
+-    }
+-
+-    /// Scatter conv states back to the pool for the given slot indices
+-    pub fn scatter_conv_state(&mut self, state_indices: &Tensor, values: &Tensor) -> Result<()> {
+-        let indices: Vec<u32> = state_indices.to_vec1()?;
+-        for (batch_idx, &slot_idx) in indices.iter().enumerate() {
+-            let value = values.i(batch_idx)?.unsqueeze(0)?.contiguous()?;
+-            self.conv_state.slice_set(&value, 0, slot_idx as usize)?;
++        if let Ok(s) = self.state_mut(slot_idx) {
++            s.seqlen_offset += delta;
+         }
+-        Ok(())
+     }
+ 
+-    /// Scatter recurrent states back to the pool for the given slot indices
+-    pub fn scatter_recurrent_state(
++    /// Copies of the conv states for the given slots, batched in their order.
++    pub fn gather_conv_state(&self, slot_indices: &[u32]) -> Result<Tensor> {
++        self.gather(slot_indices, |s| &s.conv)
++    }
++
++    /// Copies of the recurrent states for the given slots, batched in their order.
++    pub fn gather_recurrent_state(&self, slot_indices: &[u32]) -> Result<Tensor> {
++        self.gather(slot_indices, |s| &s.recurrent)
++    }
++
++    /// A copy, never a share: the caller keeps it while the slot is rewritten; a device clone shares its buffer.
++    fn gather(&self, slot_indices: &[u32], part: impl Fn(&SlotState) -> &Tensor) -> Result<Tensor> {
++        let copies = slot_indices
++            .iter()
++            .map(|&i| part(self.state(i as usize)?).force_contiguous())
++            .collect::<Result<Vec<_>>>()?;
++        match copies.as_slice() {
++            [one] => Ok(one.clone()),
++            _ => Tensor::cat(&copies, 0),
++        }
++    }
++
++    /// Write back the conv states of a batch, row `b` into `slot_indices[b]`.
++    pub fn scatter_conv_state_slots(
+         &mut self,
+-        state_indices: &Tensor,
++        slot_indices: &[u32],
+         values: &Tensor,
+     ) -> Result<()> {
+-        let indices: Vec<u32> = state_indices.to_vec1()?;
+-        for (batch_idx, &slot_idx) in indices.iter().enumerate() {
++        for (batch_idx, &slot_idx) in slot_indices.iter().enumerate() {
+             let value = values.i(batch_idx)?.unsqueeze(0)?.contiguous()?;
+-            self.recurrent_state
+-                .slice_set(&value, 0, slot_idx as usize)?;
++            self.state_mut(slot_idx as usize)?.conv.slice_set(&value, 0, 0)?;
+         }
+         Ok(())
+     }
+ 
+-    /// Reset a specific slot's state to zeros
+-    pub fn reset_slot(&mut self, slot_idx: usize) -> Result<()> {
+-        let zero_conv = Tensor::zeros(
+-            (1, self.conv_dim, self.conv_width),
+-            self.dtype,
+-            &self.device,
+-        )?;
+-
+-        let mut recurrent_shape = vec![1usize];
+-        recurrent_shape.extend_from_slice(&self.state_dims);
+-        let zero_recurrent = Tensor::zeros(recurrent_shape, self.dtype, &self.device)?;
+-
+-        self.conv_state.slice_set(&zero_conv, 0, slot_idx)?;
+-        self.recurrent_state
+-            .slice_set(&zero_recurrent, 0, slot_idx)?;
+-        self.seqlen_offsets[slot_idx] = 0;
++    /// Write back the recurrent states of a batch, as [`Self::scatter_conv_state_slots`].
++    pub fn scatter_recurrent_state_slots(
++        &mut self,
++        slot_indices: &[u32],
++        values: &Tensor,
++    ) -> Result<()> {
++        for (batch_idx, &slot_idx) in slot_indices.iter().enumerate() {
++            let value = values.i(batch_idx)?.unsqueeze(0)?.contiguous()?;
++            self.state_mut(slot_idx as usize)?.recurrent.slice_set(&value, 0, 0)?;
++        }
+         Ok(())
+     }
+ 
+-    /// Reset all slots
+-    pub fn reset(&mut self) -> Result<()> {
+-        self.conv_state = self.conv_state.zeros_like()?;
+-        self.recurrent_state = self.recurrent_state.zeros_like()?;
+-        self.seqlen_offsets.fill(0);
+-        self.free_slots = (0..self.capacity).rev().collect();
+-        Ok(())
+-    }
+-
+-    pub fn capacity(&self) -> usize {
+-        self.capacity
+-    }
+-
+-    pub fn num_free_slots(&self) -> usize {
+-        self.free_slots.len()
+-    }
+-
+     pub fn device(&self) -> &Device {
+         &self.device
+     }
+@@ -231,23 +330,6 @@ impl RecurrentStatePool {
+     }
+ }
+ 
+-impl Clone for RecurrentStatePool {
+-    fn clone(&self) -> Self {
+-        Self {
+-            conv_state: self.conv_state.clone(),
+-            recurrent_state: self.recurrent_state.clone(),
+-            seqlen_offsets: self.seqlen_offsets.clone(),
+-            free_slots: self.free_slots.clone(),
+-            capacity: self.capacity,
+-            conv_dim: self.conv_dim,
+-            conv_width: self.conv_width,
+-            state_dims: self.state_dims.clone(),
+-            dtype: self.dtype,
+-            device: self.device.clone(),
+-        }
+-    }
+-}
+-
+ /// Per-layer cache that can be either attention (KV) or recurrent (state pool)
+ #[derive(Clone, Debug)]
+ pub enum HybridLayerCache {
+@@ -256,12 +338,10 @@ pub enum HybridLayerCache {
+ }
+ 
+ impl HybridLayerCache {
++    /// The attention layer's cache emptied; a recurrent layer's states are the cache's ([`HybridCache::reset`]).
+     pub fn reset(&mut self) {
+-        match self {
+-            Self::Attention(kv) => kv.reset(),
+-            Self::Recurrent(pool) => {
+-                let _ = pool.reset();
+-            }
++        if let Self::Attention(kv) = self {
++            kv.reset();
+         }
+     }
+ 
+@@ -302,7 +382,7 @@ pub enum HybridLayerType {
+ }
+ 
+ /// Configuration for the recurrent layer state dimensions
+-#[derive(Clone, Debug)]
++#[derive(Clone, Debug, PartialEq)]
+ pub struct RecurrentLayerConfig {
+     /// Dimension of the convolution state
+     pub conv_dim: usize,
+@@ -314,12 +394,24 @@ pub struct RecurrentLayerConfig {
+     pub state_dims: Vec<usize>,
+ }
+ 
++/// Dtypes for a recurrent pool's state tensors when they should not follow the model's; only callers that care name it.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct RecurrentStateDtypes {
++    /// dtype for `recurrent_state`; `None` follows the model dtype.
++    pub state: Option<candle_core::DType>,
++    /// dtype for `conv_state`; `None` follows the model dtype.
++    pub conv: Option<candle_core::DType>,
++}
++
+ /// Configuration for creating a hybrid cache
+ #[derive(Clone, Debug)]
+ pub struct HybridCacheConfig {
+     pub layer_types: Vec<HybridLayerType>,
+     pub max_seq_len: usize,
+     pub recurrent: RecurrentLayerConfig,
++    /// Per-layer overrides for recurrent layers whose state shape differs from the model-wide `recurrent`
++    /// config (one layer carrying an auxiliary conv history beside its taps); empty where they are uniform.
++    pub recurrent_overrides: Vec<(usize, RecurrentLayerConfig)>,
+ }
+ 
+ /// Hybrid cache that stores per-layer caches for mixed attention/recurrent models
+@@ -331,36 +423,51 @@ pub struct HybridCacheConfig {
+ pub struct HybridCache {
+     pub caches: Vec<HybridLayerCache>,
+     config: HybridCacheConfig,
++    /// Each slot's state while a sequence holds it: the object every recurrent layer's slot views are cut from.
++    states: Vec<Option<RecurrentState>>,
+     /// Current batch's state indices for recurrent pool access.
+     /// Set by clone_in_cache before forward, used by model during forward.
+-    /// Shape: (batch_size,) containing pool slot indices.
+-    state_indices: Option<Tensor>,
++    state_indices: Option<HybridStateIndices>,
++    /// One slot's emit points for the chunk being forwarded: `(position inside the chunk, the object every
++    /// recurrent layer writes its state at it into)`, ascending; set before the forward, taken after it.
++    emits: (usize, Vec<(usize, RecurrentState)>),
+ }
+ 
+ impl HybridCache {
+     pub const CACHE_GROW_SIZE: usize = 512;
+ 
++    /// The recurrent pool's state tensors follow the model's dtype unless `state_dtypes` names theirs.
+     pub fn new(
+         config: HybridCacheConfig,
+         dtype: candle_core::DType,
++        state_dtypes: RecurrentStateDtypes,
+         device: &Device,
+     ) -> Result<Self> {
+         let mut caches = Vec::with_capacity(config.layer_types.len());
+ 
+-        for layer_type in &config.layer_types {
++        for (layer_idx, layer_type) in config.layer_types.iter().enumerate() {
+             let cache = match layer_type {
+                 HybridLayerType::Attention => HybridLayerCache::Attention(KvCache::new_normal(
+                     2,
+                     config.max_seq_len,
+                     Self::CACHE_GROW_SIZE,
+                 )),
+-                HybridLayerType::Recurrent => HybridLayerCache::Recurrent(RecurrentStatePool::new(
+-                    config.recurrent.conv_dim,
+-                    config.recurrent.conv_width,
+-                    config.recurrent.state_dims.clone(),
+-                    dtype,
+-                    device,
+-                )?),
++                HybridLayerType::Recurrent => {
++                    let rc = config
++                        .recurrent_overrides
++                        .iter()
++                        .find(|(i, _)| *i == layer_idx)
++                        .map(|(_, c)| c)
++                        .unwrap_or(&config.recurrent);
++                    HybridLayerCache::Recurrent(RecurrentStatePool::new(
++                        rc.conv_dim,
++                        rc.conv_width,
++                        rc.state_dims.clone(),
++                        state_dtypes.conv.unwrap_or(dtype),
++                        state_dtypes.state,
++                        device,
++                    )?)
++                }
+             };
+             caches.push(cache);
+         }
+@@ -368,101 +475,111 @@ impl HybridCache {
+         Ok(Self {
+             caches,
+             config,
++            states: Vec::new(),
+             state_indices: None,
++            emits: (0, Vec::new()),
+         })
+     }
+ 
+-    /// Allocate state slots for a new sequence across all recurrent layers.
+-    /// Returns the slot index (same for all layers).
+-    pub fn allocate_seq(&mut self) -> Option<usize> {
+-        // Collect recurrent layer indices once so rollback can target only recurrent pools.
+-        let recurrent_layers: Vec<usize> = self
+-            .caches
+-            .iter()
+-            .enumerate()
+-            .filter_map(|(idx, cache)| match cache {
+-                HybridLayerCache::Recurrent(_) => Some(idx),
+-                HybridLayerCache::Attention(_) => None,
+-            })
+-            .collect();
+-
+-        let mut expected_slot = None;
+-        let mut allocated_slots = Vec::new();
+-
+-        for &layer_idx in &recurrent_layers {
+-            let slot_idx = {
+-                let HybridLayerCache::Recurrent(pool) = &mut self.caches[layer_idx] else {
+-                    unreachable!("recurrent_layers only contains recurrent entries");
+-                };
+-                match pool.allocate() {
+-                    Some(idx) => idx,
+-                    None => {
+-                        for (&rollback_layer_idx, &rollback_slot_idx) in
+-                            recurrent_layers.iter().zip(allocated_slots.iter())
+-                        {
+-                            if let HybridLayerCache::Recurrent(pool) =
+-                                &mut self.caches[rollback_layer_idx]
+-                            {
+-                                pool.free(rollback_slot_idx);
+-                            }
+-                        }
+-                        return None;
+-                    }
+-                }
+-            };
+-
+-            if let Some(expected) = expected_slot {
+-                if slot_idx != expected {
+-                    tracing::warn!(
+-                        "Hybrid recurrent pool slot mismatch: expected {expected}, got {slot_idx}. Rolling back allocation."
+-                    );
+-                    if let HybridLayerCache::Recurrent(pool) = &mut self.caches[layer_idx] {
+-                        pool.free(slot_idx);
+-                    }
+-                    for (&rollback_layer_idx, &rollback_slot_idx) in
+-                        recurrent_layers.iter().zip(allocated_slots.iter())
+-                    {
+-                        if let HybridLayerCache::Recurrent(pool) =
+-                            &mut self.caches[rollback_layer_idx]
+-                        {
+-                            pool.free(rollback_slot_idx);
+-                        }
+-                    }
+-                    return None;
+-                }
+-            } else {
+-                expected_slot = Some(slot_idx);
+-            }
+-
+-            allocated_slots.push(slot_idx);
+-        }
+-
+-        expected_slot
++    /// The objects slot `slot`'s layers fill at the chunk positions given, in ascending order.
++    pub fn set_emits(&mut self, slot: usize, emits: Vec<(usize, RecurrentState)>) {
++        self.emits = (slot, emits);
+     }
+ 
+-    /// Free state slots for a sequence across all recurrent layers.
++    pub fn take_emits(&mut self) -> Vec<(usize, RecurrentState)> {
++        std::mem::take(&mut self.emits.1)
++    }
++
++    /// Layer `i`'s part of each emit of `slot`: the position, the object's conv and recurrent tensors for it.
++    pub fn layer_emits(&self, slot: usize, i: usize) -> Vec<(usize, Tensor, Tensor)> {
++        let k = self.caches[..i].iter().filter(|c| c.as_recurrent_pool().is_some()).count();
++        let part = |(at, state): &(usize, RecurrentState)| {
++            let (conv, recurrent) = &state.layers()[k];
++            (*at, conv.clone(), recurrent.clone())
++        };
++        self.emits.1.iter().filter(|_| self.emits.0 == slot).map(part).collect()
++    }
++
++    fn pools(&self) -> impl Iterator<Item = &RecurrentStatePool> {
++        self.caches.iter().filter_map(HybridLayerCache::as_recurrent_pool)
++    }
++
++    fn pools_mut(&mut self) -> impl Iterator<Item = &mut RecurrentStatePool> {
++        self.caches.iter_mut().filter_map(HybridLayerCache::as_recurrent_pool_mut)
++    }
++
++    /// The model layers that carry recurrent state, in order: what a state's layers correspond to.
++    pub fn recurrent_layers(&self) -> Vec<usize> {
++        self.caches.iter().enumerate().filter(|(_, c)| c.as_recurrent_pool().is_some()).map(|(i, _)| i).collect()
++    }
++
++    /// The layout of one sequence's state: every recurrent layer's part, in layer order.
++    pub fn state_layout(&self) -> RecurrentStateLayout {
++        RecurrentStateLayout { layers: self.pools().map(RecurrentStatePool::layout).collect() }
++    }
++
++    /// A state of this cache's layout from the installed memory, its bytes
++    /// unspecified; `None` for a cache with no recurrent layer.
++    pub fn take_state(&self) -> Result<Option<RecurrentState>> {
++        let Some(device) = self.recurrent_device() else {
++            return Ok(None);
++        };
++        recurrent_state_memory()?.take(&self.state_layout(), device).map(Some)
++    }
++
++    /// The device the recurrent states live on; none without a recurrent layer.
++    pub fn recurrent_device(&self) -> Option<&Device> {
++        self.pools().next().map(RecurrentStatePool::device)
++    }
++
++    /// Allocate a new sequence's state slot across all recurrent layers: the slot index (one for every layer,
++    /// its views over one zeroed state), `None` without a recurrent layer, or the memory's refusal with nothing taken.
++    pub fn allocate_seq(&mut self) -> Result<Option<usize>> {
++        let Some(state) = self.take_state()? else {
++            return Ok(None);
++        };
++        state.zero()?;
++        let slot = self.pools().map(RecurrentStatePool::free_slot).max().unwrap_or(0);
++        for (pool, (conv, recurrent)) in self.pools_mut().zip(state.layers().iter().cloned().collect::<Vec<_>>()) {
++            pool.hold(slot, conv, recurrent);
++        }
++        if slot >= self.states.len() {
++            self.states.resize(slot + 1, None);
++        }
++        self.states[slot] = Some(state);
++        Ok(Some(slot))
++    }
++
++    /// Free the state slot of a sequence across all recurrent layers: the
++    /// state goes back to the memory with the last handle on it.
+     pub fn free_seq(&mut self, slot_idx: usize) {
+-        for cache in &mut self.caches {
+-            if let HybridLayerCache::Recurrent(pool) = cache {
+-                pool.free(slot_idx);
+-            }
++        for pool in self.pools_mut() {
++            pool.free(slot_idx);
++        }
++        if let Some(state) = self.states.get_mut(slot_idx) {
++            *state = None;
+         }
+     }
+ 
+     /// Reset a specific sequence's state in all recurrent layers.
+     pub fn reset_seq(&mut self, slot_idx: usize) -> Result<()> {
+-        for cache in &mut self.caches {
+-            if let HybridLayerCache::Recurrent(pool) = cache {
+-                pool.reset_slot(slot_idx)?;
+-            }
++        if let Some(state) = self.states.get(slot_idx).and_then(Option::as_ref) {
++            state.zero()?;
++        }
++        for pool in self.pools_mut() {
++            pool.set_seqlen_offset(slot_idx, 0);
+         }
+         Ok(())
+     }
+ 
++    /// Zero every held state at position zero; the sequences keep their slots.
+     pub fn reset(&mut self) {
+         for cache in &mut self.caches {
+             cache.reset();
+         }
++        for slot in 0..self.states.len() {
++            let _ = self.reset_seq(slot);
++        }
+     }
+ 
+     pub fn num_layers(&self) -> usize {
+@@ -489,14 +606,34 @@ impl HybridCache {
+ 
+     /// Set the state indices for the current batch.
+     /// Called by HybridCacheManager::clone_in_cache before forward.
+-    pub fn set_state_indices(&mut self, indices: Option<Tensor>) {
++    pub fn set_state_indices(&mut self, indices: Option<HybridStateIndices>) {
+         self.state_indices = indices;
+     }
+ 
+-    /// Get the state indices for the current batch.
+-    /// Used by the model during forward to access recurrent state pool.
++    /// Build state indices from a host-side `Vec<u32>`; vec is mirrored, tensor built on `device`.
++    pub fn set_state_indices_from_host(
++        &mut self,
++        host: Vec<u32>,
++        device: &Device,
++    ) -> Result<()> {
++        let len = host.len();
++        let host_arc: Arc<[u32]> = Arc::from(host.as_slice());
++        let tensor = Tensor::from_vec(host, (len,), device)?;
++        self.state_indices = Some(HybridStateIndices {
++            tensor,
++            host: host_arc,
++        });
++        Ok(())
++    }
++
++    /// GPU tensor of state indices for the current batch.
+     pub fn state_indices(&self) -> Option<&Tensor> {
+-        self.state_indices.as_ref()
++        self.state_indices.as_ref().map(|s| &s.tensor)
++    }
++
++    /// Host-side mirror of state indices; per-layer dispatch uses to avoid sync.
++    pub fn state_indices_host(&self) -> Option<&[u32]> {
++        self.state_indices.as_ref().map(|s| s.host.as_ref())
+     }
+ }
+ 
+@@ -524,55 +661,43 @@ impl HybridCache {
+     }
+ }
+ 
+-/// Snapshot of a single recurrent layer's state for prefix caching.
+-#[derive(Clone, Debug)]
+-pub struct RecurrentStateSnapshot {
+-    pub conv_state: Tensor,
+-    pub recurrent_state: Tensor,
+-    pub seqlen_offset: usize,
+-}
+-
+ impl HybridCache {
+-    /// Snapshot the recurrent state for a sequence at the given slot index.
+-    /// Returns one snapshot per recurrent layer, in layer order.
+-    #[allow(clippy::cast_possible_truncation)]
+-    pub fn snapshot_recurrent_state(&self, slot_idx: usize) -> Result<Vec<RecurrentStateSnapshot>> {
+-        let mut snapshots = Vec::new();
+-        for cache in &self.caches {
+-            if let HybridLayerCache::Recurrent(pool) = cache {
+-                let idx_tensor = Tensor::from_vec(vec![slot_idx as u32], (1,), pool.device())?;
+-                let conv = pool.gather_conv_state(&idx_tensor)?;
+-                let recurrent = pool.gather_recurrent_state(&idx_tensor)?;
+-                snapshots.push(RecurrentStateSnapshot {
+-                    conv_state: conv,
+-                    recurrent_state: recurrent,
+-                    seqlen_offset: pool.get_seqlen_offset(slot_idx),
+-                });
+-            }
+-        }
+-        Ok(snapshots)
++    /// Tokens the recurrent state at `slot_idx` has consumed, the position a snapshot taken now is valid at.
++    /// Read from the first recurrent pool; the layers advance together (the forward asserts it).
++    pub fn recurrent_seqlen_offset(&self, slot_idx: usize) -> Option<usize> {
++        self.pools().next().map(|pool| pool.get_seqlen_offset(slot_idx))
+     }
+ 
+-    /// Restore recurrent state snapshots into the pool at the given slot index.
+-    /// Snapshots must be in the same layer order as returned by `snapshot_recurrent_state`.
+-    #[allow(clippy::cast_possible_truncation)]
+-    pub fn restore_recurrent_state(
+-        &mut self,
+-        slot_idx: usize,
+-        snapshots: &[RecurrentStateSnapshot],
+-    ) -> Result<()> {
+-        let mut snap_iter = snapshots.iter();
+-        for cache in &mut self.caches {
+-            if let HybridLayerCache::Recurrent(pool) = cache {
+-                if let Some(snap) = snap_iter.next() {
+-                    let conv = snap.conv_state.to_device(pool.device())?;
+-                    let recurrent = snap.recurrent_state.to_device(pool.device())?;
+-                    let idx_tensor = Tensor::from_vec(vec![slot_idx as u32], (1,), pool.device())?;
+-                    pool.scatter_conv_state(&idx_tensor, &conv)?;
+-                    pool.scatter_recurrent_state(&idx_tensor, &recurrent)?;
+-                    pool.set_seqlen_offset(slot_idx, snap.seqlen_offset);
+-                }
+-            }
++    /// A handle on the state a sequence holds in `slot_idx` and its consumed position, taking nothing from the
++    /// memory: the object stays the slot's, alive while the handle is; a finished sequence's record copies it first.
++    pub fn live_recurrent_state(&self, slot_idx: usize) -> Result<(usize, RecurrentState)> {
++        let live = self
++            .states
++            .get(slot_idx)
++            .and_then(Option::as_ref)
++            .ok_or_else(|| candle_core::Error::Msg(format!("recurrent slot {slot_idx} held by no sequence")))?;
++        Ok((self.recurrent_seqlen_offset(slot_idx).unwrap_or(0), live.clone()))
++    }
++
++    /// A copy of the state a sequence holds in `slot_idx`, valid at its consumed position: a taken state and one blit.
++    pub fn snapshot_recurrent_state(&self, slot_idx: usize) -> Result<RecurrentState> {
++        let (at, live) = self.live_recurrent_state(slot_idx)?;
++        let copy = self.take_state()?.ok_or_else(|| candle_core::Error::Msg("no recurrent layer to snapshot".into()))?;
++        copy.copy_from(&live)?;
++        Ok(copy.at(at))
++    }
++
++    /// The state a sequence holds in `slot_idx` becomes `snapshot`, at the snapshot's position: one blit.
++    pub fn restore_recurrent_state(&mut self, slot_idx: usize, snapshot: &RecurrentState) -> Result<()> {
++        let live = self
++            .states
++            .get(slot_idx)
++            .and_then(Option::as_ref)
++            .ok_or_else(|| candle_core::Error::Msg(format!("recurrent slot {slot_idx} held by no sequence")))?;
++        live.copy_from(snapshot)?;
++        let offset = snapshot.seqlen_offset();
++        for pool in self.pools_mut() {
++            pool.set_seqlen_offset(slot_idx, offset);
+         }
+         Ok(())
+     }
+diff --git c/mistralrs-core/src/models/granite.rs w/mistralrs-core/src/models/granite.rs
+index f60621a1..dc2a8b12 100644
+--- c/mistralrs-core/src/models/granite.rs
++++ w/mistralrs-core/src/models/granite.rs
+@@ -1868,12 +1868,14 @@ impl GraniteMoeHybrid {
+                 conv_width: cfg.mamba_d_conv,
+                 state_dims: vec![cfg.mamba_n_heads(), cfg.mamba_d_head(), cfg.mamba_d_state],
+             },
++            recurrent_overrides: vec![],
+         };
+ 
+         let pipeline_cache = Arc::new(Mutex::new(
+             HybridCache::new(
+                 hybrid_cache_config,
+                 vb_m.dtype(),
++                Default::default(),
+                 &normal_loading_metadata.real_device,
+             )
+             .map_err(|e| {
+@@ -1998,12 +2000,12 @@ impl GraniteMoeHybrid {
+                     if let (Some(ref indices), Some(HybridLayerCache::Recurrent(pool))) =
+                         (&state_indices, pipeline_cache.get_mut(layer_idx))
+                     {
+-                        let conv_state = pool.gather_conv_state(indices)?;
+-                        let ssm_state = pool.gather_recurrent_state(indices)?;
++                        let indices_vec: Vec<u32> = indices.to_vec1()?;
++                        let conv_state = pool.gather_conv_state(&indices_vec)?;
++                        let ssm_state = pool.gather_recurrent_state(&indices_vec)?;
+ 
+                         // Get seqlen_offset from first sequence (assumes all same phase)
+-                        let first_idx: u32 = indices.i(0)?.to_scalar()?;
+-                        let seqlen_offset = pool.get_seqlen_offset(first_idx as usize);
++                        let seqlen_offset = pool.get_seqlen_offset(indices_vec[0] as usize);
+ 
+                         // Create temporary cache with gathered states
+                         let mut temp_cache = MambaLayerCache {
+@@ -2016,11 +2018,10 @@ impl GraniteMoeHybrid {
+                         x = block.forward(&x, &mut temp_cache)?;
+ 
+                         // Scatter updated states back to pool
+-                        pool.scatter_conv_state(indices, &temp_cache.conv_state)?;
+-                        pool.scatter_recurrent_state(indices, &temp_cache.ssm_state)?;
++                        pool.scatter_conv_state_slots(&indices_vec, &temp_cache.conv_state)?;
++                        pool.scatter_recurrent_state_slots(&indices_vec, &temp_cache.ssm_state)?;
+ 
+                         // Update seqlen_offsets in pool for each sequence
+-                        let indices_vec: Vec<u32> = indices.to_vec1()?;
+                         for &idx in &indices_vec {
+                             pool.set_seqlen_offset(idx as usize, temp_cache.seqlen_offset);
+                         }
+diff --git c/mistralrs-core/src/models/qwen3_next.rs w/mistralrs-core/src/models/qwen3_next.rs
+index 91ab52d2..f87eef29 100644
+--- c/mistralrs-core/src/models/qwen3_next.rs
++++ w/mistralrs-core/src/models/qwen3_next.rs
+@@ -859,12 +859,14 @@ impl Model {
+                     cfg.linear_value_head_dim,
+                 ],
+             },
++            recurrent_overrides: vec![],
+         };
+ 
+         let pipeline_cache = Arc::new(Mutex::new(
+             HybridCache::new(
+                 hybrid_cache_config,
+                 vb_m.dtype(),
++                Default::default(),
+                 &normal_loading_metadata.real_device,
+             )
+             .map_err(|e| {
+@@ -982,8 +984,8 @@ impl Model {
+                             );
+                         }
+ 
+-                        let conv_state = pool.gather_conv_state(indices)?;
+-                        let recurrent_state = pool.gather_recurrent_state(indices)?;
++                        let conv_state = pool.gather_conv_state(&indices_vec)?;
++                        let recurrent_state = pool.gather_recurrent_state(&indices_vec)?;
+ 
+                         let mut gdn_cache = GdnLayerCache {
+                             conv_state,
+@@ -993,8 +995,8 @@ impl Model {
+ 
+                         x = layer.forward_linear(&x, &mut gdn_cache)?;
+ 
+-                        pool.scatter_conv_state(indices, &gdn_cache.conv_state)?;
+-                        pool.scatter_recurrent_state(indices, &gdn_cache.recurrent_state)?;
++                        pool.scatter_conv_state_slots(&indices_vec, &gdn_cache.conv_state)?;
++                        pool.scatter_recurrent_state_slots(&indices_vec, &gdn_cache.recurrent_state)?;
+ 
+                         let delta = gdn_cache.seqlen_offset.saturating_sub(first_offset);
+                         for &idx in &indices_vec {
+diff --git c/mistralrs-core/src/vision_models/qwen3_5/text.rs w/mistralrs-core/src/vision_models/qwen3_5/text.rs
+index f797a58b..e87b6f43 100644
+--- c/mistralrs-core/src/vision_models/qwen3_5/text.rs
++++ w/mistralrs-core/src/vision_models/qwen3_5/text.rs
+@@ -612,12 +612,14 @@ impl Qwen3_5TextModel {
+                     cfg.linear_value_head_dim,
+                 ],
+             },
++            recurrent_overrides: vec![],
+         };
+ 
+         let pipeline_cache = Arc::new(Mutex::new(
+             HybridCache::new(
+                 hybrid_cache_config,
+                 vb_m.dtype(),
++                Default::default(),
+                 &normal_loading_metadata.real_device,
+             )
+             .map_err(|e| {
+@@ -762,8 +764,8 @@ impl Qwen3_5TextModel {
+                             );
+                         }
+ 
+-                        let conv_state = pool.gather_conv_state(indices)?;
+-                        let recurrent_state = pool.gather_recurrent_state(indices)?;
++                        let conv_state = pool.gather_conv_state(&indices_vec)?;
++                        let recurrent_state = pool.gather_recurrent_state(&indices_vec)?;
+ 
+                         let mut gdn_cache = GdnLayerCache {
+                             conv_state,
+@@ -773,8 +775,8 @@ impl Qwen3_5TextModel {
+ 
+                         xs = layer.forward_linear(&xs, &mut gdn_cache)?;
+ 
+-                        pool.scatter_conv_state(indices, &gdn_cache.conv_state)?;
+-                        pool.scatter_recurrent_state(indices, &gdn_cache.recurrent_state)?;
++                        pool.scatter_conv_state_slots(&indices_vec, &gdn_cache.conv_state)?;
++                        pool.scatter_recurrent_state_slots(&indices_vec, &gdn_cache.recurrent_state)?;
+ 
+                         let delta = gdn_cache.seqlen_offset.saturating_sub(first_offset);
+                         for &idx in &indices_vec {
+diff --git c/mistralrs-core/src/vision_models/qwen3_5_moe/text.rs w/mistralrs-core/src/vision_models/qwen3_5_moe/text.rs
+index d2b88ec0..eb378f4b 100644
+--- c/mistralrs-core/src/vision_models/qwen3_5_moe/text.rs
++++ w/mistralrs-core/src/vision_models/qwen3_5_moe/text.rs
+@@ -736,12 +736,14 @@ impl Qwen3_5MoeTextModel {
+                     cfg.linear_value_head_dim,
+                 ],
+             },
++            recurrent_overrides: vec![],
+         };
+ 
+         let pipeline_cache = Arc::new(Mutex::new(
+             HybridCache::new(
+                 hybrid_cache_config,
+                 vb_m.dtype(),
++                Default::default(),
+                 &normal_loading_metadata.real_device,
+             )
+             .map_err(|e| {
+@@ -886,8 +888,8 @@ impl Qwen3_5MoeTextModel {
+                             );
+                         }
+ 
+-                        let conv_state = pool.gather_conv_state(indices)?;
+-                        let recurrent_state = pool.gather_recurrent_state(indices)?;
++                        let conv_state = pool.gather_conv_state(&indices_vec)?;
++                        let recurrent_state = pool.gather_recurrent_state(&indices_vec)?;
+ 
+                         let mut gdn_cache = GdnLayerCache {
+                             conv_state,
+@@ -897,8 +899,8 @@ impl Qwen3_5MoeTextModel {
+ 
+                         xs = layer.forward_linear(&xs, &mut gdn_cache)?;
+ 
+-                        pool.scatter_conv_state(indices, &gdn_cache.conv_state)?;
+-                        pool.scatter_recurrent_state(indices, &gdn_cache.recurrent_state)?;
++                        pool.scatter_conv_state_slots(&indices_vec, &gdn_cache.conv_state)?;
++                        pool.scatter_recurrent_state_slots(&indices_vec, &gdn_cache.recurrent_state)?;
+ 
+                         let delta = gdn_cache.seqlen_offset.saturating_sub(first_offset);
+                         for &idx in &indices_vec {

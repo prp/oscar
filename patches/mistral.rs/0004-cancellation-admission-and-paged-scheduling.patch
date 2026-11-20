@@ -1,0 +1,3436 @@
+Subject: [mistral.rs] cancellation-admission-and-paged-scheduling
+
+  Admission, cancel-on-disconnect, and the scheduling changes a paging engine needs
+  Woven into the engine loop — no seam exists for this, so it is carried or upstreamed.
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 21
+
+---
+diff --git c/mistralrs-core/src/scheduler/mod.rs w/mistralrs-core/src/scheduler/mod.rs
+index 34c8d56f..e8fe4d4d 100644
+--- c/mistralrs-core/src/scheduler/mod.rs
++++ w/mistralrs-core/src/scheduler/mod.rs
+@@ -56,11 +56,18 @@ pub trait Scheduler: Send + Sync {
+     fn waiting_len(&self) -> usize;
+     fn running_len(&self) -> usize;
+     fn add_seq(&mut self, seq: Sequence);
++    /// Cancels sequences whose client disconnected, returning how many: waiting ones removed, running
++    /// ones marked `Done(Canceled)`. Polled per step: a send fails only once tried, which prefill never does.
++    fn cancel_disconnected(&mut self) -> usize {
++        0
++    }
+     /// This may do nothing. It depends on the implementation
+     fn free_finished_sequence_groups(&mut self);
+-    /// Get recurrent state pool indices of finished sequences for freeing.
+-    /// Called before free_finished_sequence_groups to allow cleanup of hybrid cache slots.
+-    fn get_finished_recurrent_indices(&self) -> Vec<usize>;
++    /// The recurrent slots of every sequence let go of since the last call (finished, cancelled or never
++    /// run), for the engine to free against the hybrid cache before a state is taken again.
++    fn take_released_recurrent(&mut self) -> Vec<usize> {
++        Vec::new()
++    }
+ 
+     // PagedAttention metadata
+     fn block_size(&self) -> Option<usize>;
+diff --git c/mistralrs-core/src/scheduler/default_scheduler.rs w/mistralrs-core/src/scheduler/default_scheduler.rs
+index fc8eefe3..07c06314 100644
+--- c/mistralrs-core/src/scheduler/default_scheduler.rs
++++ w/mistralrs-core/src/scheduler/default_scheduler.rs
+@@ -222,21 +222,7 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
+                     completion: vec![].into(),
+                 };
+             }
+-            (_, 0) => {
+-                for seq in waiting.into_iter() {
+-                    seq.set_state(SequenceState::RunningPrompt);
+-                    self.running.push(seq);
+-                }
+-                self.waiting = Backer::new();
+-                let running = std::mem::take(&mut self.running);
+-                self.running = self.bucket_and_waitlist_seqs(running);
+-                logger.set_num_running(self.running.len());
+-                logger.set_num_waiting(self.waiting.len());
+-                return DefaultSchedulerOutput {
+-                    prompt: self.running.iter_mut().collect::<Vec<_>>().into(),
+-                    completion: vec![].into(),
+-                };
+-            }
++            // No idle-engine fast path: it admitted every waiting sequence past the Fixed(n) cap.
+             (0, _) => {
+                 self.running = self.bucket_and_waitlist_seqs(running);
+                 if TERMINATE_ALL_NEXT_STEP.load(Ordering::SeqCst) {
+@@ -334,13 +320,6 @@ impl Scheduler for DefaultScheduler<VecDeque<Sequence>> {
+         // Remove finished sequences
+         self.running.retain(|seq| !seq.is_finished_paged_attn());
+     }
+-    fn get_finished_recurrent_indices(&self) -> Vec<usize> {
+-        self.running
+-            .iter()
+-            .filter(|seq| seq.is_finished_paged_attn())
+-            .filter_map(|seq| seq.recurrent_state_idx())
+-            .collect()
+-    }
+     fn kv_cache_manager(&self) -> Option<Arc<tokio::sync::Mutex<KVCacheManager>>> {
+         None
+     }
+diff --git c/mistralrs-core/src/paged_attention/config.rs w/mistralrs-core/src/paged_attention/config.rs
+index beb54666..157d8a4e 100644
+--- c/mistralrs-core/src/paged_attention/config.rs
++++ w/mistralrs-core/src/paged_attention/config.rs
+@@ -24,14 +24,30 @@ pub trait ModelConfigLike {
+     fn v_head_dim_for_layer(&self, _layer_idx: usize) -> usize {
+         self.v_head_dim()
+     }
+-    fn uses_own_kv_cache_for_layer(&self, _layer_idx: usize) -> bool {
++    /// Whether this layer stores KV at all; false on a hybrid's linear-attention blocks.
++    fn kv_bearing_layer(&self, _layer_idx: usize) -> bool {
+         true
+     }
++    /// Block-pool sizing divides the budget by this; on a hybrid `num_layers()` overcounts several-fold.
++    fn num_kv_bearing_layers(&self) -> usize {
++        (0..self.num_layers())
++            .filter(|i| self.kv_bearing_layer(*i))
++            .count()
++            .max(1)
++    }
+     fn kv_cache_layout(&self) -> KvCacheLayout {
+         KvCacheLayout::Standard
+     }
+     fn kv_cache_elements_per_token(&self) -> usize {
+-        2 * self.num_kv_heads() * self.k_head_dim().max(self.v_head_dim())
++        match self.kv_cache_layout() {
++            KvCacheLayout::Standard => {
++                2 * self.num_kv_heads() * self.k_head_dim().max(self.v_head_dim())
++            }
++            KvCacheLayout::Mla {
++                kv_lora_rank,
++                kpe_head_dim,
++            } => kv_lora_rank + kpe_head_dim,
++        }
+     }
+ }
+ 
+@@ -73,13 +89,4 @@ impl ModelConfigLike for ModelConfigMetadata {
+     fn kv_cache_layout(&self) -> KvCacheLayout {
+         self.kv_cache_layout
+     }
+-    fn kv_cache_elements_per_token(&self) -> usize {
+-        match self.kv_cache_layout {
+-            KvCacheLayout::Standard => 2 * self.num_kv_heads * self.k_head_dim.max(self.v_head_dim),
+-            KvCacheLayout::Mla {
+-                kv_lora_rank,
+-                kpe_head_dim,
+-            } => kv_lora_rank + kpe_head_dim,
+-        }
+-    }
+ }
+diff --git c/mistralrs-core/src/paged_attention/mod.rs w/mistralrs-core/src/paged_attention/mod.rs
+index 4b2ef979..da38ca41 100644
+--- c/mistralrs-core/src/paged_attention/mod.rs
++++ w/mistralrs-core/src/paged_attention/mod.rs
+@@ -7,6 +7,8 @@ pub mod block_pool;
+ /// operations issued by the scheduler.
+ mod cache_engine;
+ mod config;
++/// The block pool's memory, supplied from outside the engine, and the block layout the kernels read.
++pub mod kv_memory;
+ /// Encoder output cache for multimodal models (vision/audio encoder outputs).
+ pub mod encoder_cache;
+ /// KV Cache Manager: high-level block allocation, prefix cache lookups, per-request tracking.
+@@ -15,10 +17,16 @@ mod layers;
+ mod scheduler;
+ pub const _PAD_SLOT_ID: i64 = -1;
+ 
+-pub use cache_engine::{CacheConfig, CacheEngine, PagedCacheType};
++pub use cache_engine::{CacheConfig, CacheEngine, KVCache, PagedCacheType};
+ use candle_core::{DType, Device};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, OnceLock};
+ pub use config::{KvCacheLayout, ModelConfigLike, ModelConfigMetadata};
+ pub use kv_cache_manager::KVCacheManager;
++pub use kv_memory::{
++    block_size, cache_dtype, kv_layout, set_kv_layout, set_kv_memory_factory, KvBlockLayout,
++    KvBlockMemory, KvMemoryFactory, LayerRows,
++};
+ pub use layers::PagedAttention;
+ pub use scheduler::{
+     PagedAttentionScheduler, PagedAttentionSchedulerConfig, PagedAttentionSchedulerOutput,
+@@ -75,14 +83,14 @@ macro_rules! mb_to_blocks {
+         $mb_size
+             / $dtype_size
+             / $block_size
+-            / $config.num_layers()
++            / $config.num_kv_bearing_layers()
+             / $config.kv_cache_elements_per_token()
+     };
+ }
+ 
+ macro_rules! ctxt_to_blocks {
+     ($context_len:expr, $dtype_size:expr, $block_size:expr, $config:expr) => {
+-        $context_len * $dtype_size * $config.num_layers() * $config.kv_cache_elements_per_token()
++        $context_len * $dtype_size * $config.num_kv_bearing_layers() * $config.kv_cache_elements_per_token()
+     };
+ }
+ 
+@@ -193,6 +201,173 @@ pub fn calculate_cache_config(
+     Ok(CacheConfig {
+         block_size,
+         num_gpu_blocks,
++        index_blocks: num_gpu_blocks,
+         cache_type,
++        drafter_reserved_blocks: 0,
+     })
+ }
++
++/// The draft thread's tail reservation in blocks: charged with the pool by the runtime, so it comes
++/// off the schedulable count, never off the pool. Stated before the cache engine is built.
++static DRAFTER_RESERVED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
++
++pub fn set_drafter_reserved_blocks(blocks: usize) {
++    DRAFTER_RESERVED_BLOCKS.store(blocks, Ordering::Relaxed);
++}
++
++pub fn drafter_reserved_blocks(num_gpu_blocks: usize) -> usize {
++    let r = DRAFTER_RESERVED_BLOCKS.load(Ordering::Relaxed);
++    if r < num_gpu_blocks { r } else { 0 }
++}
++
++/// A memory-axis crossing: the runtime asks, the engine runs the hook on its own thread at the next
++/// token or chunk boundary, handing it the device to drain the stream first. Pool and sequences stay.
++static MEMORY_CROSSING_HOOK: OnceLock<Box<dyn Fn(&Device) + Send + Sync>> = OnceLock::new();
++static MEMORY_CROSSING_PENDING: AtomicBool = AtomicBool::new(false);
++/// The engine loop's wake handle, so a request lands while it idles.
++static ENGINE_WAKER: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
++
++pub fn set_memory_crossing_hook(hook: Box<dyn Fn(&Device) + Send + Sync>) {
++    let _ = MEMORY_CROSSING_HOOK.set(hook);
++}
++
++pub fn request_memory_crossing() {
++    MEMORY_CROSSING_PENDING.store(true, Ordering::Release);
++    if let Some(n) = ENGINE_WAKER.get() {
++        n.notify_one();
++    }
++}
++
++/// The one relaxed check the engine pays per token or chunk boundary.
++pub(crate) fn memory_crossing_pending() -> bool {
++    MEMORY_CROSSING_PENDING.load(Ordering::Relaxed)
++}
++
++pub(crate) fn run_memory_crossing(dev: &Device) {
++    if MEMORY_CROSSING_PENDING.swap(false, Ordering::AcqRel) {
++        if let Some(hook) = MEMORY_CROSSING_HOOK.get() {
++            hook(dev);
++        }
++    }
++}
++
++/// The engine's step, announced before its inputs are made: a prompt step (every prefill chunk)
++/// or a completion step (a drafter's verify among them). `tokens` is what a prompt step forwards;
++/// `drop_state_indices` empties the working memory for a hook that needs it. A refused step does not run.
++pub struct StepKind<'a> {
++    pub prompt: bool,
++    pub tokens: usize,
++    pub device: &'a Device,
++    pub drop_state_indices: &'a dyn Fn(),
++}
++
++type StepKindHook = Box<dyn Fn(&StepKind<'_>) -> Result<(), String> + Send + Sync>;
++static STEP_KIND_HOOK: OnceLock<StepKindHook> = OnceLock::new();
++
++pub fn set_step_kind_hook(hook: StepKindHook) {
++    let _ = STEP_KIND_HOOK.set(hook);
++}
++
++pub(crate) fn note_step_kind(step: &StepKind<'_>) -> candle_core::Result<()> {
++    STEP_KIND_HOOK.get().map_or(Ok(()), |hook| hook(step).map_err(candle_core::Error::msg))
++}
++
++/// The layer-boundary park inside a prefill chunk: the MoE dispatcher calls this before each routed
++/// layer, with no expert referenced, so a mid-chunk crossing lands after one layer, not the chunk.
++pub fn park_for_memory_crossing(dev: &Device) -> bool {
++    let pending = memory_crossing_pending();
++    if pending {
++        run_memory_crossing(dev);
++    }
++    pending
++}
++
++pub(crate) fn set_engine_waker(notify: Arc<tokio::sync::Notify>) {
++    let _ = ENGINE_WAKER.set(notify);
++}
++
++/// The engine's block state: a crossing withdraws free blocks from it and restores them to it.
++static KV_MANAGER: OnceLock<Arc<tokio::sync::Mutex<KVCacheManager>>> = OnceLock::new();
++
++pub(crate) fn set_kv_manager(manager: Arc<tokio::sync::Mutex<KVCacheManager>>) {
++    let _ = KV_MANAGER.set(manager);
++}
++
++pub fn kv_manager() -> Option<&'static Arc<tokio::sync::Mutex<KVCacheManager>>> {
++    KV_MANAGER.get()
++}
++
++/// Admission's ask for blocks the pool cannot hold: the memory brings in what a plan at its ceiling
++/// hosts; the request waits in the queue for its room either way.
++static KV_ASK_HOOK: OnceLock<Box<dyn Fn(usize) + Send + Sync>> = OnceLock::new();
++
++pub fn set_kv_ask_hook(hook: Box<dyn Fn(usize) + Send + Sync>) {
++    let _ = KV_ASK_HOOK.set(hook);
++}
++
++pub(crate) fn ask_kv_blocks(blocks: usize) {
++    if let Some(hook) = KV_ASK_HOOK.get() {
++        hook(blocks)
++    }
++}
++
++/// The blocks the live requests were admitted to ([`crate::sequence::admitted_len`] each), published by
++/// the scheduler and read on its thread: a crossing sheds none, admission asks for what the pool lacks.
++static ADMITTED_BLOCKS: AtomicUsize = AtomicUsize::new(0);
++
++pub fn admitted_blocks() -> usize {
++    ADMITTED_BLOCKS.load(Ordering::Relaxed)
++}
++
++pub(crate) fn publish_admitted_blocks(blocks: usize) {
++    ADMITTED_BLOCKS.store(blocks, Ordering::Relaxed);
++}
++
++/// Whether blocks a request asked for are still coming: the scheduler then waits rather than count
++/// toward its starvation exit; nothing of it has run, and the unhostable was refused at admission.
++static KV_PENDING_HOOK: OnceLock<Box<dyn Fn() -> bool + Send + Sync>> = OnceLock::new();
++
++pub fn set_kv_pending_hook(hook: Box<dyn Fn() -> bool + Send + Sync>) {
++    let _ = KV_PENDING_HOOK.set(hook);
++}
++
++pub(crate) fn kv_blocks_pending() -> bool {
++    KV_PENDING_HOOK.get().is_some_and(|h| h())
++}
++
++/// The census: the model's own forward, run at load with no data and no GPU work, so a host records
++/// what a forward asks its pools for and sizes its plan; it runs before any elastic pool is sized.
++static CENSUS_HOOK: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
++
++pub fn set_census_hook(hook: Box<dyn Fn() + Send + Sync>) {
++    let _ = CENSUS_HOOK.set(hook);
++}
++
++pub(crate) fn run_census() {
++    if let Some(h) = CENSUS_HOOK.get() {
++        h();
++    }
++}
++
++/// The recurrent-snapshot cap the plan charges; the prefix cache holds no more. `usize::MAX` = unset.
++static PAGED_SNAPSHOT_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
++
++pub fn set_paged_snapshot_cap(entries: usize) {
++    PAGED_SNAPSHOT_CAP.store(entries, Ordering::Relaxed);
++}
++
++pub(crate) fn paged_snapshot_cap() -> Option<usize> {
++    let n = PAGED_SNAPSHOT_CAP.load(Ordering::Relaxed);
++    (n != usize::MAX).then_some(n)
++}
++
++/// The planned (input, output) tokens: prompts past the input refused, `max_seq_len` capped at the sum.
++static PLAN_CTX_LIMIT: OnceLock<(usize, usize)> = OnceLock::new();
++
++pub fn set_plan_ctx_limit(input: usize, output: usize) {
++    let _ = PLAN_CTX_LIMIT.set((input, output));
++}
++
++pub(crate) fn plan_ctx_limit() -> Option<(usize, usize)> {
++    PLAN_CTX_LIMIT.get().copied()
++}
+diff --git c/mistralrs-core/src/paged_attention/kv_memory.rs w/mistralrs-core/src/paged_attention/kv_memory.rs
+new file mode 100644
+index 00000000..ca47857d
+--- /dev/null
++++ w/mistralrs-core/src/paged_attention/kv_memory.rs
+@@ -0,0 +1,141 @@
++//! The KV pool's memory, supplied from outside the engine: one object per block, block-major (every
++//! layer's K row then V row), reached by the kernels through address tables indexed by block id.
++
++use std::sync::{Arc, OnceLock};
++
++use candle_core::{DType, Device, Result, Tensor};
++
++use super::config::{KvCacheLayout, ModelConfigLike};
++
++/// One layer's two rows inside a block: their dims and byte offsets.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct LayerRows {
++    /// The K row: `[kv_heads, head_size / x, block_size, x]`; a latent row `[block_size, kv_lora_rank]`.
++    pub k: Vec<usize>,
++    /// The V row: `[kv_heads, head_size, block_size]`; latent `[block_size, kpe_head_dim]` (empty for NoPE).
++    pub v: Vec<usize>,
++    pub k_offset: usize,
++    pub v_offset: usize,
++}
++
++/// One block's bytes, row by row, in the cache dtype: what the memory allocates and a store writes.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct KvBlockLayout {
++    pub block_size: usize,
++    pub dtype: DType,
++    /// Every model layer in order; `None` for a layer that stores no KV.
++    pub rows: Vec<Option<LayerRows>>,
++}
++
++impl KvBlockLayout {
++    /// The layout the model's configuration implies at `block_size`.
++    pub fn of(model: &dyn ModelConfigLike, block_size: usize, dtype: DType) -> Self {
++        let es = dtype.size_in_bytes();
++        let x = 16 / es;
++        let mut offset = 0usize;
++        let rows = (0..model.num_layers())
++            .map(|layer| {
++                if !model.kv_bearing_layer(layer) {
++                    return None;
++                }
++                let (k, v) = match model.kv_cache_layout() {
++                    KvCacheLayout::Standard => (
++                        vec![
++                            model.num_kv_heads_for_layer(layer),
++                            model.k_head_dim_for_layer(layer) / x,
++                            block_size,
++                            x,
++                        ],
++                        vec![
++                            model.num_kv_heads_for_layer(layer),
++                            model.v_head_dim_for_layer(layer),
++                            block_size,
++                        ],
++                    ),
++                    KvCacheLayout::Mla { kv_lora_rank, kpe_head_dim } => {
++                        (vec![block_size, kv_lora_rank], vec![block_size, kpe_head_dim])
++                    }
++                };
++                let k_offset = offset;
++                offset += k.iter().product::<usize>() * es;
++                let v_offset = offset;
++                offset += v.iter().product::<usize>() * es;
++                Some(LayerRows { k, v, k_offset, v_offset })
++            })
++            .collect();
++        Self { block_size, dtype, rows }
++    }
++
++    /// A block's bytes: every layer's rows, K then V, in layer order.
++    pub fn block_bytes(&self) -> usize {
++        let es = self.dtype.size_in_bytes();
++        self.rows
++            .iter()
++            .flatten()
++            .map(|r| (r.k.iter().product::<usize>() + r.v.iter().product::<usize>()) * es)
++            .sum()
++    }
++
++    /// The KV-bearing layers: (layer index, its rows).
++    pub fn kv_layers(&self) -> impl Iterator<Item = (usize, &LayerRows)> {
++        self.rows.iter().enumerate().filter_map(|(i, r)| r.as_ref().map(|r| (i, r)))
++    }
++}
++
++/// The memory behind the block pool. `layer_tables` gives every layer its K and V tables of one
++/// `i64` GPU address per block (null where absent), `block` a block's bytes as a tensor for a
++/// store's or drafter's copies; `take` and `release` move blocks between present and absent.
++pub trait KvBlockMemory: Send + Sync {
++    /// The index space, in blocks.
++    fn blocks(&self) -> usize;
++    /// The blocks present now.
++    fn live_blocks(&self) -> usize;
++    /// Per layer, the K and V address tables (`[blocks]` I64); a layer without KV gets one null entry.
++    fn layer_tables(&self) -> Vec<(Tensor, Tensor)>;
++    /// Block `id`'s bytes, `[block_bytes / dtype size]` in the cache dtype.
++    fn block(&self, id: usize) -> Result<Tensor>;
++    fn take(&self, ids: &[usize]) -> Result<()>;
++    fn release(&self, ids: &[usize]) -> Result<()>;
++}
++
++/// Builds the memory for a layout on a device, once per process.
++pub type KvMemoryFactory =
++    Box<dyn Fn(&Device, &KvBlockLayout) -> Result<Arc<dyn KvBlockMemory>> + Send + Sync>;
++
++static FACTORY: OnceLock<KvMemoryFactory> = OnceLock::new();
++static LAYOUT: OnceLock<KvBlockLayout> = OnceLock::new();
++
++/// Install the memory's factory before the first pipeline is built; later calls are ignored.
++pub fn set_kv_memory_factory(factory: KvMemoryFactory) {
++    let _ = FACTORY.set(factory);
++}
++
++/// The memory for `layout`, through the installed factory; the layout is the process's from here on.
++pub(crate) fn make_kv_memory(device: &Device, layout: &KvBlockLayout) -> Result<Arc<dyn KvBlockMemory>> {
++    let Some(factory) = FACTORY.get() else {
++        candle_core::bail!("paged attention: no KV block memory installed");
++    };
++    let memory = factory(device, layout)?;
++    set_kv_layout(layout.clone());
++    Ok(memory)
++}
++
++/// Install the kernels' block layout (the factory path does; a kernel test does it itself). First wins.
++pub fn set_kv_layout(layout: KvBlockLayout) {
++    let _ = LAYOUT.set(layout);
++}
++
++/// The process's block layout.
++pub fn kv_layout() -> &'static KvBlockLayout {
++    LAYOUT.get().expect("paged attention: the KV block layout is set when the block pool is built")
++}
++
++/// The block size in tokens.
++pub fn block_size() -> usize {
++    kv_layout().block_size
++}
++
++/// The cache dtype.
++pub fn cache_dtype() -> DType {
++    kv_layout().dtype
++}
+diff --git c/mistralrs-core/src/paged_attention/cache_engine.rs w/mistralrs-core/src/paged_attention/cache_engine.rs
+index 0d6a00d5..6eddf507 100644
+--- c/mistralrs-core/src/paged_attention/cache_engine.rs
++++ w/mistralrs-core/src/paged_attention/cache_engine.rs
+@@ -1,12 +1,10 @@
+-use std::{
+-    str::FromStr,
+-    sync::{Arc, Mutex, MutexGuard},
+-};
++use std::{str::FromStr, sync::Arc};
+ 
+ use candle_core::{DType, Device, Result, Tensor};
+ use serde::{Deserialize, Serialize};
+ 
+-use super::config::{KvCacheLayout, ModelConfigLike};
++use super::config::ModelConfigLike;
++use super::kv_memory::{make_kv_memory, KvBlockLayout, KvBlockMemory};
+ 
+ #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
+ #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
+@@ -41,266 +39,69 @@ impl FromStr for PagedCacheType {
+ #[derive(Clone, Debug)]
+ pub struct CacheConfig {
+     pub block_size: usize,
++    /// The blocks present at launch.
+     pub num_gpu_blocks: usize,
++    /// Every id a block may ever have, present or absent; `num_gpu_blocks` where the pool never grows.
++    pub index_blocks: usize,
+     pub cache_type: PagedCacheType,
++    /// Tail block ids `[num_gpu_blocks - n, num_gpu_blocks)` kept from the scheduler's allocator: only a
++    /// draft thread writes them (its speculative rows).
++    pub drafter_reserved_blocks: usize,
+ }
+ 
++/// A layer's view of the pool: its K and V address tables, one `i64` GPU address per block id.
+ pub type KVCache = (Tensor, Tensor);
+ 
++/// The pool as the engine sees it: the memory behind it, its block layout, every layer's address tables.
+ pub struct CacheEngine {
+-    gpu_cache: Arc<Mutex<Vec<KVCache>>>,
++    memory: Arc<dyn KvBlockMemory>,
++    layout: KvBlockLayout,
++    tables: Vec<KVCache>,
+ }
+ 
+ impl CacheEngine {
++    /// The pool for `model_config` at `cache_config`'s block size and cache type, through the installed
++    /// memory; the block count is the memory's, not the config's. Every table lives on `device`.
+     pub fn new(
+         model_config: &dyn ModelConfigLike,
+         cache_config: &CacheConfig,
+         dtype: DType,
+         device: &Device,
+-        layer_devices: Vec<Option<Device>>,
++        _layer_devices: Vec<Option<Device>>,
+     ) -> Result<Self> {
+         let dtype = cache_config.cache_type.to_dtype(dtype);
+-        Ok(Self {
+-            gpu_cache: Arc::new(Mutex::new(Self::allocate_gpu_cache(
+-                model_config,
+-                cache_config,
+-                dtype,
+-                device,
+-                layer_devices,
+-            )?)),
+-        })
+-    }
+-
+-    pub fn get_kv_cache(&self) -> MutexGuard<'_, Vec<KVCache>> {
+-        // Use blocking lock instead of busy-wait spin loop to avoid CPU waste
+-        // and potential thread starvation issues
+-        self.gpu_cache.lock().expect("KV cache mutex was poisoned")
+-    }
+-
+-    fn allocate_gpu_cache(
+-        model_config: &dyn ModelConfigLike,
+-        cache_config: &CacheConfig,
+-        dtype: DType,
+-        device: &Device,
+-        layer_devices: Vec<Option<Device>>,
+-    ) -> Result<Vec<KVCache>> {
+-        let kv_cache_layout = model_config.kv_cache_layout();
+-        let mut gpu_cache = Vec::new();
+-
+-        for (layer_idx, device) in layer_devices
+-            .iter()
+-            .take(model_config.num_layers())
+-            .map(|x| x.as_ref().unwrap_or(device))
+-            .enumerate()
+-        {
+-            let (key_blocks, value_blocks) = match kv_cache_layout {
+-                KvCacheLayout::Standard => {
+-                    let key_block_shape = Self::calculate_key_block_shape(
+-                        model_config,
+-                        dtype,
+-                        cache_config.block_size,
+-                        layer_idx,
+-                    );
+-                    let value_block_shape = Self::calculate_value_block_shape(
+-                        model_config,
+-                        cache_config.block_size,
+-                        layer_idx,
+-                    );
+-                    #[allow(unused)]
+-                    let key_blocks = if let Device::Metal(dev) = &device {
+-                        #[cfg(feature = "metal")]
+-                        {
+-                            use candle_core::{MetalStorage, Shape, Storage};
+-
+-                            let elem_count = cache_config.num_gpu_blocks
+-                                * key_block_shape.0
+-                                * key_block_shape.1
+-                                * key_block_shape.2
+-                                * key_block_shape.3;
+-                            let buffer = dev.new_private_buffer(elem_count, dtype, "k_cache")?;
+-                            let storage = Storage::Metal(MetalStorage::new(
+-                                buffer,
+-                                dev.clone(),
+-                                elem_count,
+-                                dtype,
+-                            ));
+-                            Tensor::from((
+-                                storage,
+-                                Shape::from_dims(&[
+-                                    cache_config.num_gpu_blocks,
+-                                    key_block_shape.0,
+-                                    key_block_shape.1,
+-                                    key_block_shape.2,
+-                                    key_block_shape.3,
+-                                ]),
+-                            ))
+-                        }
+-
+-                        #[cfg(not(feature = "metal"))]
+-                        {
+-                            unreachable!()
+-                        }
+-                    } else {
+-                        unsafe {
+-                            Tensor::empty(
+-                                (
+-                                    cache_config.num_gpu_blocks,
+-                                    key_block_shape.0,
+-                                    key_block_shape.1,
+-                                    key_block_shape.2,
+-                                    key_block_shape.3,
+-                                ),
+-                                dtype,
+-                                device,
+-                            )?
+-                        }
+-                    };
+-                    #[allow(unused)]
+-                    let value_blocks = if let Device::Metal(dev) = &device {
+-                        #[cfg(feature = "metal")]
+-                        {
+-                            use candle_core::{MetalStorage, Shape, Storage};
+-
+-                            let elem_count = cache_config.num_gpu_blocks
+-                                * value_block_shape.0
+-                                * value_block_shape.1
+-                                * value_block_shape.2;
+-                            let buffer = dev.new_private_buffer(elem_count, dtype, "v_cache")?;
+-                            let storage = Storage::Metal(MetalStorage::new(
+-                                buffer,
+-                                dev.clone(),
+-                                elem_count,
+-                                dtype,
+-                            ));
+-                            Tensor::from((
+-                                storage,
+-                                Shape::from_dims(&[
+-                                    cache_config.num_gpu_blocks,
+-                                    value_block_shape.0,
+-                                    value_block_shape.1,
+-                                    value_block_shape.2,
+-                                ]),
+-                            ))
+-                        }
+-
+-                        #[cfg(not(feature = "metal"))]
+-                        {
+-                            unreachable!()
+-                        }
+-                    } else {
+-                        unsafe {
+-                            Tensor::empty(
+-                                (
+-                                    cache_config.num_gpu_blocks,
+-                                    value_block_shape.0,
+-                                    value_block_shape.1,
+-                                    value_block_shape.2,
+-                                ),
+-                                dtype,
+-                                device,
+-                            )?
+-                        }
+-                    };
+-                    (key_blocks, value_blocks)
+-                }
+-                KvCacheLayout::Mla {
+-                    kv_lora_rank,
+-                    kpe_head_dim,
+-                } => {
+-                    #[allow(unused)]
+-                    let key_blocks = if let Device::Metal(dev) = &device {
+-                        #[cfg(feature = "metal")]
+-                        {
+-                            use candle_core::{MetalStorage, Shape, Storage};
+-
+-                            let elem_count = cache_config.num_gpu_blocks
+-                                * cache_config.block_size
+-                                * kv_lora_rank;
+-                            let buffer = dev.new_private_buffer(elem_count, dtype, "k_cache")?;
+-                            let storage = Storage::Metal(MetalStorage::new(
+-                                buffer,
+-                                dev.clone(),
+-                                elem_count,
+-                                dtype,
+-                            ));
+-                            Tensor::from((
+-                                storage,
+-                                Shape::from_dims(&[
+-                                    cache_config.num_gpu_blocks,
+-                                    cache_config.block_size,
+-                                    kv_lora_rank,
+-                                ]),
+-                            ))
+-                        }
+-
+-                        #[cfg(not(feature = "metal"))]
+-                        {
+-                            unreachable!()
+-                        }
+-                    } else {
+-                        unsafe {
+-                            Tensor::empty(
+-                                (
+-                                    cache_config.num_gpu_blocks,
+-                                    cache_config.block_size,
+-                                    kv_lora_rank,
+-                                ),
+-                                dtype,
+-                                device,
+-                            )?
+-                        }
+-                    };
+-                    #[allow(unused)]
+-                    let value_blocks = if let Device::Metal(dev) = &device {
+-                        #[cfg(feature = "metal")]
+-                        {
+-                            use candle_core::{MetalStorage, Shape, Storage};
+-
+-                            let elem_count = cache_config.num_gpu_blocks
+-                                * cache_config.block_size
+-                                * kpe_head_dim;
+-                            let buffer = dev.new_private_buffer(elem_count, dtype, "v_cache")?;
+-                            let storage = Storage::Metal(MetalStorage::new(
+-                                buffer,
+-                                dev.clone(),
+-                                elem_count,
+-                                dtype,
+-                            ));
+-                            Tensor::from((
+-                                storage,
+-                                Shape::from_dims(&[
+-                                    cache_config.num_gpu_blocks,
+-                                    cache_config.block_size,
+-                                    kpe_head_dim,
+-                                ]),
+-                            ))
+-                        }
+-
+-                        #[cfg(not(feature = "metal"))]
+-                        {
+-                            unreachable!()
+-                        }
+-                    } else {
+-                        unsafe {
+-                            Tensor::empty(
+-                                (
+-                                    cache_config.num_gpu_blocks,
+-                                    cache_config.block_size,
+-                                    kpe_head_dim,
+-                                ),
+-                                dtype,
+-                                device,
+-                            )?
+-                        }
+-                    };
+-                    (key_blocks, value_blocks)
+-                }
+-            };
+-            gpu_cache.push((key_blocks, value_blocks));
++        let layout = KvBlockLayout::of(model_config, cache_config.block_size, dtype);
++        let memory = make_kv_memory(device, &layout)?;
++        let tables = memory.layer_tables();
++        if tables.len() != layout.rows.len() {
++            candle_core::bail!(
++                "paged attention: KV block memory gave {} layer tables for {} layers",
++                tables.len(),
++                layout.rows.len()
++            );
+         }
+-        Ok(gpu_cache)
++        Ok(Self { memory, layout, tables })
+     }
+ 
++    /// The blocks present now, the live geometry; the built-time `CacheConfig` is a launch snapshot.
++    pub fn num_gpu_blocks(&self) -> usize {
++        self.memory.live_blocks()
++    }
++
++    /// Every layer's tables, in layer order.
++    pub fn get_kv_cache(&self) -> &Vec<KVCache> {
++        &self.tables
++    }
++
++    pub fn memory(&self) -> &Arc<dyn KvBlockMemory> {
++        &self.memory
++    }
++
++    pub fn layout(&self) -> &KvBlockLayout {
++        &self.layout
++    }
++
++    #[allow(dead_code)]
+     fn calculate_key_block_shape(
+         model_config: &dyn ModelConfigLike,
+         dtype: DType,
+@@ -317,6 +118,7 @@ impl CacheEngine {
+         )
+     }
+ 
++    #[allow(dead_code)]
+     fn calculate_value_block_shape(
+         model_config: &dyn ModelConfigLike,
+         block_size: usize,
+diff --git c/mistralrs-core/src/paged_attention/block_pool.rs w/mistralrs-core/src/paged_attention/block_pool.rs
+index 58ec8688..f3f2a0d7 100644
+--- c/mistralrs-core/src/paged_attention/block_pool.rs
++++ w/mistralrs-core/src/paged_attention/block_pool.rs
+@@ -55,7 +55,6 @@ impl KVCacheBlock {
+     }
+ 
+     /// Check if this block is currently in the free list.
+-    #[allow(dead_code)]
+     fn is_in_free_list(&self) -> bool {
+         self.prev_free != NO_LINK || self.next_free != NO_LINK
+     }
+@@ -277,6 +276,8 @@ pub struct BlockPool {
+     enable_caching: bool,
+     /// Total number of real GPU blocks (excludes sentinels and null block).
+     num_gpu_blocks: usize,
++    /// Blocks the memory withdrew: out of the free list and the allocator's reach until restored.
++    withdrawn: usize,
+     /// The null block ID (block 0). Used as a placeholder, never freed.
+     null_block_id: usize,
+     /// The block size (number of tokens per block) for hash computation.
+@@ -284,6 +285,16 @@ pub struct BlockPool {
+ }
+ 
+ impl BlockPool {
++    /// The host bytes a pool over `num_gpu_blocks` holds, summed by the memory plan before the
++    /// pool exists: every block's entry with the two sentinels, and the hash map at its fullest
++    /// as hashbrown lays it out (buckets at the next power of two above 8/7 of the entries).
++    pub fn host_bytes(num_gpu_blocks: usize) -> usize {
++        use std::mem::size_of;
++        let entries = num_gpu_blocks + 2;
++        let buckets = (entries * 8).div_ceil(7).next_power_of_two().max(4);
++        entries * size_of::<KVCacheBlock>() + buckets * (size_of::<(BlockHashWithGroupId, CachedBlocks)>() + 1) + 16
++    }
++
+     /// Create a new block pool.
+     ///
+     /// `num_gpu_blocks`: Number of physical GPU blocks.
+@@ -310,6 +321,7 @@ impl BlockPool {
+             cached_block_hash_to_block: BlockHashToBlockMap::new(),
+             enable_caching,
+             num_gpu_blocks,
++            withdrawn: 0,
+             null_block_id: 0, // Will be set below
+             hash_block_size,
+         };
+@@ -340,16 +352,77 @@ impl BlockPool {
+         self.num_gpu_blocks
+     }
+ 
+-    /// Get KV cache usage as a fraction [0.0, 1.0].
++    /// Get KV cache usage as a fraction [0.0, 1.0] of the blocks present.
+     #[allow(clippy::cast_precision_loss)]
+     pub fn usage(&self) -> f64 {
+-        let total = self.num_gpu_blocks - 1; // Exclude null block
++        let total = self.allocatable_blocks();
+         if total == 0 {
+             return 0.0;
+         }
+         1.0 - (self.num_free_blocks() as f64 / total as f64)
+     }
+ 
++    /// The blocks a request can hold: the index space less the null block and the withdrawn ones.
++    pub fn allocatable_blocks(&self) -> usize {
++        self.num_gpu_blocks - 1 - self.withdrawn
++    }
++
++    /// Free blocks holding no cached prefix: a withdrawal of these costs nothing anyone would notice.
++    pub fn free_uncached_blocks(&self) -> usize {
++        let mut n = 0;
++        let mut id = self.blocks[self.free_queue.fake_head].next_free;
++        while id != self.free_queue.fake_tail {
++            if self.blocks[id].block_hash.is_none() {
++                n += 1;
++            }
++            id = self.blocks[id].next_free;
++        }
++        n
++    }
++
++    /// Withdraw up to `n` free blocks for the memory, least recently used first: only blocks holding no
++    /// cached prefix unless `cached`, never the null block; withdrawn until [`Self::restore`].
++    pub fn withdraw(&mut self, n: usize, cached: bool) -> Vec<usize> {
++        let mut out = Vec::with_capacity(n);
++        let mut id = self.blocks[self.free_queue.fake_head].next_free;
++        while out.len() < n && id != self.free_queue.fake_tail {
++            let next = self.blocks[id].next_free;
++            if cached || self.blocks[id].block_hash.is_none() {
++                self.withdraw_one(id);
++                out.push(id);
++            }
++            id = next;
++        }
++        out
++    }
++
++    /// Withdraw these blocks, every one of them free.
++    pub fn withdraw_ids(&mut self, ids: &[usize]) {
++        for &id in ids {
++            debug_assert!(self.blocks[id].ref_cnt == 0 && !self.blocks[id].is_null && self.blocks[id].is_in_free_list());
++            self.withdraw_one(id);
++        }
++    }
++
++    fn withdraw_one(&mut self, id: usize) {
++        self.free_queue.remove(&mut self.blocks, id);
++        if self.enable_caching {
++            self.maybe_evict_cached_block(id);
++        }
++        self.blocks[id].ref_cnt = 1;
++        self.withdrawn += 1;
++    }
++
++    /// Blocks the memory withdrew, back into the free list at its most recently freed end.
++    pub fn restore(&mut self, ids: &[usize]) {
++        for &id in ids {
++            debug_assert!(self.blocks[id].ref_cnt == 1 && !self.blocks[id].is_in_free_list());
++            self.blocks[id].ref_cnt = 0;
++            self.free_queue.append(&mut self.blocks, id);
++            self.withdrawn -= 1;
++        }
++    }
++
+     /// Look up cached blocks for a given hash across the specified group IDs.
+     ///
+     /// Returns `Some(vec_of_block_ids)` if ALL groups have a cached block for
+diff --git c/mistralrs-core/src/paged_attention/kv_cache_manager.rs w/mistralrs-core/src/paged_attention/kv_cache_manager.rs
+index 2339b681..b98b7676 100644
+--- c/mistralrs-core/src/paged_attention/kv_cache_manager.rs
++++ w/mistralrs-core/src/paged_attention/kv_cache_manager.rs
+@@ -104,6 +104,31 @@ impl KVCacheManager {
+         self.block_pool.num_free_blocks()
+     }
+ 
++    /// The blocks a request can hold: the index space less the withdrawn.
++    pub fn allocatable_blocks(&self) -> usize {
++        self.block_pool.allocatable_blocks()
++    }
++
++    /// Free blocks holding no cached prefix.
++    pub fn free_uncached_blocks(&self) -> usize {
++        self.block_pool.free_uncached_blocks()
++    }
++
++    /// Withdraw up to `n` free blocks for the memory behind the pool (see [`BlockPool::withdraw`]).
++    pub fn withdraw(&mut self, n: usize, cached: bool) -> Vec<usize> {
++        self.block_pool.withdraw(n, cached)
++    }
++
++    /// Withdraw these free blocks by id.
++    pub fn withdraw_ids(&mut self, ids: &[usize]) {
++        self.block_pool.withdraw_ids(ids)
++    }
++
++    /// Give withdrawn blocks back to the allocator.
++    pub fn restore(&mut self, ids: &[usize]) {
++        self.block_pool.restore(ids)
++    }
++
+     /// Whether prefix caching is enabled.
+     pub fn caching_enabled(&self) -> bool {
+         self.enable_caching
+diff --git c/mistralrs-core/src/paged_attention/scheduler.rs w/mistralrs-core/src/paged_attention/scheduler.rs
+index 8acb6229..1f032167 100644
+--- c/mistralrs-core/src/paged_attention/scheduler.rs
++++ w/mistralrs-core/src/paged_attention/scheduler.rs
+@@ -6,7 +6,7 @@ use std::{
+     sync::{atomic::Ordering, Arc, Mutex},
+ };
+ 
+-use tracing::{info, warn};
++use tracing::{error, info};
+ 
+ use crate::{
+     engine::IntervalLogger,
+@@ -17,6 +17,7 @@ use crate::{
+         },
+         kv_cache_manager::KVCacheManager,
+     },
++    response::Response,
+     scheduler::{Scheduler, SchedulerOutput},
+     sequence::{Sequence, SequenceState, StopReason},
+     TERMINATE_ALL_NEXT_STEP,
+@@ -56,27 +57,54 @@ pub struct PagedAttentionScheduler {
+     seq_block_hashes: HashMap<usize, Vec<BlockHash>>,
+     /// Per-sequence waitlist counter for starvation detection.
+     waiting_counts: HashMap<usize, usize>,
++    /// The recurrent slots of sequences let go of, for the engine to free.
++    released_recurrent: Vec<usize>,
+ }
+ 
+ impl PagedAttentionScheduler {
+     pub fn new(config: PagedAttentionSchedulerConfig, cache_config: CacheConfig) -> Self {
++        // The block state spans the pool's index space; the drafter's reserved tail (the top ids present at
++        // launch) and the ids above the launch count (absent until a regrow) start withdrawn.
++        let mut manager = KVCacheManager::new(
++            cache_config.index_blocks,
++            cache_config.block_size,
++            true, // Default enabled, will be configured by Engine
++            vec![0],
++        );
++        let withheld: Vec<usize> = (cache_config.num_gpu_blocks - cache_config.drafter_reserved_blocks
++            ..cache_config.index_blocks)
++            .collect();
++        manager.withdraw_ids(&withheld);
+         Self {
+             waiting: VecDeque::new(),
+             running: VecDeque::new(),
+-            kv_cache_manager: Arc::new(tokio::sync::Mutex::new(KVCacheManager::new(
+-                cache_config.num_gpu_blocks,
+-                cache_config.block_size,
+-                true, // Default enabled, will be configured by Engine
+-                vec![0],
+-            ))),
++            kv_cache_manager: Arc::new(tokio::sync::Mutex::new(manager)),
+             block_size: cache_config.block_size,
+             config,
+             prefix_caching_enabled: true,
+             seq_block_hashes: HashMap::new(),
+             waiting_counts: HashMap::new(),
++            released_recurrent: Vec::new(),
+         }
+     }
+ 
++    /// A sequence leaves the queues: its recurrent slot joins the released.
++    fn let_go(&mut self, seq: &mut Sequence) {
++        self.released_recurrent.extend(seq.recurrent_state_idx());
++        seq.set_recurrent_state_idx(None);
++    }
++
++    /// The live requests' admitted blocks, published for the memory ([`super::admitted_blocks`]).
++    fn publish_admitted(&self) {
++        let blocks = self
++            .waiting
++            .iter()
++            .chain(self.running.iter())
++            .map(|seq| get_mut_arcmutex!(seq).admitted_len.div_ceil(self.block_size))
++            .sum();
++        crate::paged_attention::publish_admitted_blocks(blocks);
++    }
++
+     /// Set whether prefix caching is enabled. This also updates the KV cache manager.
+     pub fn set_prefix_caching_enabled_sync(&mut self, enabled: bool) {
+         self.prefix_caching_enabled = enabled;
+@@ -177,6 +205,15 @@ impl PagedAttentionScheduler {
+     }
+ 
+     pub fn schedule(&mut self, logger: &IntervalLogger) -> PagedAttentionSchedulerOutput {
++        let output = self.schedule_queues(logger);
++        self.publish_admitted();
++        output
++    }
++
++    fn schedule_queues(&mut self, logger: &IntervalLogger) -> PagedAttentionSchedulerOutput {
++        // A sequence the disconnect cull marked Done must leave through the free path before completion
++        // scheduling re-marks states below, or it comes back as RunningCompletion and decodes to its cap.
++        self.free_finished_sequence_groups();
+         let mut scheduled: VecDeque<Arc<Mutex<Sequence>>> = VecDeque::new();
+         let mut for_waiting_again: VecDeque<Arc<Mutex<Sequence>>> = VecDeque::new();
+         while !self.waiting.is_empty() {
+@@ -186,6 +223,14 @@ impl PagedAttentionScheduler {
+             if self.running.len() >= self.config.max_num_seqs {
+                 break;
+             }
++            // A request starts once its room fits beside the running ones', unless its blocks are still coming.
++            let room = |seq: &Arc<Mutex<Sequence>>| get_mut_arcmutex!(seq).admitted_len.div_ceil(self.block_size);
++            let held: usize = self.running.iter().map(room).sum();
++            if held + room(&seq) > get_mut_arcmutex!(self.kv_cache_manager).allocatable_blocks()
++                && !crate::paged_attention::kv_blocks_pending()
++            {
++                break;
++            }
+ 
+             let seq_guard = get_mut_arcmutex!(seq);
+             let seq_id = *seq_guard.id();
+@@ -227,39 +272,33 @@ impl PagedAttentionScheduler {
+                     self.waiting_counts.remove(&seq_id);
+                 }
+                 None => {
++                    // Blocks the memory is still bringing in are waited for, not starved on.
++                    if crate::paged_attention::kv_blocks_pending() {
++                        break;
++                    }
+                     // Not enough blocks, check starvation
+                     let count = self.waiting_counts.entry(seq_id).or_insert(0);
+                     *count += 1;
+ 
+                     if *count > WAITING_TIMEOUT {
+                         // Try to preempt a running sequence
+-                        if let Some(seq_to_preempt) = self.running.pop_back() {
+-                            self._preempt(seq_to_preempt);
+-
+-                            // Retry allocation
++                        let fits = self.running.pop_back().is_some_and(|victim| {
++                            self._preempt(victim);
+                             let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
+-                            let retry =
+-                                kv_mgr.allocate_slots(seq_id, num_tokens, &computed.block_ids);
+-                            drop(kv_mgr);
+-
+-                            if retry.is_none() {
+-                                let id = seq_id;
+-                                warn!(
+-                                    "Sequence {id} with length of {num_tokens} tokens still exceeds KV cache size \
+-                                     even after evicting another sequence.",
+-                                );
+-                                get_mut_arcmutex!(seq).set_state(SequenceState::FinishedIgnored);
+-                                did_ignore = true;
+-                            } else {
+-                                self.waiting_counts.remove(&seq_id);
+-                            }
++                            kv_mgr.allocate_slots(seq_id, num_tokens, &computed.block_ids).is_some()
++                        });
++                        if fits {
++                            self.waiting_counts.remove(&seq_id);
+                         } else {
+-                            warn!(
+-                                "Sequence {seq_id} with length of {num_tokens} tokens is too long and exceeds KV cache size. \
+-                                 To fix, increase the maximum sequence length for the KV cache, for example with \
+-                                 `--max-seq-len`/ `max_seq_len` in automatic device mapping parameters.",
++                            // Admission keeps every request's room in the pool, so this is a defect: the
++                            // request ends with an error its client reads, and its memory goes back.
++                            let why = format!(
++                                "request {seq_id} failed: KV cache has no room for its {num_tokens} tokens"
+                             );
+-                            get_mut_arcmutex!(seq).set_state(SequenceState::FinishedIgnored);
++                            error!("{why}");
++                            let guard = get_mut_arcmutex!(seq);
++                            let _ = guard.responder().try_send(Response::InternalError(why.into()));
++                            guard.set_state(SequenceState::FinishedIgnored);
+                             did_ignore = true;
+                         }
+                     } else {
+@@ -293,7 +332,11 @@ impl PagedAttentionScheduler {
+             if did_ignore {
+                 // Sequence is terminal (FinishedIgnored), do NOT add to running queue.
+                 // Clean up associated state and free any allocated blocks.
+-                let seq_id = *get_mut_arcmutex!(seq).id();
++                let seq_id = {
++                    let mut guard = get_mut_arcmutex!(seq);
++                    self.let_go(&mut guard);
++                    *guard.id()
++                };
+                 self.waiting_counts.remove(&seq_id);
+                 self.seq_block_hashes.remove(&seq_id);
+                 let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
+@@ -424,25 +467,23 @@ impl PagedAttentionScheduler {
+     }
+ 
+     pub fn free_finished_sequence_groups(&mut self) {
+-        // Collect finished sequence info before modifying self.running
+-        let mut finished: Vec<(usize, Vec<u32>, Vec<MultiModalFeature>)> = Vec::new();
+-        for seq in self.running.iter() {
+-            let seq_guard = get_mut_arcmutex!(seq);
+-            if seq_guard.is_finished_paged_attn() {
+-                let id = *seq_guard.id();
+-                let tokens = seq_guard.get_toks().to_vec();
+-                let mm_features = seq_guard.mm_features().to_vec();
+-                finished.push((id, tokens, mm_features));
+-            }
++        // Finished sequences leave running, their recurrent slots released
++        let (running, ended): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.running)
++            .into_iter()
++            .partition(|seq| !get_mut_arcmutex!(seq).is_finished_paged_attn());
++        self.running = running;
++        let mut finished: Vec<(usize, Vec<u32>, Vec<MultiModalFeature>, bool)> = Vec::new();
++        for seq in &ended {
++            let mut guard = get_mut_arcmutex!(seq);
++            self.let_go(&mut guard);
++            let completed = matches!(guard.getstate(), SequenceState::Done(_));
++            finished.push((*guard.id(), guard.get_toks().to_vec(), guard.mm_features().to_vec(), completed));
+         }
+ 
+-        // Remove finished sequences from running
+-        self.running
+-            .retain(|seq| !get_mut_arcmutex!(seq).is_finished_paged_attn());
+-
+-        // Cache and free blocks for finished sequences
++        // Cache and free blocks for finished sequences. Only one that completed wrote its blocks: a failed
++        // step may have written none, and caching those would hand their prefix to a later prompt.
+         if self.prefix_caching_enabled {
+-            for (id, tokens, mm_features) in &finished {
++            for (id, tokens, mm_features, _) in finished.iter().filter(|f| f.3) {
+                 self.ensure_block_hashes(*id, tokens, mm_features);
+                 let block_hashes = self.seq_block_hashes.get(id).cloned().unwrap_or_default();
+                 let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
+@@ -452,11 +493,13 @@ impl PagedAttentionScheduler {
+         }
+ 
+         let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
+-        for (id, _, _) in finished {
++        for (id, _, _, _) in finished {
+             kv_mgr.free(id);
+             self.seq_block_hashes.remove(&id);
+             self.waiting_counts.remove(&id);
+         }
++        drop(kv_mgr);
++        self.publish_admitted();
+     }
+ }
+ 
+@@ -469,6 +512,9 @@ impl PagedAttentionScheduler {
+         }
+         seq_guard.set_state(SequenceState::Waiting);
+         seq_guard.set_prefix_cache_len(0);
++        // Recomputed from its tokens: what it holds of the working memory goes now.
++        seq_guard.in_flight = None;
++        seq_guard.sample_buffers = None;
+         let seq_id = *seq_guard.id();
+         let tokens = seq_guard.get_toks().to_vec();
+         let mm_features = seq_guard.mm_features().to_vec();
+@@ -504,6 +550,7 @@ impl PagedAttentionScheduler {
+ impl Scheduler for PagedAttentionScheduler {
+     fn add_seq(&mut self, seq: Sequence) {
+         self.waiting.push_back(Arc::new(Mutex::new(seq)));
++        self.publish_admitted();
+     }
+     fn schedule(&mut self, logger: &IntervalLogger) -> SchedulerOutput<'_> {
+         SchedulerOutput::PagedAttention {
+@@ -516,18 +563,40 @@ impl Scheduler for PagedAttentionScheduler {
+     fn running_len(&self) -> usize {
+         self.running.len()
+     }
++    fn cancel_disconnected(&mut self) -> usize {
++        let mut cancelled = 0;
++        // They hold no blocks yet, but their recurrent slot was allocated at request add: released with them.
++        let (waiting_counts, released) = (&mut self.waiting_counts, &mut self.released_recurrent);
++        self.waiting.retain(|seq| {
++            let guard = get_mut_arcmutex!(seq);
++            if !guard.is_finished_paged_attn() && guard.responder().is_closed() {
++                cancelled += 1;
++                released.extend(guard.recurrent_state_idx());
++                waiting_counts.remove(guard.id());
++                false
++            } else {
++                true
++            }
++        });
++        // Marked Done here; the free sweep at the top of the next `schedule` releases them.
++        for seq in self.running.iter() {
++            let guard = get_mut_arcmutex!(seq);
++            if guard.is_running() && guard.responder().is_closed() {
++                guard.set_state(SequenceState::Done(StopReason::Canceled));
++                cancelled += 1;
++            }
++        }
++        self.publish_admitted();
++        cancelled
++    }
+     fn block_size(&self) -> Option<usize> {
+         Some(self.block_size)
+     }
+     fn free_finished_sequence_groups(&mut self) {
+         self.free_finished_sequence_groups()
+     }
+-    fn get_finished_recurrent_indices(&self) -> Vec<usize> {
+-        self.running
+-            .iter()
+-            .filter(|seq| get_mut_arcmutex!(seq).is_finished_paged_attn())
+-            .filter_map(|seq| get_mut_arcmutex!(seq).recurrent_state_idx())
+-            .collect()
++    fn take_released_recurrent(&mut self) -> Vec<usize> {
++        std::mem::take(&mut self.released_recurrent)
+     }
+     fn kv_cache_manager(&self) -> Option<Arc<tokio::sync::Mutex<KVCacheManager>>> {
+         Some(self.kv_cache_manager.clone())
+diff --git c/mistralrs-core/src/sequence.rs w/mistralrs-core/src/sequence.rs
+index 7f95137e..838ed663 100644
+--- c/mistralrs-core/src/sequence.rs
++++ w/mistralrs-core/src/sequence.rs
+@@ -27,8 +27,6 @@ use tokio::sync::{
+     Mutex, MutexGuard,
+ };
+ 
+-pub type SeqPreallocatedCache = Vec<Option<(Tensor, Tensor)>>;
+-
+ #[derive(Clone, Copy, PartialEq, Debug)]
+ pub enum StopReason {
+     Eos,
+@@ -482,13 +480,36 @@ pub fn build_mm_features_from_ranges(
+         .collect()
+ }
+ 
++/// A decode step the engine queued before reading the token it consumes.
++pub struct InFlightStep {
++    pub out: Tensor,
++    pub generation: u64,
++    /// The buffer this step's embedding reads: the previous step's output.
++    pub consumed: Option<Tensor>,
++    /// The presence penalty's context, where the row has one: a token bitmap the sampler keeps current.
++    pub seen: Option<Tensor>,
++    /// The step's logits row on the host, held for a trace that records it.
++    pub logits: Option<Tensor>,
++}
++
++/// The buffers a device-sampled sequence keeps across drained steps: the sampler's two-word output
++/// and, with a presence penalty, its context. Nothing is queued while these are held (`steps_ahead`).
++pub struct SampleBuffers {
++    pub out: Tensor,
++    pub seen: Option<Tensor>,
++}
++
+ pub struct Sequence {
+     // Metadata, const
+     id: usize,
+     prompt_len: usize,
+-    max_len: Option<usize>,
++    pub max_len: Option<usize>,
++    /// The most tokens admission gave this sequence ([`admitted_len`]); zero where no plan bounds it.
++    pub admitted_len: usize,
+     timestamp: u128,
+     sampler: Arc<Sampler>,
++    /// The request's own sampler RNG, seeded from its `seed`; none draws from the engine's shared one.
++    rng: Option<Arc<std::sync::Mutex<rand_isaac::Isaac64Rng>>>,
+     stop_tokens: Vec<u32>,
+     stop_strings: Vec<String>,
+     return_logprobs: bool,
+@@ -526,9 +547,21 @@ pub struct Sequence {
+     xlora_cache: Option<LayerCaches>,
+     /// For hybrid models: index into the recurrent state pool
+     recurrent_state_idx: Option<usize>,
++    // The decode step queued past the committed tokens (the device sampler's output and the completion
++    // generation that says it has landed), and the seed its draws hash from.
++    pub in_flight: Option<InFlightStep>,
++    pub sample_buffers: Option<SampleBuffers>,
++    pub device_seed: u64,
++    /// Recurrent state at the prompt boundary. The completion-time snapshot cannot
++    /// be rewound, so this is the only restore point for a partial match.
++    pub recurrent_prompt_snapshot: Option<(usize, crate::kv_cache::RecurrentState)>,
++    /// End of the durable shared prefix: the prompt minus the generation-only
++    /// suffix later turns never re-render, which is where the snapshot must land.
++    pub template_suffix_boundary: Option<usize>,
++    /// Depth (in blocks) of this sequence's newest decode-time recurrent deposit; the next supersedes it,
++    /// so a generation retains one advancing entry, not one per crossed block boundary.
++    pub paged_snapshot_blocks: Option<usize>,
+ 
+-    // Preallocated KV cache templates, keyed by layer.
+-    seq_preallocated_cache: Option<SeqPreallocatedCache>,
+ 
+     // Mutables
+     tokens: Vec<u32>,
+@@ -558,6 +591,12 @@ pub struct Sequence {
+     reasoning_mode: Option<ReasoningMode>,
+ }
+ 
++/// The room a request is admitted to, in tokens: its prompt and its generation cap within the model
++/// length, where [`Sequence::is_done`] stops it, plus the slot the last token's sampling step holds.
++pub fn admitted_len(prompt_len: usize, max_len: Option<usize>, max_model_len: usize) -> usize {
++    max_len.map_or(max_model_len, |m| prompt_len.saturating_add(m).min(max_model_len)) + 1
++}
++
+ impl Sequence {
+     #[allow(clippy::too_many_arguments)]
+     pub fn new_waiting(
+@@ -590,9 +629,6 @@ impl Sequence {
+         sequence_stepping_type: SeqStepType,
+         diffusion_params: Option<DiffusionGenerationParams>,
+         image_gen_save_file: Option<PathBuf>,
+-        // Preallocated KV cache templates, keyed by layer.
+-        seq_preallocated_cache: Option<SeqPreallocatedCache>,
+-        //
+         return_raw_logits: bool,
+         eos_tokens: Vec<u32>,
+     ) -> Self {
+@@ -616,12 +652,19 @@ impl Sequence {
+                 None
+             },
+             recurrent_state_idx: None,
+-            seq_preallocated_cache,
++            in_flight: None,
++            sample_buffers: None,
++            device_seed: 0,
++            recurrent_prompt_snapshot: None,
++            template_suffix_boundary: None,
++            paged_snapshot_blocks: None,
+             responder,
+             sampler: sampler.into(),
++            rng: None,
+             stop_tokens,
+             stop_strings,
+             max_len,
++            admitted_len: 0,
+             return_logprobs,
+             prompt_tok_per_sec: 0.,
+             prompt_timestamp: None,
+@@ -748,11 +791,14 @@ impl Sequence {
+     }
+ 
+     pub fn is_finished_paged_attn(&self) -> bool {
++        // Error is terminal here: the handler has already responded, so a sequence left in `running` would
++        // be re-scheduled as a completion over torn state (its context reset, its `token_offset` not).
+         matches!(
+             *self.state.read().unwrap(),
+             SequenceState::FinishedAborted
+                 | SequenceState::FinishedIgnored
+                 | SequenceState::Done(_)
++                | SequenceState::Error
+         )
+     }
+ 
+@@ -775,6 +821,11 @@ impl Sequence {
+         self.token_offset
+     }
+ 
++    /// The tokens this step forwards: what is left from the offset, the cached prefix beyond it left out.
++    pub fn step_tokens(&self) -> usize {
++        self.get_toks().len().saturating_sub(self.prefix_cache_len.saturating_sub(self.token_offset))
++    }
++
+     /// Get the number of prefix tokens that are cached (KV already computed).
+     /// These tokens should be skipped during prefill.
+     pub fn prefix_cache_len(&self) -> usize {
+@@ -822,10 +873,6 @@ impl Sequence {
+         &self.completion_bytes
+     }
+ 
+-    pub fn preallocated_cache(&self) -> Option<&SeqPreallocatedCache> {
+-        self.seq_preallocated_cache.as_ref()
+-    }
+-
+     pub fn normal_cache(&mut self) -> &mut Vec<Option<KvCache>> {
+         &mut self.normal_cache
+     }
+@@ -854,6 +901,11 @@ impl Sequence {
+         self.recurrent_state_idx
+     }
+ 
++    /// Move the prefill continuation point (KV computed up to `offset`): the engine's template-suffix split.
++    pub fn set_token_offset(&mut self, offset: usize) {
++        self.token_offset = offset;
++    }
++
+     pub fn set_recurrent_state_idx(&mut self, idx: Option<usize>) {
+         self.recurrent_state_idx = idx;
+     }
+@@ -862,6 +914,21 @@ impl Sequence {
+         self.xlora_cache.is_some()
+     }
+ 
++    /// Positions queued past the committed tokens: one while a step is in flight.
++    pub fn steps_ahead(&self) -> usize {
++        usize::from(self.in_flight.is_some())
++    }
++    /// Seeded at admission from the request's `seed`: its own draws, so the same request returns the same tokens.
++    pub fn set_seed(&mut self, seed: Option<u64>) {
++        self.rng = seed.map(|s| {
++            Arc::new(std::sync::Mutex::new(<rand_isaac::Isaac64Rng as rand::SeedableRng>::seed_from_u64(s)))
++        });
++    }
++
++    pub fn rng(&self) -> Option<Arc<std::sync::Mutex<rand_isaac::Isaac64Rng>>> {
++        self.rng.clone()
++    }
++
+     pub fn sampler(&mut self) -> Arc<Sampler> {
+         self.sampler.clone()
+     }
+@@ -968,7 +1035,8 @@ impl Sequence {
+         {
+             // add_token will be called after this check
+             Some(StopReason::Length(self.max_len.unwrap()))
+-        } else if self.tokens.len().saturating_sub(self.prompt_len) >= max_model_len {
++        } else if self.tokens.len() >= max_model_len {
++            // Total, not generated-only: KV grows with the total, charged at `max_model_len` per sequence.
+             Some(StopReason::ModelLength(max_model_len))
+         } else {
+             if !self.stop_strings.is_empty() {
+@@ -1069,6 +1137,7 @@ impl Sequence {
+         get_mut_group!(self).total_time = now - self.timestamp;
+ 
+         get_mut_group!(self).total_prompt_toks = self.prompt_len;
++        get_mut_group!(self).total_cached_prompt_toks = self.prefix_cache_len();
+         get_mut_group!(self).total_toks = self.len();
+     }
+ 
+@@ -1335,6 +1404,8 @@ pub struct SequenceGroup {
+     n_choices: usize, // The target number of choices to return. Can be decreased if an error is thrown.
+     best_of: Option<usize>, // Top n seqs based on cumulative logprobs.
+     pub total_prompt_toks: usize,
++    /// Of `total_prompt_toks`, how many came back from cached context.
++    pub total_cached_prompt_toks: usize,
+     pub total_toks: usize,
+     pub total_prompt_time: u128,
+     pub total_time: u128,
+@@ -1367,6 +1438,7 @@ impl SequenceGroup {
+             completion_choices: Vec::new(),
+             n_choices,
+             total_prompt_toks: 0,
++            total_cached_prompt_toks: 0,
+             total_toks: 0,
+             total_prompt_time: 0,
+             total_time: 0,
+@@ -1412,6 +1484,9 @@ impl SequenceGroup {
+         Usage {
+             completion_tokens: self.total_toks.saturating_sub(self.total_prompt_toks),
+             prompt_tokens: self.total_prompt_toks,
++            prompt_tokens_details: crate::response::PromptTokensDetails {
++                cached_tokens: self.total_cached_prompt_toks,
++            },
+             total_tokens: self.total_toks,
+             avg_tok_per_sec: if self.total_time > 0 {
+                 (self.total_toks as f32 / self.total_time as f32) * 1000.
+@@ -1578,6 +1653,22 @@ mod tests {
+     use super::*;
+     use tokio::sync::mpsc::channel;
+ 
++    /// Two sequences seeded alike draw alike; unseeded, a sequence draws from the engine's RNG.
++    #[test]
++    fn a_seeded_sequence_draws_its_own_tokens() {
++        use rand::RngCore;
++        let (mut a, mut b) = (make_test_sequence(), make_test_sequence());
++        assert!(a.rng().is_none(), "unseeded: the engine's RNG");
++        a.set_seed(Some(7));
++        b.set_seed(Some(7));
++        let draw = |s: &Sequence| s.rng().expect("seeded").lock().unwrap().next_u64();
++        assert_eq!(draw(&a), draw(&b), "the same seed, the same first draw");
++        b.set_seed(Some(8));
++        assert_ne!(draw(&a), draw(&b), "another seed, another draw");
++        a.set_seed(None);
++        assert!(a.rng().is_none());
++    }
++
+     fn make_test_sequence() -> Sequence {
+         let (tx, _rx) = channel(1);
+         let sampler =
+@@ -1612,7 +1703,6 @@ mod tests {
+             SeqStepType::PromptAndDecode,
+             None,
+             None,
+-            None,
+             false,
+             vec![],
+         )
+diff --git c/mistralrs-core/src/engine/add_request.rs w/mistralrs-core/src/engine/add_request.rs
+index fae7c813..5f7fd56b 100644
+--- c/mistralrs-core/src/engine/add_request.rs
++++ w/mistralrs-core/src/engine/add_request.rs
+@@ -1,12 +1,10 @@
+ use crate::{
+-    pipeline::{KvCache, NormalCache},
+     prefix_cacher::MatchingCache,
+     request::{DetokenizationRequest, NormalRequest, TokenizationRequest},
+     sequence::SeqStepType,
+     tools::{ToolCallingMatcher, ToolChoice},
+     ModelCategory, RequestMessage, Response,
+ };
+-use candle_core::Tensor;
+ use either::Either;
+ use std::{
+     ops::Deref,
+@@ -62,6 +60,20 @@ impl Engine {
+             request.messages,
+             RequestMessage::Chat { .. } | RequestMessage::MultimodalChat { .. }
+         );
++        // Read here, while `messages` is still whole, for the sampling record below: a client
++        // cannot otherwise see which mode's row it was served. `None` for a request with no mode
++        // to choose, the load-time dummy run included, which must not print into the load spinner.
++        let mode = match &request.messages {
++            RequestMessage::Chat { enable_thinking, .. }
++            | RequestMessage::MultimodalChat { enable_thinking, .. } => Some(
++                if enable_thinking.unwrap_or(crate::DEFAULT_ENABLE_THINKING) {
++                    "thinking"
++                } else {
++                    "non-thinking"
++                },
++            ),
++            _ => None,
++        };
+         let echo_prompt = matches!(
+             request.messages,
+             RequestMessage::Completion {
+@@ -172,6 +184,7 @@ impl Engine {
+         };
+         let mut added_seq = false;
+ 
++        let mut template_suffix_boundary: Option<usize> = None;
+         let (mut prompt_tokens, prompt_text) = match request.messages {
+             RequestMessage::Chat {
+                 messages,
+@@ -188,6 +201,29 @@ impl Engine {
+             } => {
+                 let pipeline = &*get_mut_arcmutex!(self.pipeline);
+                 let tools = request.tools.unwrap_or_default();
++                // The snapshot must land before the generation-only suffix, since
++                // that is the only point a later turn can rewind to.
++                let mut boundary_render = (!pipeline.get_metadata().no_kv_cache
++                    && pipeline.cache().is_hybrid()
++                    && pipeline.supports_prefill_split()
++                    && {
++                        let pc = get_mut_arcmutex!(self.prefix_cacher);
++                        // The paged path needs the boundary too: the tail record's state must sit below the
++                        // generation-only suffix, the one position a re-render keeps.
++                        pc.sequence_caching_enabled()
++                            || pc.paged_recurrent_caching_enabled()
++                    })
++                .then(|| {
++                    pipeline.get_processor().process(
++                        pipeline,
++                        messages.clone(),
++                        false,
++                        true,
++                        enable_thinking,
++                        reasoning_effort,
++                        tools.clone(),
++                    )
++                });
+                 let template = pipeline.get_processor().process(
+                     pipeline,
+                     messages,
+@@ -197,7 +233,30 @@ impl Engine {
+                     reasoning_effort,
+                     tools,
+                 );
+-                handle_seq_error!(template, request.response)
++                let (mut toks, text) = handle_seq_error!(template, request.response);
++                // The model's own tokens for the repeated turn, in both renders, so the boundary stays.
++                if let Some(tokenizer) = pipeline.tokenizer().filter(|_| images.is_none()) {
++                    let pc = get_mut_arcmutex!(self.prefix_cacher);
++                    let canonical = crate::prefix_cacher::diagnosing().then(|| toks.clone());
++                    toks = pc.turns().own_tokens(&text, toks, &tokenizer);
++                    if let Some(Ok((no_gen_toks, no_gen_text))) = boundary_render.as_mut() {
++                        *no_gen_toks = pc.turns().own_tokens(no_gen_text, std::mem::take(no_gen_toks), &tokenizer);
++                    }
++                    if let Some(canonical) = canonical {
++                        pc.turns().say_history(&toks, &canonical, &tokenizer);
++                    }
++                }
++                if let Some(Ok((no_gen_toks, _))) = boundary_render {
++                    let shared = toks
++                        .iter()
++                        .zip(no_gen_toks.iter())
++                        .take_while(|(a, b)| a == b)
++                        .count();
++                    if shared > 0 && shared < toks.len() {
++                        template_suffix_boundary = Some(shared);
++                    }
++                }
++                (toks, text)
+             }
+             RequestMessage::Completion { text, .. }
+             | RequestMessage::Embedding { prompt: text } => {
+@@ -252,6 +311,49 @@ impl Engine {
+             return;
+         }
+ 
++        // The planned sequence's limits: a prompt past the input bound is refused; generation keeps the
++        // whole remaining envelope (the `max_seq_len` cap at the sum is the stop).
++        let planned_limits = crate::paged_attention::plan_ctx_limit();
++        let requested_max_len = request.sampling_params.max_len;
++        if let Some((max_input, max_output)) = planned_limits {
++            // A demand (the prompt plus the planned output reservation, capped by the caller's own generation
++            // cap) past the plan's envelope is refused.
++            let demand =
++                prompt_tokens.len() + requested_max_len.unwrap_or(max_output).min(max_output);
++            let text_like = matches!(
++                get_mut_arcmutex!(self.pipeline).category(),
++                ModelCategory::Text | ModelCategory::Multimodal { .. } | ModelCategory::Embedding
++            );
++            if !truncate_sequence && text_like && demand > max_input + max_output {
++                request
++                    .response
++                    .send(Response::ValidationError(
++                        format!(
++                            "Prompt is {} tokens; the memory plan guarantees prompts up to \
++                             {max_input} (relaunch with a larger --max-input-tokens to trade \
++                             expert-pool slots for context)",
++                            prompt_tokens.len(),
++                        )
++                        .into(),
++                    ))
++                    .await
++                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
++                return;
++            }
++            // The room this request is admitted to, beside every live one's: the memory is asked for what the
++            // pool cannot hold, and the request waits in the queue until its room is there.
++            if let Some(manager) = crate::paged_attention::kv_manager().filter(|_| !truncate_sequence && text_like) {
++                let block_size = crate::paged_attention::block_size();
++                let max_model_len = get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len;
++                let admitted = crate::sequence::admitted_len(prompt_tokens.len(), requested_max_len, max_model_len);
++                let need = admitted.div_ceil(block_size) + crate::paged_attention::admitted_blocks();
++                let have = manager.lock().await.allocatable_blocks();
++                if need > have {
++                    crate::paged_attention::ask_kv_blocks(need - have);
++                }
++            }
++        }
++
+         if matches!(
+             get_mut_arcmutex!(self.pipeline).category(),
+             ModelCategory::Text | ModelCategory::Multimodal { .. } | ModelCategory::Embedding
+@@ -264,7 +366,15 @@ impl Engine {
+                 request
+                     .response
+                     .send(Response::ValidationError(
+-                        format!("Prompt sequence length is greater than {}, perhaps consider using `truncate_sequence`?", get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len).into(),
++                        format!(
++                            "Prompt sequence length is greater than {}{}, perhaps consider using `truncate_sequence`?",
++                            get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len,
++                            if crate::paged_attention::plan_ctx_limit().is_some() {
++                                " (the planned sequence; relaunch with a larger --max-input-tokens/--max-output-tokens to trade expert-pool slots for context)"
++                            } else {
++                                ""
++                            },
++                        ).into(),
+                     ))
+                     .await
+                     .unwrap_or_else(|_| warn!("Receiver disconnected"));
+@@ -294,6 +404,10 @@ impl Engine {
+                 let slice_start = prompt_len.saturating_sub(tokens_to_keep);
+ 
+                 prompt_tokens = prompt_tokens[slice_start..].to_vec();
++                // The suffix boundary is absolute; front truncation shifts it (and cannot rehit anyway).
++                template_suffix_boundary = template_suffix_boundary
++                    .and_then(|p| p.checked_sub(slice_start))
++                    .filter(|p| *p > 0);
+                 warn!("Prompt for request {} was {currently_over} tokens over the model maximum length. The first {slice_start} tokens were truncated to make space for generation.", request.id);
+             } else {
+                 let prompt_len = prompt_tokens.len();
+@@ -397,8 +511,19 @@ impl Engine {
+ 
+         let tokenizer = get_mut_arcmutex!(self.pipeline).tokenizer();
+ 
++        // The sampler a request actually got and the mode whose row it came from: a client sending no
++        // sampling fields cannot otherwise see whether the model's row or the API's defaults answered it.
++        let temperature = request.sampling_params.temperature.unwrap_or(1.0);
++        if let Some(mode) = mode {
++            let presence = request.sampling_params.presence_penalty.unwrap_or(0.0);
++            tracing::info!(
++                target: "oscar_runtime::serve",
++                "sampling     | {mode} | temperature {temperature} | top_k {topk} | \
++                 top_p {topp} | min_p {minp} | presence_penalty {presence}"
++            );
++        }
+         let sampler = Sampler::new(
+-            Some(request.sampling_params.temperature.unwrap_or(1.0)),
++            Some(temperature),
+             request.sampling_params.top_n_logprobs,
+             tokenizer,
+             request.sampling_params.frequency_penalty,
+@@ -454,102 +579,6 @@ impl Engine {
+                 .eos_tok
+                 .clone();
+ 
+-            let seq_preallocated_cache = if matches!(
+-                get_mut_arcmutex!(self.pipeline).category(),
+-                ModelCategory::Text | ModelCategory::Multimodal { .. }
+-            ) {
+-                let (metadata, device, needs_preallocated_cache) = {
+-                    let pipeline = get_mut_arcmutex!(self.pipeline);
+-                    let needs_preallocated_cache = match pipeline.cache() {
+-                        crate::pipeline::EitherCache::Normal(normal) => normal
+-                            .lock()
+-                            .unwrap()
+-                            .0
+-                            .iter()
+-                            .map(|cache| matches!(cache, KvCache::Normal { .. }))
+-                            .collect(),
+-                        _ => Vec::new(),
+-                    };
+-                    (
+-                        pipeline.get_metadata(),
+-                        pipeline.device(),
+-                        needs_preallocated_cache,
+-                    )
+-                };
+-                let model_metadata = metadata
+-                    .model_metadata
+-                    .as_ref()
+-                    .expect("If a model has a NormalCache it must have a model metadata");
+-                let n_tokens = prompt_tokens.len();
+-                let required_blocks = n_tokens.div_ceil(NormalCache::CACHE_GROW_SIZE);
+-                let max_seq_len = required_blocks * NormalCache::CACHE_GROW_SIZE;
+-                let dtype = metadata.activation_dtype;
+-                let mut layer_caches = Vec::with_capacity(model_metadata.num_layers());
+-                for layer_idx in 0..model_metadata.num_layers() {
+-                    if !needs_preallocated_cache
+-                        .get(layer_idx)
+-                        .copied()
+-                        .unwrap_or(false)
+-                        || !model_metadata.uses_own_kv_cache_for_layer(layer_idx)
+-                    {
+-                        layer_caches.push(None);
+-                        continue;
+-                    }
+-
+-                    let k_shape = (
+-                        1usize,
+-                        model_metadata.num_kv_heads_for_layer(layer_idx),
+-                        max_seq_len,
+-                        model_metadata.k_head_dim_for_layer(layer_idx),
+-                    );
+-                    let v_shape = (
+-                        1usize,
+-                        model_metadata.num_kv_heads_for_layer(layer_idx),
+-                        max_seq_len,
+-                        model_metadata.v_head_dim_for_layer(layer_idx),
+-                    );
+-
+-                    let k_seq_cache = match Tensor::zeros(k_shape, dtype, &device) {
+-                        Ok(x) => x,
+-                        Err(_) => {
+-                            request
+-                                .response
+-                                .send(Response::InternalError(
+-                                    "Failed to allocate preallocated KV cache."
+-                                        .to_string()
+-                                        .into(),
+-                                ))
+-                                .await
+-                                .unwrap_or_else(|_| warn!("Receiver disconnected"));
+-                            return;
+-                        }
+-                    };
+-                    let v_seq_cache = if k_shape == v_shape {
+-                        k_seq_cache.clone()
+-                    } else {
+-                        match Tensor::zeros(v_shape, dtype, &device) {
+-                            Ok(x) => x,
+-                            Err(_) => {
+-                                request
+-                                    .response
+-                                    .send(Response::InternalError(
+-                                        "Failed to allocate preallocated KV cache."
+-                                            .to_string()
+-                                            .into(),
+-                                    ))
+-                                    .await
+-                                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+-                                return;
+-                            }
+-                        }
+-                    };
+-                    layer_caches.push(Some((k_seq_cache, v_seq_cache)));
+-                }
+-                Some(layer_caches)
+-            } else {
+-                None
+-            };
+-
+             let now = SystemTime::now()
+                 .duration_since(UNIX_EPOCH)
+                 .expect("Time travel has occurred!");
+@@ -589,11 +618,17 @@ impl Engine {
+                 seq_step_type,
+                 diffusion_params.clone(),
+                 image_gen_save_file.clone(),
+-                seq_preallocated_cache,
+                 request.return_raw_logits,
+                 eos_toks,
+             );
+ 
++            seq.set_seed(request.sampling_params.seed);
++            seq.template_suffix_boundary = template_suffix_boundary;
++            if crate::paged_attention::kv_manager().is_some() {
++                let max_model_len = get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len;
++                seq.admitted_len = crate::sequence::admitted_len(seq.prompt_tokens(), seq.max_len, max_model_len);
++            }
++
+             // Only "track" a new sequence if it is a traditional one
+             if matches!(seq_step_type, SeqStepType::PromptAndDecode) {
+                 self.logger.add_new_sequence();
+@@ -634,6 +669,19 @@ impl Engine {
+                                 crate::reasoning_parsers::TagReasoningContext::new_gemma_channel()
+                             }),
+                         );
++                    } else if chat_template.uses_kimi_channel_tags() {
++                        // Kimi K3: <|open|>think<|sep|> … <|close|>think<|sep|>
++                        let starts_in_block = seq.get_initial_prompt().trim_end().ends_with(
++                            crate::reasoning_parsers::tag_based::KIMI_THINK_OPEN_TAG,
++                        );
++                        seq.enable_reasoning(
++                            crate::reasoning_parsers::ReasoningMode::TagBased,
++                            Box::new(
++                                crate::reasoning_parsers::TagReasoningContext::new_kimi_channel(
++                                    starts_in_block,
++                                ),
++                            ),
++                        );
+                     } else if chat_template.uses_think_tags() {
+                         // DeepSeek, QwQ, SmolLM3: <think>...</think>
+                         let starts_in_block = seq
+@@ -653,17 +701,6 @@ impl Engine {
+                 }
+             }
+ 
+-            // Allocate recurrent state pool slot for hybrid models
+-            {
+-                let pipeline = get_mut_arcmutex!(self.pipeline);
+-                if !pipeline.get_metadata().no_kv_cache && pipeline.cache().is_hybrid() {
+-                    let mut hybrid_cache = pipeline.cache().hybrid();
+-                    if let Some(slot_idx) = hybrid_cache.allocate_seq() {
+-                        seq.set_recurrent_state_idx(Some(slot_idx));
+-                    }
+-                }
+-            }
+-
+             // Run the inputs processor to normalize multimodal prompts before prefix-cache lookup.
+             // Rely on the sequence's attached modalities rather than just the top-level request
+             // fields so historical images/audios in a reconstructed multi-turn conversation
+@@ -696,6 +733,16 @@ impl Engine {
+                 request.response
+             );
+ 
++            // A sequence-level cache hit restores into the recurrent state now, so that request is seated at
++            // admission; every other takes its state when first scheduled, so a waiting request holds none.
++            if matches!(&prefill_cache, Some(MatchingCache::Normal { recurrent_snapshots: Some(_), .. })) {
++                let seated = {
++                    let pipeline = get_mut_arcmutex!(self.pipeline);
++                    super::seat_recurrent(&*pipeline, &self.prefix_cacher, &mut seq)
++                };
++                handle_seq_error!(seated, request.response);
++            }
++
+             seq = match prefill_cache.clone() {
+                 Some(MatchingCache::Normal {
+                     normal,
+diff --git c/mistralrs-core/src/engine/mod.rs w/mistralrs-core/src/engine/mod.rs
+index f21e7948..be28d30e 100644
+--- c/mistralrs-core/src/engine/mod.rs
++++ w/mistralrs-core/src/engine/mod.rs
+@@ -1,16 +1,20 @@
+ use crate::{
+     distributed,
+-    paged_attention::block_hash::compute_block_hashes,
++    kv_cache::RecurrentState,
++    paged_attention::{
++        block_hash::{compute_block_hashes, BlockHash},
++        KVCacheManager,
++    },
+     pipeline::{
+         llg::{constraint_from_llg_grammar, llg_grammar_from_constraint},
+         text_models_inputs_processor::PagedAttentionMeta,
+         CacheBackendMetadata, CacheInstruction,
+     },
+-    prefix_cacher::PrefixCacheManagerV2,
++    prefix_cacher::{PagedKvStore, PrefixCacheManagerV2, SealedBlockMeta, TailDeposit},
+     response::CompletionChoice,
+     scheduler::{Scheduler, SchedulerOutput},
+     search::{self, rag::SearchPipeline},
+-    sequence::{SeqStepType, StopReason},
++    sequence::{SeqStepType, Sequence, StopReason},
+     tools, CompletionResponse, SchedulerConfig, DEBUG,
+ };
+ use interprocess::local_socket::{traits::Listener, ListenerOptions};
+@@ -221,6 +225,7 @@ impl Engine {
+         get_mut_arcmutex!(scheduler).set_prefix_caching_enabled(!no_prefix_cache);
+ 
+         let has_paged_attention = get_mut_arcmutex!(scheduler).kv_cache_manager().is_some();
++        let pipeline_device = get_mut_arcmutex!(pipeline).device();
+ 
+         Ok(Self {
+             tx,
+@@ -237,6 +242,7 @@ impl Engine {
+                 prefix_cache_n,
+                 no_prefix_cache,
+                 has_paged_attention,
++                &pipeline_device,
+             ))),
+             is_debug: DEBUG.load(Ordering::Relaxed),
+             disable_eos_stop,
+@@ -260,14 +266,36 @@ impl Engine {
+         }
+     }
+ 
++    /// The let-go sequences' recurrent slots, back to the hybrid cache before the next state is taken.
++    fn free_recurrent(&self, slots: Vec<usize>) {
++        if slots.is_empty() {
++            return;
++        }
++        let pipeline = get_mut_arcmutex!(self.pipeline);
++        if !pipeline.get_metadata().no_kv_cache && pipeline.cache().is_hybrid() {
++            let mut hybrid = pipeline.cache().hybrid();
++            for idx in slots {
++                hybrid.free_seq(idx);
++            }
++        }
++    }
++
+     pub async fn run(self: Arc<Self>) {
+         if self.throughput_logging_enabled {
+             self.logger.enable_logging();
+         }
++        crate::paged_attention::set_engine_waker(self.pending_notify.clone());
++        if let Some(manager) = get_mut_arcmutex!(self.scheduler).kv_cache_manager() {
++            crate::paged_attention::set_kv_manager(manager);
++        }
+ 
+         let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(SEED)));
+         let mut last_completion_ids: Vec<usize> = vec![];
+         'lp: loop {
++            // Every Metal encoder a step encodes is autoreleased on this thread, and a pool living as long as
++            // the engine would keep them all (~320 per token step). One pool per step.
++            #[cfg(feature = "metal")]
++            let _pool = AutoreleaseScope::push();
+             let should_terminate = || {
+                 matches!(
+                     ENGINE_INSTRUCTIONS
+@@ -310,13 +338,47 @@ impl Engine {
+                 break 'lp;
+             }
+ 
++            // Cull before scheduling: a gone client cannot hold the engine, and queued retries die before running.
++            {
++                let (cancelled, released) = {
++                    let mut scheduler = get_mut_arcmutex!(self.scheduler);
++                    (scheduler.cancel_disconnected(), scheduler.take_released_recurrent())
++                };
++                self.free_recurrent(released);
++                if cancelled > 0 {
++                    tracing::info!("canceled {cancelled} sequence(s): client disconnected");
++                }
++            }
++
++            // A memory-axis crossing parks here, at the token boundary, with the KV pool and every live sequence
++            // intact; the hook drains the GPU stream itself, so what is in flight never matters.
++            if crate::paged_attention::memory_crossing_pending() {
++                let dev = get_mut_arcmutex!(self.pipeline).device();
++                crate::paged_attention::run_memory_crossing(&dev);
++            }
++
+             let (waiting_len, running_len) = {
+                 let scheduler = get_mut_arcmutex!(self.scheduler);
+                 (scheduler.waiting_len(), scheduler.running_len())
+             };
++
++            // Nothing runs and the waiting wait for blocks the memory is still bringing in: the crossing that
++            // brings them wakes this loop, so it parks for that wake rather than spin the scheduler.
++            if running_len == 0
++                && waiting_len > 0
++                && crate::paged_attention::kv_blocks_pending()
++            {
++                let _ = tokio::time::timeout(
++                    std::time::Duration::from_millis(20),
++                    self.pending_notify.notified(),
++                )
++                .await;
++            }
++
+             let scheduler_idle = waiting_len == 0 && running_len == 0;
+ 
+             if scheduler_idle {
++                crate::live::set_phase(crate::live::Phase::Idle);
+                 if should_terminate() {
+                     self.replicate_request_to_daemons(&Request::Terminate);
+                     break 'lp;
+@@ -367,6 +429,7 @@ impl Engine {
+                     output: mut scheduled,
+                 } => {
+                     if !scheduled.completion.is_empty() {
++                        crate::live::set_phase(crate::live::Phase::Decode);
+                         let current_completion_ids: Vec<usize> =
+                             scheduled.completion.iter().map(|seq| *seq.id()).collect();
+                         let res = {
+@@ -382,7 +445,6 @@ impl Engine {
+                                 CacheInstruction::Out
+                             } else {
+                                 CacheInstruction::Reset {
+-                                    load_preallocated_cache: false,
+                                     reset_non_granular: false,
+                                 }
+                             };
+@@ -396,17 +458,17 @@ impl Engine {
+                                 "All sequences must either return raw logits, or not."
+                             );
+ 
+-                            pipeline
+-                                .step(
+-                                    &mut scheduled.completion,
+-                                    false,
+-                                    return_raw_logits,
+-                                    &mut *get_mut_arcmutex!(self.prefix_cacher),
+-                                    self.disable_eos_stop,
+-                                    rng.clone(),
+-                                    CacheBackendMetadata::DefaultInstructions { pre_op, post_op },
+-                                )
+-                                .await
++                            engine_step(
++                                &mut *pipeline,
++                                &mut scheduled.completion,
++                                false,
++                                return_raw_logits,
++                                &mut *get_mut_arcmutex!(self.prefix_cacher),
++                                self.disable_eos_stop,
++                                rng.clone(),
++                                CacheBackendMetadata::DefaultInstructions { pre_op, post_op },
++                            )
++                            .await
+                         };
+ 
+                         handle_pipeline_forward_error!(
+@@ -424,6 +486,7 @@ impl Engine {
+                     }
+ 
+                     if !scheduled.prompt.is_empty() {
++                        crate::live::set_phase(crate::live::Phase::Prefill);
+                         let prompt_exec_time = {
+                             let mut pipeline = get_mut_arcmutex!(self.pipeline);
+ 
+@@ -432,7 +495,6 @@ impl Engine {
+                                 CacheInstruction::Out
+                             } else {
+                                 CacheInstruction::Reset {
+-                                    load_preallocated_cache: false,
+                                     reset_non_granular: false,
+                                 }
+                             };
+@@ -452,22 +514,21 @@ impl Engine {
+                                 CacheInstruction::In
+                             } else {
+                                 CacheInstruction::Reset {
+-                                    load_preallocated_cache: true,
+                                     reset_non_granular: false,
+                                 }
+                             };
+ 
+-                            pipeline
+-                                .step(
+-                                    &mut scheduled.prompt,
+-                                    true,
+-                                    return_raw_logits,
+-                                    &mut *get_mut_arcmutex!(self.prefix_cacher),
+-                                    self.disable_eos_stop,
+-                                    rng.clone(),
+-                                    CacheBackendMetadata::DefaultInstructions { pre_op, post_op },
+-                                )
+-                                .await
++                            engine_step(
++                                &mut *pipeline,
++                                &mut scheduled.prompt,
++                                true,
++                                return_raw_logits,
++                                &mut *get_mut_arcmutex!(self.prefix_cacher),
++                                self.disable_eos_stop,
++                                rng.clone(),
++                                CacheBackendMetadata::DefaultInstructions { pre_op, post_op },
++                            )
++                            .await
+                         };
+ 
+                         let prompt_exec_time = handle_pipeline_forward_error!(
+@@ -486,6 +547,21 @@ impl Engine {
+                             .sum();
+                         self.logger.add_tokens_processed(total_processed_tokens);
+ 
++                        // The prompt boundary is the one rewind point a later partial match can restore.
++                        {
++                            let pipeline = get_mut_arcmutex!(self.pipeline);
++                            if !pipeline.get_metadata().no_kv_cache && pipeline.cache().is_hybrid() {
++                                let hybrid_cache = pipeline.cache().hybrid();
++                                for seq in scheduled.prompt.iter_mut() {
++                                    let Some(idx) = seq.recurrent_state_idx() else { continue };
++                                    match hybrid_cache.snapshot_recurrent_state(idx) {
++                                        Ok(snaps) => seq.recurrent_prompt_snapshot = Some((seq.prompt_tokens(), snaps)),
++                                        Err(e) => tracing::warn!("A request's state could not be saved: snapshotting recurrent state for sequence {}: {e}", seq.id()),
++                                    }
++                                }
++                            }
++                        }
++
+                         for seq in scheduled.prompt.iter_mut() {
+                             match seq.sequence_stepping_type() {
+                                 SeqStepType::OneShot => {
+@@ -538,8 +614,11 @@ impl Engine {
+                     }
+                 }
+                 SchedulerOutput::PagedAttention { mut output } => {
++                    // What the schedule let go of is freed before a step takes a state.
++                    self.free_recurrent(scheduler.take_released_recurrent());
+                     if !output.scheduled.is_empty() {
+                         let is_prompt = get_mut_arcmutex!(output.scheduled[0]).is_prompt();
++                        crate::live::set_phase(if is_prompt { crate::live::Phase::Prefill } else { crate::live::Phase::Decode });
+ 
+                         // Record prompt timing BEFORE step() so it's available if response is sent inside step()
+                         if is_prompt {
+@@ -564,11 +643,27 @@ impl Engine {
+                         let mut guards_mut =
+                             guards.iter_mut().map(|seq| &mut **seq).collect::<Vec<_>>();
+ 
+-                        let res = {
++                        let res = 'step: {
+                             let mut pipeline = get_mut_arcmutex!(self.pipeline);
++                            // Seated here, not at admission, before any restore into the state: a request waiting
++                            // in the queue holds no state.
++                            let seated = guards_mut.iter_mut().try_for_each(|seq| match seq.recurrent_state_idx() {
++                                None => seat_recurrent(&*pipeline, &self.prefix_cacher, &mut **seq),
++                                Some(_) => Ok(()),
++                            });
++                            if let Err(e) = seated {
++                                break 'step Err(e);
++                            }
+ 
+                             let block_size = scheduler.block_size().unwrap();
+ 
++                            // The ids of the sequences whose recurrent state the store installed; the ancestor pass
++                            // below must not touch them.
++                            let state_restored = if is_prompt {
++                                self.restore_from_store(&*pipeline, &*scheduler, &mut guards_mut, block_size)
++                            } else {
++                                Vec::new()
++                            };
+                             // For hybrid models under paged attention, restore recurrent state
+                             // from block-hash keyed prefix snapshots before prompt prefill.
+                             if is_prompt && pipeline.cache().is_hybrid() {
+@@ -581,13 +676,17 @@ impl Engine {
+                                     if cached_prefix_len == 0 {
+                                         continue;
+                                     }
++                                    // A store restore already installed its state.
++                                    if state_restored.contains(seq.id()) {
++                                        continue;
++                                    }
+ 
+                                     let mut fallback_to_full_prompt = false;
+ 
+                                     let slot_idx = match seq.recurrent_state_idx() {
+                                         Some(idx) => idx,
+                                         None => {
+-                                            tracing::warn!("Sequence {} has paged prefix hit but no recurrent_state_idx; recomputing full prompt.", seq.id());
++                                            tracing::warn!("A prompt was recomputed: sequence {} has a paged prefix hit but no recurrent state", seq.id());
+                                             fallback_to_full_prompt = true;
+                                             // Dummy value, unused in fallback path.
+                                             0usize
+@@ -612,12 +711,41 @@ impl Engine {
+                                             );
+                                             if block_hashes.len() < num_prefix_blocks {
+                                                 fallback_to_full_prompt = true;
+-                                            } else if let Some(snapshots) = prefix_cacher
+-                                                .get_paged_recurrent_prefix(
++                                            } else if let Some((depth, snapshots)) = prefix_cacher
++                                                .longest_paged_recurrent_ancestor(
+                                                     &block_hashes[..num_prefix_blocks],
+                                                 )
+                                             {
+-                                                if let Err(e) = hybrid_cache
++                                                // A state below the KV match is still a resume point: keep the
++                                                // blocks under it, re-encode the span above it.
++                                                let resume = depth * block_size;
++                                                let mut resumable = true;
++                                                if resume < cached_prefix_len {
++                                                    let seq_id = *seq.id();
++                                                    let num_tokens = seq.get_toks().len();
++                                                    let mut kv_mgr =
++                                                        get_mut_arcmutex!(kv_cache_manager);
++                                                    kv_mgr.trim_request_to_num_tokens(
++                                                        seq_id, resume,
++                                                    );
++                                                    resumable = kv_mgr
++                                                        .allocate_slots(seq_id, num_tokens, &[])
++                                                        .is_some();
++                                                    drop(kv_mgr);
++                                                    if resumable {
++                                                        seq.set_prefix_cache_len(resume);
++                                                        tracing::info!(
++                                                            "sequence {} resumes from stored state at {} of {} matched tokens; re-encoding {}",
++                                                            seq.id(),
++                                                            resume,
++                                                            cached_prefix_len,
++                                                            num_tokens - resume
++                                                        );
++                                                    }
++                                                }
++                                                if !resumable {
++                                                    fallback_to_full_prompt = true;
++                                                } else if let Err(e) = hybrid_cache
+                                                     .restore_recurrent_state(slot_idx, &snapshots)
+                                                 {
+                                                     tracing::warn!(
+@@ -627,10 +755,12 @@ impl Engine {
+                                                     fallback_to_full_prompt = true;
+                                                 }
+                                             } else {
+-                                                tracing::warn!(
+-                                                    "No recurrent prefix snapshot for sequence {} at cached prefix length {}; recomputing full prompt.",
+-                                                    seq.id(),
+-                                                    cached_prefix_len
++                                                // A KV prefix no state anchors: the store's
++                                                // reuse line says what is re-encoded.
++                                                tracing::debug!(
++                                                    "no recurrent snapshot at or below cached prefix of {} tokens for sequence {}; full prompt recomputed",
++                                                    cached_prefix_len,
++                                                    seq.id()
+                                                 );
+                                                 fallback_to_full_prompt = true;
+                                             }
+@@ -662,8 +792,26 @@ impl Engine {
+                                 guards_mut.retain(|seq| !seq.is_finished_paged_attn());
+                             }
+ 
+-                            if guards_mut.is_empty() {
++                            let mut split_err = None;
++                            let (split_time, deposits) = match guards_mut.as_mut_slice() {
++                                [seq] if is_prompt && !self.no_kv_cache && !seq.return_raw_logits => self
++                                    .prefill_chunks(&mut *pipeline, &*scheduler, seq, block_size)
++                                    .unwrap_or_else(|e| {
++                                        split_err = Some(e);
++                                        (Duration::ZERO, None)
++                                    }),
++                                _ => (Duration::ZERO, None),
++                            };
++
++                            if let Some(e) = split_err {
++                                Err(e)
++                            } else if guards_mut.is_empty() {
+                                 Ok(Duration::ZERO)
++                            } else if guards_mut.len() == 1
++                                && guards_mut[0].is_finished_paged_attn()
++                            {
++                                // Canceled between prefill chunks: no sampling step; the free sweep collects it.
++                                Ok(split_time)
+                             } else {
+                                 let metadata = PagedAttentionMeta {
+                                     block_size,
+@@ -679,17 +827,25 @@ impl Engine {
+                                     "All sequences must either return raw logits, or not."
+                                 );
+ 
+-                                pipeline
+-                                    .step(
+-                                        &mut guards_mut,
+-                                        is_prompt,
+-                                        return_raw_logits,
+-                                        &mut *get_mut_arcmutex!(self.prefix_cacher),
+-                                        self.disable_eos_stop,
+-                                        rng.clone(),
+-                                        CacheBackendMetadata::PagedAttention { metadata },
+-                                    )
+-                                    .await
++                                let res = engine_step(
++                                    &mut *pipeline,
++                                    &mut guards_mut,
++                                    is_prompt,
++                                    return_raw_logits,
++                                    &mut *get_mut_arcmutex!(self.prefix_cacher),
++                                    self.disable_eos_stop,
++                                    rng.clone(),
++                                    CacheBackendMetadata::PagedAttention { metadata },
++                                )
++                                .await
++                                    .map(|step_time| step_time + split_time);
++                                if let Some(deposits) = &deposits {
++                                    let emitted = pipeline.cache().hybrid().take_emits();
++                                    if res.is_ok() {
++                                        self.deliver(deposits, &*scheduler, &mut *pipeline, &mut *guards_mut[0], None, emitted);
++                                    }
++                                }
++                                res
+                             }
+                         };
+ 
+@@ -702,6 +858,13 @@ impl Engine {
+                             self.prefix_cacher
+                         );
+ 
++                        // A chunked prompt advanced `token_offset`; decode assumes absolute positions again.
++                        if is_prompt {
++                            for seq in guards_mut.iter_mut() {
++                                seq.set_token_offset(0);
++                            }
++                        }
++
+                         let total_processed_tokens: usize = guards_mut
+                             .iter()
+                             .map(|seq| {
+@@ -714,59 +877,61 @@ impl Engine {
+                             .sum();
+                         self.logger.add_tokens_processed(total_processed_tokens);
+ 
+-                        // Capture recurrent states at full-block boundaries so hybrid models can
+-                        // reuse recurrent prefix state when paged prefix caching hits.
++                        // Recurrent states captured at full-block boundaries for a paged prefix hit to reuse:
++                        // at the consumed count (the sampled token not), each deposit superseding the last.
+                         {
+                             let pipeline = get_mut_arcmutex!(self.pipeline);
+                             if pipeline.cache().is_hybrid() {
+                                 let block_size = scheduler.block_size().unwrap();
+                                 let hybrid_cache = pipeline.cache().hybrid();
+                                 let mut prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
+-
+-                                for seq in guards_mut.iter() {
+-                                    let seq_len = seq.get_toks().len();
+-                                    if seq_len == 0 || seq_len % block_size != 0 {
+-                                        continue;
+-                                    }
+-
+-                                    let Some(slot_idx) = seq.recurrent_state_idx() else {
+-                                        continue;
+-                                    };
+-
+-                                    let snapshots = match hybrid_cache
+-                                        .snapshot_recurrent_state(slot_idx)
+-                                    {
+-                                        Ok(snapshots) => snapshots,
+-                                        Err(e) => {
+-                                            tracing::warn!(
+-                                                    "Failed snapshotting recurrent state for sequence {}: {e}",
+-                                                    seq.id()
+-                                                );
++                                if prefix_cacher.paged_recurrent_caching_enabled() {
++                                    for seq in guards_mut.iter_mut() {
++                                        let Some(slot_idx) = seq.recurrent_state_idx() else {
++                                            continue;
++                                        };
++                                        let Some(consumed) =
++                                            hybrid_cache.recurrent_seqlen_offset(slot_idx)
++                                        else {
++                                            continue;
++                                        };
++                                        if consumed == 0 || consumed % block_size != 0 {
+                                             continue;
+                                         }
+-                                    };
+-                                    if snapshots.is_empty() {
+-                                        continue;
+-                                    }
+ 
+-                                    let num_blocks = seq_len / block_size;
+-                                    let block_hashes = compute_block_hashes(
+-                                        seq.get_toks(),
+-                                        block_size,
+-                                        seq.mm_features(),
+-                                        &[],
+-                                    );
+-                                    if block_hashes.len() < num_blocks {
+-                                        continue;
++                                        let num_blocks = consumed / block_size;
++                                        let block_hashes = compute_block_hashes(
++                                            seq.get_toks(),
++                                            block_size,
++                                            seq.mm_features(),
++                                            &[],
++                                        );
++                                        if block_hashes.len() < num_blocks {
++                                            continue;
++                                        }
++                                        let prev = seq
++                                            .paged_snapshot_blocks
++                                            .filter(|d| *d < num_blocks)
++                                            .map(|d| block_hashes[..d].to_vec());
++                                        if let Err(e) = prefix_cacher.add_paged_recurrent_prefix(
++                                            block_hashes[..num_blocks].to_vec(),
++                                            || hybrid_cache.snapshot_recurrent_state(slot_idx),
++                                            prev.as_deref(),
++                                        ) {
++                                            tracing::warn!(
++                                                "A request's state could not be saved: snapshotting recurrent state for sequence {}: {e}",
++                                                seq.id()
++                                            );
++                                            continue;
++                                        }
++                                        seq.paged_snapshot_blocks = Some(num_blocks);
+                                     }
+-                                    prefix_cacher.add_paged_recurrent_prefix(
+-                                        block_hashes[..num_blocks].to_vec(),
+-                                        snapshots,
+-                                    );
+                                 }
+                             }
+                         }
+ 
++                        self.deposit_finished(&*scheduler, &mut guards_mut);
++
+                         if self.is_debug {
+                             let ms_from_last_run = run_start.elapsed().as_secs_f64();
+                             let total_len = guards.len();
+@@ -814,20 +979,330 @@ impl Engine {
+                 }
+             }
+ 
+-            // Free recurrent state pool slots for finished sequences (hybrid models)
+-            {
+-                let pipeline = get_mut_arcmutex!(self.pipeline);
+-                if !pipeline.get_metadata().no_kv_cache && pipeline.cache().is_hybrid() {
+-                    let recurrent_indices = scheduler.get_finished_recurrent_indices();
+-                    if !recurrent_indices.is_empty() {
+-                        let mut hybrid_cache = pipeline.cache().hybrid();
+-                        for idx in recurrent_indices {
+-                            hybrid_cache.free_seq(idx);
++            scheduler.free_finished_sequence_groups();
++            self.free_recurrent(scheduler.take_released_recurrent());
++        }
++    }
++
++    /// Extends each prompt's RAM prefix hit from the durable store: the restored blocks fill the sequence's
++    /// allocated slots and the prefix pointer advances, so a stored conversation resumes across a restart; a
++    /// hybrid's state lands in its slot. The ids of the sequences whose state the store installed.
++    fn restore_from_store(
++        &self,
++        pipeline: &dyn Pipeline,
++        scheduler: &dyn Scheduler,
++        seqs: &mut [&mut Sequence],
++        block_size: usize,
++    ) -> Vec<usize> {
++        let store = get_mut_arcmutex!(self.prefix_cacher).paged_kv_store();
++        let (Some(store), Some(kv)) = (store, scheduler.kv_cache_manager()) else {
++            return Vec::new();
++        };
++        let is_hybrid = pipeline.cache().is_hybrid();
++        if let Some(engine) = pipeline.get_metadata().cache_engine.as_ref() {
++            let probe: Vec<u32> = (0..2 * block_size as u32).collect();
++            let hash_probe = compute_block_hashes(&probe, block_size, &[], &[]).last().map_or(0, |h| h.value());
++            store.bind(Arc::clone(engine.memory()), engine.layout(), hash_probe);
++        }
++        let mut restored = Vec::new();
++        for seq in seqs.iter_mut() {
++            let toks_len = seq.get_toks().len();
++            // The last token always re-prefills for logits, so a fully covered prefix has nothing to gain.
++            let d1 = seq.prefix_cache_len() / block_size;
++            if toks_len <= block_size || d1 * block_size >= toks_len - 1 {
++                continue;
++            }
++            // A hybrid restore must land its state in a slot.
++            let slot = seq.recurrent_state_idx();
++            if is_hybrid && slot.is_none() {
++                continue;
++            }
++            let hashes = block_hashes(seq, block_size);
++            let usable = ((toks_len - 1) / block_size).min(hashes.len());
++            // Past the full-block span so a matching tail record can fill the prompt's partial block too.
++            let dst: Vec<usize> = match get_mut_arcmutex!(kv).get_block_ids(*seq.id()) {
++                Some(ids) if ids.len() >= usable => ids[d1..].to_vec(),
++                _ => continue,
++            };
++            // The deepest RAM-side recurrent anchor, so the store can arbitrate its tail records against it (a
++            // hybrid tail below the RAM match may still be the deepest resume).
++            let ram_state_tokens = if is_hybrid {
++                get_mut_arcmutex!(self.prefix_cacher)
++                    .longest_paged_recurrent_ancestor(&hashes[..d1.min(hashes.len())])
++                    .map_or(0, |(depth, _)| depth * block_size)
++            } else {
++                0
++            };
++            let chain = chain(&hashes[..usable]);
++            let Some((tokens, state)) =
++                store.restore_extension(&chain, d1, &dst, is_hybrid, ram_state_tokens, seq.get_toks())
++            else {
++                continue;
++            };
++            let full = tokens / block_size;
++            // The store resumed below the RAM match: blocks above its floor are re-encoded, as for an ancestor.
++            if full < d1 && !rewind_blocks(&kv, seq, full * block_size) {
++                seq.set_prefix_cache_len(0);
++                continue;
++            }
++            get_mut_arcmutex!(kv).cache_blocks(*seq.id(), &hashes, full * block_size);
++            seq.set_prefix_cache_len(tokens);
++            // The restored state goes into the slot now, at any position; on failure the ancestor pass decides.
++            if let (true, Some(state)) = (is_hybrid, state) {
++                match pipeline.cache().hybrid().restore_recurrent_state(slot.unwrap_or_default(), &state) {
++                    Ok(()) => restored.push(*seq.id()),
++                    Err(e) => tracing::warn!("A request's state could not be restored: recurrent state not installed for sequence {}: {e}", seq.id()),
++                }
++            }
++        }
++        restored
++    }
++
++    /// One prompt forwarded in chunks under the plan's cuts (a bounded transient); on a hybrid with caching
++    /// on, each cut deposits the state a later match can land on. The chunks' time and the step's deposits.
++    fn prefill_chunks(
++        &self,
++        pipeline: &mut dyn Pipeline,
++        scheduler: &dyn Scheduler,
++        seq: &mut Sequence,
++        block_size: usize,
++    ) -> Result<(Duration, Option<Deposits>), candle_core::Error> {
++        let end = seq.get_toks().len();
++        let deposits = self.deposits(pipeline, seq, block_size);
++        // The plan's cuts past a computed watermark (the cached prefix until a chunk has run, the last chunk's
++        // end after it), block-aligned under a deposit slot; the state positions are emit points inside the
++        // chunks, where the recurrent layers write their state into objects taken before the chunk.
++        let computed = |seq: &Sequence| seq.token_offset().max(seq.prefix_cache_len());
++        let cuts_past = |computed: usize| {
++            let plan = prefill_chunk_ends(computed, end);
++            let mut cuts = match &deposits {
++                Some(_) => paged_deposit_cuts(computed, end, block_size, plan),
++                None => plan,
++            };
++            cuts.push(end);
++            cuts
++        };
++        let points = deposits.as_ref().map_or_else(Vec::new, Deposits::points);
++        let mut cuts = cuts_past(computed(seq));
++        let mut at = 0;
++        let mut split_time = Duration::ZERO;
++        loop {
++            // A crossing parks before every chunk, the last too, and re-cuts the remainder at the new width.
++            if crate::paged_attention::memory_crossing_pending() {
++                crate::paged_attention::run_memory_crossing(&pipeline.device());
++                cuts = cuts_past(computed(seq));
++                at = 0;
++            }
++            if at >= cuts.len() {
++                break;
++            }
++            let mut chunk_end = cuts[at];
++            at += 1;
++            // A departed client is otherwise unnoticed until the first decode step, this whole chunked pass
++            // being one engine iteration. The token view is cut to the watermark so only written blocks are cached.
++            if seq.responder().is_closed() {
++                let computed = seq.token_offset();
++                seq.reset_prefill_toks();
++                let prefix = seq.get_toks()[..computed].to_vec();
++                seq.set_prefill_toks(prefix);
++                seq.set_state(SequenceState::Done(StopReason::Canceled));
++                break;
++            }
++            // The chunk's emit points take their objects, at the chunk's own positions; one the pool refuses
++            // ends the chunk there instead, its state a cut's.
++            let computed = computed(seq);
++            if let Some(d) = &deposits {
++                let mut hybrid = pipeline.cache().hybrid();
++                let mut emits = Vec::new();
++                for &p in points.iter().filter(|p| **p > computed && **p < chunk_end) {
++                    match hybrid.take_state() {
++                        Ok(Some(state)) => emits.push((p - computed, state.at(p))),
++                        _ => {
++                            (chunk_end, at) = (p, at - 1);
++                            break;
+                         }
+                     }
+                 }
++                hybrid.set_emits(d.slot, emits);
+             }
+-            scheduler.free_finished_sequence_groups();
++            if chunk_end == end {
++                break;
++            }
++            let meta = PagedAttentionMeta {
++                block_size,
++                sliding_window: pipeline.get_metadata().sliding_window,
++                kv_cache_manager: scheduler.kv_cache_manager().unwrap(),
++            };
++            let forwarded = prefill_one_chunk(pipeline, seq, chunk_end, meta);
++            let emitted = deposits.as_ref().map_or_else(Vec::new, |_| pipeline.cache().hybrid().take_emits());
++            let t = forwarded?;
++            tracing::info!("prefill chunk to {chunk_end} of {end} tokens: {:.0} ms", t.as_secs_f64() * 1e3);
++            split_time += t;
++            if let Some(d) = &deposits {
++                self.deliver(d, scheduler, pipeline, seq, Some(chunk_end), emitted);
++            }
++        }
++        Ok((split_time, deposits))
++    }
++
++    /// Where a hybrid prompt's prefill deposits its states, none without a slot under paged recurrent caching:
++    /// the prompt record at the template-suffix boundary (the deepest point a re-rendered follow-up shares; only
++    /// a store reads it, so without one its block floor stands in) and the fork from a sequence the store holds.
++    fn deposits(&self, pipeline: &dyn Pipeline, seq: &mut Sequence, block_size: usize) -> Option<Deposits> {
++        let end = seq.get_toks().len();
++        let (slot, store) = {
++            let prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
++            let slot = (pipeline.cache().is_hybrid() && prefix_cacher.paged_recurrent_caching_enabled())
++                .then(|| seq.recurrent_state_idx())
++                .flatten()?;
++            (slot, prefix_cacher.paged_kv_store())
++        };
++        let boundary = seq.template_suffix_boundary;
++        let state_cut = store.as_ref().and(boundary).filter(|b| *b < end);
++        let floor = boundary.filter(|_| store.is_none()).map(|b| b - b % block_size);
++        let hashes = block_hashes(seq, block_size);
++        let computed = seq.token_offset().max(seq.prefix_cache_len());
++        let fork_cut = store
++            .as_ref()
++            .and_then(|store| {
++                let usable = ((end - 1) / block_size).min(hashes.len());
++                store.fork_depth(&chain(&hashes[..usable]), seq.get_toks())
++            })
++            .map(|d| d * block_size)
++            .filter(|c| *c > computed && *c < end);
++        // A resume at the boundary holds its state: kept as the prompt record, so the store keeps that record
++        // as this turn's instead of superseding it with the last turn's.
++        if let Some(b) = state_cut.filter(|b| *b == computed) {
++            match pipeline.cache().hybrid().snapshot_recurrent_state(slot) {
++                Ok(state) => seq.recurrent_prompt_snapshot = Some((b, state)),
++                Err(e) => tracing::warn!(target: "oscar::store", "A reply's boundary was not saved: {e}"),
++            }
++        }
++        Some(Deposits { slot, block_size, hashes, store, state_cut, fork_cut, floor })
++    }
++
++    /// Recurrent states to every consumer of their position: `emitted` the chunk's emit points' states, `own`
++    /// the chunk end's where a consumer wants it. The prompt record at the boundary, the block-keyed map at a
++    /// block-aligned position, the store's shared record at the fork.
++    fn deliver(
++        &self,
++        d: &Deposits,
++        scheduler: &dyn Scheduler,
++        pipeline: &mut dyn Pipeline,
++        seq: &mut Sequence,
++        own: Option<usize>,
++        emitted: Vec<(usize, RecurrentState)>,
++    ) {
++        let block_size = d.block_size;
++        let wanted = own.filter(|p| p % block_size == 0 || [d.state_cut, d.fork_cut].contains(&Some(*p)));
++        let own = wanted.and_then(|p| match pipeline.cache().hybrid().snapshot_recurrent_state(d.slot) {
++            Ok(state) => Some((p, state)),
++            Err(e) => {
++                tracing::warn!("A request's state could not be saved: snapshotting recurrent state for sequence {}: {e}", seq.id());
++                None
++            }
++        });
++        for (p, state) in emitted.into_iter().map(|(_, s)| (s.seqlen_offset(), s)).chain(own) {
++            let blocks = p / block_size;
++            if Some(p) == d.state_cut {
++                seq.recurrent_prompt_snapshot = Some((p, state.clone()));
++            }
++            // Only a block-aligned position enters the block-keyed map.
++            if p % block_size == 0 && d.hashes.len() >= blocks {
++                let deposited = get_mut_arcmutex!(self.prefix_cacher).add_paged_recurrent_prefix(
++                    d.hashes[..blocks].to_vec(),
++                    || Ok(state.clone()),
++                    None,
++                );
++                if let Err(e) = deposited {
++                    tracing::warn!("A request's state could not be saved: snapshotting recurrent state for sequence {}: {e}", seq.id());
++                }
++            }
++            // The fork's state, for every later prompt sharing this beginning.
++            if let (true, Some(store)) = (Some(p) == d.fork_cut, &d.store) {
++                let ids = scheduler
++                    .kv_cache_manager()
++                    .and_then(|kv| get_mut_arcmutex!(kv).get_block_ids(*seq.id()).map(<[usize]>::to_vec));
++                if let Some(ids) = ids.filter(|ids| ids.len() >= blocks) {
++                    let record = TailDeposit {
++                        parent: d.hashes[blocks - 1].value(),
++                        pos: blocks as u32,
++                        block_id: 0,
++                        tokens: Vec::new(),
++                        snapshots: Some(state.clone()),
++                    };
++                    store.note_shared(&sealed_blocks(&d.hashes, &ids, blocks), record);
++                }
++            }
++        }
++    }
++
++    /// A finished sequence's sealed blocks and boundary records into the durable store, copied out here,
++    /// after the response, since a later allocation may recycle these blocks; the write rides the store's thread.
++    fn deposit_finished(&self, scheduler: &dyn Scheduler, seqs: &mut [&mut Sequence]) {
++        let store = get_mut_arcmutex!(self.prefix_cacher).paged_kv_store();
++        let (Some(store), Some(kv)) = (store, scheduler.kv_cache_manager()) else {
++            return;
++        };
++        let block_size = scheduler.block_size().unwrap();
++        let pipeline = get_mut_arcmutex!(self.pipeline);
++        let is_hybrid = pipeline.cache().is_hybrid();
++        for seq in seqs.iter_mut() {
++            if !matches!(seq.getstate(), SequenceState::Done(_)) {
++                continue;
++            }
++            let hashes = block_hashes(seq, block_size);
++            if hashes.is_empty() {
++                continue;
++            }
++            // One block past the sealed span when allocated: the tip record's partial rows live there.
++            let ids: Vec<usize> = match get_mut_arcmutex!(kv).get_block_ids(*seq.id()) {
++                Some(ids) if ids.len() >= hashes.len() => ids[..(hashes.len() + 1).min(ids.len())].to_vec(),
++                _ => continue,
++            };
++            let blocks = sealed_blocks(&hashes, &ids, hashes.len());
++            // The boundary records: the conversation tip (the reply end) and, for hybrids, the template-suffix
++            // boundary a re-render that rewrites the reply still keeps. A hybrid record without state is skipped.
++            let prompt_rec = match seq.recurrent_prompt_snapshot.take() {
++                Some((off, s)) => Some((off, Some(s))),
++                None if is_hybrid => None,
++                None => Some((seq.prompt_tokens(), None)),
++            };
++            let tip_rec = if is_hybrid {
++                // The live state itself, at its consumed count: the sequence is done and nothing writes its
++                // slot before the record's copies complete.
++                let live = seq
++                    .recurrent_state_idx()
++                    .ok_or_else(|| candle_core::Error::Msg("sequence holds no recurrent slot".into()))
++                    .and_then(|idx| pipeline.cache().hybrid().live_recurrent_state(idx));
++                match live {
++                    Ok((consumed, state)) if consumed > 0 => Some((consumed, Some(state))),
++                    Ok(_) => None,
++                    Err(e) => {
++                        tracing::warn!(target: "oscar::store", "A reply's end was not saved: {e}");
++                        None
++                    }
++                }
++            } else {
++                Some((seq.get_toks().len().saturating_sub(1), None))
++            };
++            let tail = |(boundary, snaps): (usize, Option<RecurrentState>)| {
++                let floor = boundary - boundary % block_size;
++                let pos = floor / block_size;
++                let tokens: Vec<u32> = seq.get_toks()[floor..boundary].to_vec();
++                if boundary == 0 || (tokens.is_empty() && snaps.is_none()) || (!tokens.is_empty() && ids.len() <= pos) {
++                    return None;
++                }
++                Some(TailDeposit {
++                    parent: if pos == 0 { 0 } else { hashes[pos - 1].value() },
++                    pos: pos as u32,
++                    block_id: ids.get(pos).copied().unwrap_or(0),
++                    tokens,
++                    snapshots: snaps,
++                })
++            };
++            let tails: Vec<_> = [tip_rec, prompt_rec].into_iter().flatten().filter_map(tail).collect();
++            store.note_finished_sequence(&blocks, tails, seq.get_toks());
+         }
+     }
+ 
+@@ -875,3 +1350,253 @@ impl Engine {
+         }
+     }
+ }
++
++/// Where a hybrid prompt's prefill deposits the recurrent states it yields, and the keys they are filed under.
++struct Deposits {
++    slot: usize,
++    block_size: usize,
++    hashes: Vec<BlockHash>,
++    store: Option<Arc<dyn PagedKvStore>>,
++    /// The template-suffix boundary, the prompt record's position; only under a store.
++    state_cut: Option<usize>,
++    /// Where the prompt parts from a sequence the store holds.
++    fork_cut: Option<usize>,
++    /// The boundary's block floor, the prompt record's stand-in without a store.
++    floor: Option<usize>,
++}
++
++impl Deposits {
++    /// The state positions inside the prompt, in order, each once.
++    fn points(&self) -> Vec<usize> {
++        let mut points: Vec<usize> = [self.state_cut, self.fork_cut, self.floor].into_iter().flatten().collect();
++        points.sort_unstable();
++        points.dedup();
++        points
++    }
++}
++
++/// A sequence's chain of block hashes over its tokens.
++fn block_hashes(seq: &Sequence, block_size: usize) -> Vec<BlockHash> {
++    compute_block_hashes(seq.get_toks(), block_size, seq.mm_features(), &[])
++}
++
++/// The chain as the store is asked by.
++fn chain(hashes: &[BlockHash]) -> Vec<u64> {
++    hashes.iter().map(BlockHash::value).collect()
++}
++
++/// Keeps a sequence's blocks under `keep` tokens and takes fresh ones for the rest; false when the pool refuses.
++fn rewind_blocks(kv: &Arc<Mutex<KVCacheManager>>, seq: &Sequence, keep: usize) -> bool {
++    let mut kv = get_mut_arcmutex!(kv);
++    kv.trim_request_to_num_tokens(*seq.id(), keep);
++    kv.allocate_slots(*seq.id(), seq.get_toks().len(), &[]).is_some()
++}
++
++/// The first `n` blocks as the store names them: each by its chain hash, its parent's and its pool block.
++fn sealed_blocks(hashes: &[BlockHash], ids: &[usize], n: usize) -> Vec<SealedBlockMeta> {
++    (0..n)
++        .map(|i| SealedBlockMeta {
++            hash: hashes[i].value(),
++            parent: if i == 0 { 0 } else { hashes[i - 1].value() },
++            pos: i as u32,
++            block_id: ids[i],
++        })
++        .collect()
++}
++
++/// Forwards one prefill chunk without sampling, leaving the sequence ready to continue at `chunk_end`.
++fn prefill_one_chunk(
++    pipeline: &mut dyn Pipeline,
++    seq: &mut Sequence,
++    chunk_end: usize,
++    paged_attn: PagedAttentionMeta,
++) -> Result<Duration, candle_core::Error> {
++    let offset = seq.token_offset();
++    let remaining = seq.get_toks().to_vec();
++    let chunk_len = chunk_end - offset;
++    if chunk_len == 0 || chunk_len >= remaining.len() {
++        candle_core::bail!(
++            "prefill split: chunk_end {chunk_end} out of range (offset {offset}, {} remaining)",
++            remaining.len()
++        );
++    }
++    let (chunk, tail) = remaining.split_at(chunk_len);
++    let tail = tail.to_vec();
++    seq.set_prefill_toks(chunk.to_vec());
++    // A paged prefix hit leaves the offset at 0 and skips its cached tokens by `prefix_cache_len` instead.
++    let forwarded = seq.step_tokens();
++    crate::paged_attention::note_step_kind(&crate::paged_attention::StepKind {
++        prompt: true,
++        tokens: forwarded,
++        device: &pipeline.device(),
++        drop_state_indices: &|| {
++            if pipeline.cache().is_hybrid() {
++                pipeline.cache().hybrid().set_state_indices(None);
++            }
++        },
++    })?;
++    let result = (|| {
++        // The paged step installs the recurrent state indices itself; a chunk forward bypasses it,
++        // so a hybrid model's recurrent layers would write another request's slot without this.
++        pipeline.set_recurrent_state_indices(std::slice::from_ref(&seq));
++        let inputs = pipeline
++            .get_processor()
++            .inputs_processor()
++            .process_inputs(
++                pipeline.tokenizer(),
++                &mut [seq],
++                true,
++                pipeline.get_metadata().is_xlora,
++                &pipeline.device(),
++                pipeline.get_metadata().no_kv_cache,
++                None,
++                false,
++                pipeline.get_metadata().sliding_window,
++                pipeline.get_input_processor_config(),
++                Some(paged_attn),
++                pipeline.device_mapper(),
++            )
++            .map_err(candle_core::Error::msg)?
++            .inputs;
++        let start = Instant::now();
++        {
++            let _round = ROUND.get().map(|round| round.chunk());
++            pipeline.forward_inputs(inputs, false)?;
++        }
++        Ok(start.elapsed())
++    })();
++
++    match result {
++        Ok(exec) => {
++            crate::live::prompt_tokens(forwarded as u64);
++            // The suffix goes to the normal prompt step, continuing at `chunk_end` over the cache just filled.
++            seq.set_prefill_toks(tail);
++            seq.set_token_offset(chunk_end);
++            Ok(exec)
++        }
++        Err(e) => {
++            // Restore the token view; the caller surfaces the error (a half-advanced state cannot rewind).
++            let mut restore = seq.get_toks().to_vec();
++            restore.extend_from_slice(&tail);
++            if offset == 0 {
++                seq.reset_prefill_toks();
++            } else {
++                seq.set_prefill_toks(restore);
++            }
++            Err(e)
++        }
++    }
++}
++
++use std::sync::OnceLock;
++
++/// The interior chunk ends of one prefill: only a memory budget knows where to cut; none, a single forward.
++pub trait PrefillChunkPolicy: Send + Sync {
++    /// Interior ends in order; the final chunk is the caller's.
++    fn chunk_ends(&self, offset: usize, end: usize) -> Vec<usize>;
++}
++
++static POLICY: OnceLock<Arc<dyn PrefillChunkPolicy>> = OnceLock::new();
++
++/// First caller wins; intended for model-load time.
++pub fn set_prefill_chunk_policy(policy: Arc<dyn PrefillChunkPolicy>) {
++    let _ = POLICY.set(policy);
++}
++
++/// A step around the pipeline's own (the caller's decode strategy) and a guard across each chunk's forward.
++#[async_trait::async_trait]
++pub trait StepRound: Send + Sync {
++    #[allow(clippy::too_many_arguments)]
++    async fn step(
++        &self,
++        pipeline: &mut dyn Pipeline,
++        input_seqs: &mut [&mut crate::sequence::Sequence],
++        is_prompt: bool,
++        return_raw_logits: bool,
++        prefix_cacher: &mut PrefixCacheManagerV2,
++        disable_eos_stop: bool,
++        rng: Arc<std::sync::Mutex<Isaac64Rng>>,
++        backend_metadata: crate::CacheBackendMetadata,
++    ) -> Result<Duration, candle_core::Error>;
++    /// Held across one prefill chunk's forward.
++    fn chunk(&self) -> Box<dyn std::any::Any>;
++}
++
++static ROUND: OnceLock<Arc<dyn StepRound>> = OnceLock::new();
++
++/// First caller wins; intended for model-load time.
++pub fn set_step_round(round: Arc<dyn StepRound>) {
++    let _ = ROUND.set(round);
++}
++
++/// The engine's step: the installed round's, else the pipeline's own.
++#[allow(clippy::too_many_arguments)]
++/// The sequence's recurrent state from the state memory, where the model has one: a full memory releases retained
++/// snapshots first (a rung is a cache entry, a request is not); none left refuses.
++fn seat_recurrent(
++    pipeline: &dyn crate::pipeline::Pipeline,
++    prefix_cacher: &Arc<Mutex<crate::prefix_cacher::PrefixCacheManagerV2>>,
++    seq: &mut crate::sequence::Sequence,
++) -> Result<(), candle_core::Error> {
++    if pipeline.get_metadata().no_kv_cache || !pipeline.cache().is_hybrid() {
++        return Ok(());
++    }
++    let slot = loop {
++        let taken = pipeline.cache().hybrid().allocate_seq();
++        if taken.is_ok() || !get_mut_arcmutex!(prefix_cacher).release_paged_recurrent() {
++            break taken?;
++        }
++    };
++    seq.set_recurrent_state_idx(slot);
++    Ok(())
++}
++
++async fn engine_step(
++    pipeline: &mut dyn Pipeline,
++    input_seqs: &mut [&mut crate::sequence::Sequence],
++    is_prompt: bool,
++    return_raw_logits: bool,
++    prefix_cacher: &mut PrefixCacheManagerV2,
++    disable_eos_stop: bool,
++    rng: Arc<std::sync::Mutex<Isaac64Rng>>,
++    backend_metadata: crate::CacheBackendMetadata,
++) -> Result<Duration, candle_core::Error> {
++    match ROUND.get() {
++        Some(r) => r.step(pipeline, input_seqs, is_prompt, return_raw_logits, prefix_cacher, disable_eos_stop, rng, backend_metadata).await,
++        None => pipeline.step(input_seqs, is_prompt, return_raw_logits, prefix_cacher, disable_eos_stop, rng, backend_metadata).await,
++    }
++}
++
++/// The installed policy's ends; none without one.
++pub fn prefill_chunk_ends(offset: usize, end: usize) -> Vec<usize> {
++    POLICY.get().map_or_else(Vec::new, |policy| policy.chunk_ends(offset, end))
++}
++
++/// Deposit-bearing chunk ends for a paged hybrid prompt: the policy's cuts aligned down to block
++/// multiples, so each chunk's state sits where a later block-granular match can land.
++pub fn paged_deposit_cuts(offset: usize, end: usize, block_size: usize, cuts: Vec<usize>) -> Vec<usize> {
++    let mut cuts: Vec<usize> = cuts.iter().map(|c| c - c % block_size).filter(|c| *c > offset && *c < end).collect();
++    cuts.sort_unstable();
++    cuts.dedup();
++    cuts
++}
++
++/// An autorelease pool that drains when the scope ends, on every exit path.
++#[cfg(feature = "metal")]
++struct AutoreleaseScope(*mut std::ffi::c_void);
++
++#[cfg(feature = "metal")]
++impl AutoreleaseScope {
++    fn push() -> Self {
++        // SAFETY: push/pop pair on this thread in LIFO order; the scope is never sent across threads.
++        Self(unsafe { objc2::ffi::objc_autoreleasePoolPush() })
++    }
++}
++
++#[cfg(feature = "metal")]
++impl Drop for AutoreleaseScope {
++    fn drop(&mut self) {
++        // SAFETY: the token came from `push` on this thread.
++        unsafe { objc2::ffi::objc_autoreleasePoolPop(self.0) }
++    }
++}
+diff --git c/mistralrs-core/src/pipeline/speculative.rs w/mistralrs-core/src/pipeline/speculative.rs
+index 5dbf5569..4fafd086 100644
+--- c/mistralrs-core/src/pipeline/speculative.rs
++++ w/mistralrs-core/src/pipeline/speculative.rs
+@@ -14,7 +14,7 @@ use tokenizers::Tokenizer;
+ use crate::{
+     device_map::DeviceMapper,
+     get_mut_arcmutex,
+-    kv_cache::{CacheManager, HybridCacheManager, NormalCacheManager, RecurrentStateSnapshot},
++    kv_cache::{CacheManager, HybridCacheManager, NormalCacheManager, RecurrentState},
+     layers_masker::PastKvLenCache,
+     pipeline::sampling::{
+         finish_or_add_toks_to_seq, sample_sequence, sample_target_sequence_speculative,
+@@ -340,33 +340,22 @@ impl CacheManagerMixin for SpeculativePipeline {
+         seqs: &mut [&mut Sequence],
+         reset_non_granular: bool,
+         modify_draft_cache: bool,
+-        load_preallocated_cache: bool,
+     ) {
+         {
+             let draft = get_mut_arcmutex!(self.draft);
+             if matches!(draft.cache(), EitherCache::Hybrid(_)) {
+-                HybridCacheManager.set_none_cache(
+-                    &*draft,
+-                    seqs,
+-                    modify_draft_cache,
+-                    load_preallocated_cache,
+-                );
++                HybridCacheManager.set_none_cache(&*draft, seqs, modify_draft_cache);
+                 self.draft_recurrent_slots.lock().unwrap().clear();
+             } else {
+-                NormalCacheManager.set_none_cache(
+-                    &*draft,
+-                    seqs,
+-                    modify_draft_cache,
+-                    load_preallocated_cache,
+-                );
++                NormalCacheManager.set_none_cache(&*draft, seqs, modify_draft_cache);
+             }
+         }
+         {
+             let target = get_mut_arcmutex!(self.target);
+             if matches!(target.cache(), EitherCache::Hybrid(_)) {
+-                HybridCacheManager.set_none_cache(&*target, seqs, false, load_preallocated_cache);
++                HybridCacheManager.set_none_cache(&*target, seqs, false);
+             } else {
+-                NormalCacheManager.set_none_cache(&*target, seqs, false, load_preallocated_cache);
++                NormalCacheManager.set_none_cache(&*target, seqs, false);
+             }
+         }
+         if reset_non_granular {
+@@ -414,6 +403,10 @@ impl Pipeline for SpeculativePipeline {
+     ) -> Result<ForwardInputsResult> {
+         unreachable!()
+     }
++    fn supports_prefill_split(&self) -> bool {
++        // Prompt work is orchestrated inside `step`; there is no direct `forward_inputs` for the engine to call.
++        false
++    }
+     async fn sample_causal_gen(
+         &self,
+         _seqs: &mut [&mut Sequence],
+@@ -462,15 +455,9 @@ impl Pipeline for SpeculativePipeline {
+                 match pre_op {
+                     CacheInstruction::In => self.clone_in_cache(input_seqs),
+                     CacheInstruction::Nothing => (),
+-                    CacheInstruction::Reset {
+-                        reset_non_granular,
+-                        load_preallocated_cache,
+-                    } => self.set_none_cache(
+-                        input_seqs,
+-                        reset_non_granular,
+-                        true,
+-                        load_preallocated_cache,
+-                    ),
++                    CacheInstruction::Reset { reset_non_granular } => {
++                        self.set_none_cache(input_seqs, reset_non_granular, true)
++                    }
+                     _ => unreachable!("Unreachable PRE cache op."),
+                 }
+                 (None, Some(post_op))
+@@ -532,7 +519,7 @@ impl Pipeline for SpeculativePipeline {
+         };
+ 
+         // Snapshot draft recurrent state before draft token generation
+-        let draft_recurrent_snapshot: Option<Vec<RecurrentStateSnapshot>> = if draft_is_hybrid {
++        let draft_recurrent_snapshot: Option<RecurrentState> = if draft_is_hybrid {
+             let slot_idx = self
+                 .draft_recurrent_slots
+                 .lock()
+@@ -637,7 +624,7 @@ impl Pipeline for SpeculativePipeline {
+         };
+ 
+         // Snapshot target recurrent state before target forward
+-        let target_recurrent_snapshot: Option<Vec<RecurrentStateSnapshot>> = if target_is_hybrid {
++        let target_recurrent_snapshot: Option<RecurrentState> = if target_is_hybrid {
+             let slot_idx = seq.recurrent_state_idx().ok_or_else(|| {
+                 candle_core::Error::Msg(format!(
+                     "Hybrid target is missing recurrent slot for sequence {}",
+@@ -923,15 +910,9 @@ impl Pipeline for SpeculativePipeline {
+                     self.clone_out_cache(input_seqs);
+                 }
+                 CacheInstruction::Nothing => (),
+-                CacheInstruction::Reset {
+-                    reset_non_granular,
+-                    load_preallocated_cache,
+-                } => self.set_none_cache(
+-                    input_seqs,
+-                    reset_non_granular,
+-                    true,
+-                    load_preallocated_cache,
+-                ),
++                CacheInstruction::Reset { reset_non_granular } => {
++                    self.set_none_cache(input_seqs, reset_non_granular, true)
++                }
+                 _ => unreachable!("Unreachable pre cache op."),
+             }
+         }
+diff --git c/mistralrs-core/src/pipeline/amoe.rs w/mistralrs-core/src/pipeline/amoe.rs
+index 5728c6e0..8ac7449c 100644
+--- c/mistralrs-core/src/pipeline/amoe.rs
++++ w/mistralrs-core/src/pipeline/amoe.rs
+@@ -196,14 +196,8 @@ impl CacheManagerMixin for AnyMoePipeline {
+         seqs: &mut [&mut Sequence],
+         reset_non_granular: bool,
+         modify_draft_cache: bool,
+-        load_preallocated_cache: bool,
+     ) {
+-        get_mut_arcmutex!(self.target).set_none_cache(
+-            seqs,
+-            reset_non_granular,
+-            modify_draft_cache,
+-            load_preallocated_cache,
+-        )
++        get_mut_arcmutex!(self.target).set_none_cache(seqs, reset_non_granular, modify_draft_cache)
+     }
+ }
+ 
+@@ -460,7 +454,7 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
+                 let mut input_seqs = seqs.iter_mut().collect::<Vec<_>>();
+ 
+                 // Clear KV cache in prep for training
+-                target.set_none_cache(&mut input_seqs, true, true, false);
++                target.set_none_cache(&mut input_seqs, true, true);
+ 
+                 let inputs = inputs_processor.process_inputs(
+                     tokenizer.clone(),
+@@ -483,7 +477,7 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
+                 let _ = target.forward_inputs(inputs.unwrap().inputs, false)?;
+ 
+                 // Clear the KV cache
+-                target.set_none_cache(&mut input_seqs, true, true, false);
++                target.set_none_cache(&mut input_seqs, true, true);
+ 
+                 // === BACKWARD STEP ==
+                 #[allow(clippy::cast_possible_truncation)]
+@@ -592,7 +586,6 @@ fn new_dummy_seq(
+         SeqStepType::PromptAndDecode,
+         None,
+         None,
+-        None,
+         false,
+         eos_toks,
+     )
+diff --git c/mistralrs-core/src/pipeline/diffusion.rs w/mistralrs-core/src/pipeline/diffusion.rs
+index 79a70371..1c709464 100644
+--- c/mistralrs-core/src/pipeline/diffusion.rs
++++ w/mistralrs-core/src/pipeline/diffusion.rs
+@@ -288,7 +288,6 @@ impl CacheManagerMixin for DiffusionPipeline {
+         _seqs: &mut [&mut Sequence],
+         _reset_non_granular: bool,
+         _modify_draft_cache: bool,
+-        _load_preallocated_cache: bool,
+     ) {
+     }
+     fn cache(&self) -> &EitherCache {
+diff --git c/mistralrs-core/src/pipeline/embedding.rs w/mistralrs-core/src/pipeline/embedding.rs
+index 67d645b4..9b47a34e 100644
+--- c/mistralrs-core/src/pipeline/embedding.rs
++++ w/mistralrs-core/src/pipeline/embedding.rs
+@@ -710,7 +710,6 @@ impl CacheManagerMixin for EmbeddingPipeline {
+         _seqs: &mut [&mut Sequence],
+         _reset_non_granular: bool,
+         _modify_draft_cache: bool,
+-        _load_preallocated_cache: bool,
+     ) {
+     }
+     fn cache(&self) -> &EitherCache {
+diff --git c/mistralrs-core/src/pipeline/ggml.rs w/mistralrs-core/src/pipeline/ggml.rs
+index 4df2cad9..ba76b0c0 100644
+--- c/mistralrs-core/src/pipeline/ggml.rs
++++ w/mistralrs-core/src/pipeline/ggml.rs
+@@ -482,10 +482,8 @@ impl CacheManagerMixin for GGMLPipeline {
+         seqs: &mut [&mut Sequence],
+         reset_non_granular: bool,
+         modify_draft_cache: bool,
+-
+-        load_preallocated_cache: bool,
+     ) {
+-        FullCacheManager.set_none_cache(self, seqs, modify_draft_cache, load_preallocated_cache);
++        FullCacheManager.set_none_cache(self, seqs, modify_draft_cache);
+         if reset_non_granular {
+             self.reset_non_granular_state()
+         }
+diff --git c/mistralrs-core/src/pipeline/multimodal.rs w/mistralrs-core/src/pipeline/multimodal.rs
+index 9e3a5559..5b3234ee 100644
+--- c/mistralrs-core/src/pipeline/multimodal.rs
++++ w/mistralrs-core/src/pipeline/multimodal.rs
+@@ -1005,25 +1005,11 @@ impl CacheManagerMixin for MultimodalPipeline {
+         seqs: &mut [&mut Sequence],
+         reset_non_granular: bool,
+         modify_draft_cache: bool,
+-
+-        load_preallocated_cache: bool,
+     ) {
+         match self.model.cache() {
+-            EitherCache::Full(_) => {
+-                FullCacheManager.set_none_cache(self, seqs, modify_draft_cache, false)
+-            }
+-            EitherCache::Normal(_) => NormalCacheManager.set_none_cache(
+-                self,
+-                seqs,
+-                modify_draft_cache,
+-                load_preallocated_cache,
+-            ),
+-            EitherCache::Hybrid(_) => HybridCacheManager.set_none_cache(
+-                self,
+-                seqs,
+-                modify_draft_cache,
+-                load_preallocated_cache,
+-            ),
++            EitherCache::Full(_) => FullCacheManager.set_none_cache(self, seqs, modify_draft_cache),
++            EitherCache::Normal(_) => NormalCacheManager.set_none_cache(self, seqs, modify_draft_cache),
++            EitherCache::Hybrid(_) => HybridCacheManager.set_none_cache(self, seqs, modify_draft_cache),
+         }
+         // Always clear model-specific state (e.g. Voxtral audio_embeds_cache)
+         // for new prompts. set_none_cache is "Only called for prompt seqs",
+diff --git c/mistralrs-core/src/pipeline/normal.rs w/mistralrs-core/src/pipeline/normal.rs
+index e4d0b44f..ec9085dd 100644
+--- c/mistralrs-core/src/pipeline/normal.rs
++++ w/mistralrs-core/src/pipeline/normal.rs
+@@ -1096,24 +1096,11 @@ impl CacheManagerMixin for NormalPipeline {
+         seqs: &mut [&mut Sequence],
+         reset_non_granular: bool,
+         modify_draft_cache: bool,
+-        load_preallocated_cache: bool,
+     ) {
+         match self.model.cache() {
+-            EitherCache::Full(_) => {
+-                FullCacheManager.set_none_cache(self, seqs, modify_draft_cache, false)
+-            }
+-            EitherCache::Normal(_) => NormalCacheManager.set_none_cache(
+-                self,
+-                seqs,
+-                modify_draft_cache,
+-                load_preallocated_cache,
+-            ),
+-            EitherCache::Hybrid(_) => HybridCacheManager.set_none_cache(
+-                self,
+-                seqs,
+-                modify_draft_cache,
+-                load_preallocated_cache,
+-            ),
++            EitherCache::Full(_) => FullCacheManager.set_none_cache(self, seqs, modify_draft_cache),
++            EitherCache::Normal(_) => NormalCacheManager.set_none_cache(self, seqs, modify_draft_cache),
++            EitherCache::Hybrid(_) => HybridCacheManager.set_none_cache(self, seqs, modify_draft_cache),
+         }
+         if reset_non_granular {
+             self.reset_non_granular_state()
+diff --git c/mistralrs-core/src/pipeline/speech.rs w/mistralrs-core/src/pipeline/speech.rs
+index 400f69a7..9239056f 100644
+--- c/mistralrs-core/src/pipeline/speech.rs
++++ w/mistralrs-core/src/pipeline/speech.rs
+@@ -366,7 +366,6 @@ impl CacheManagerMixin for SpeechPipeline {
+         _seqs: &mut [&mut Sequence],
+         _reset_non_granular: bool,
+         _modify_draft_cache: bool,
+-        _load_preallocated_cache: bool,
+     ) {
+     }
+     fn cache(&self) -> &EitherCache {
+diff --git c/mistralrs-core/src/vision_models/gemma4/text.rs w/mistralrs-core/src/vision_models/gemma4/text.rs
+index 4fbe6a89..40c3e56b 100644
+--- c/mistralrs-core/src/vision_models/gemma4/text.rs
++++ w/mistralrs-core/src/vision_models/gemma4/text.rs
+@@ -955,7 +955,6 @@ struct Gemma4ModelConfigLike {
+     per_layer_num_kv_heads: Vec<usize>,
+     per_layer_k_head_dim: Vec<usize>,
+     per_layer_v_head_dim: Vec<usize>,
+-    per_layer_uses_own_kv_cache: Vec<bool>,
+ }
+ 
+ impl ModelConfigLike for Gemma4ModelConfigLike {
+@@ -1008,13 +1007,6 @@ impl ModelConfigLike for Gemma4ModelConfigLike {
+             .unwrap_or(self.base.v_head_dim)
+     }
+ 
+-    fn uses_own_kv_cache_for_layer(&self, layer_idx: usize) -> bool {
+-        self.per_layer_uses_own_kv_cache
+-            .get(layer_idx)
+-            .copied()
+-            .unwrap_or(true)
+-    }
+-
+     fn kv_cache_layout(&self) -> crate::paged_attention::KvCacheLayout {
+         self.base.kv_cache_layout
+     }
+@@ -1263,7 +1255,6 @@ impl TextModel {
+         let mut per_layer_num_kv_heads = Vec::with_capacity(cfg.num_hidden_layers);
+         let mut per_layer_k_head_dim = Vec::with_capacity(cfg.num_hidden_layers);
+         let mut per_layer_v_head_dim = Vec::with_capacity(cfg.num_hidden_layers);
+-        let mut per_layer_uses_own_kv_cache = Vec::with_capacity(cfg.num_hidden_layers);
+         let cache_types = (0..cfg.num_hidden_layers)
+             .map(|layer_idx| {
+                 let world_size = mapper.get_comm_for(layer_idx)?.world_size();
+@@ -1285,10 +1276,8 @@ impl TextModel {
+                 per_layer_v_head_dim.push(head_dim);
+ 
+                 if let Some(owner) = kv_shared_layer_index(cfg, layer_idx)? {
+-                    per_layer_uses_own_kv_cache.push(false);
+                     Ok(NormalCacheType::Shared { owner })
+                 } else if is_sliding {
+-                    per_layer_uses_own_kv_cache.push(true);
+                     if donor_layers.contains(&layer_idx) {
+                         // Donor for shared layers: full cache so consumers see
+                         // the entire sequence. SWA masking still applied via
+@@ -1302,7 +1291,6 @@ impl TextModel {
+                         })
+                     }
+                 } else {
+-                    per_layer_uses_own_kv_cache.push(true);
+                     Ok(NormalCacheType::Normal {
+                         max_seq_len: cfg.max_position_embeddings,
+                     })
+@@ -1327,7 +1315,6 @@ impl TextModel {
+                 per_layer_num_kv_heads,
+                 per_layer_k_head_dim,
+                 per_layer_v_head_dim,
+-                per_layer_uses_own_kv_cache,
+             });
+ 
+         Ok(Self {

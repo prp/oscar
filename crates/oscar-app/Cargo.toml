@@ -1,0 +1,12 @@
+[package]
+name = "oscar-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+# `cargo app`: the release runtime built and Oscar.app written around it.
+
+[dependencies]
+anyhow = { workspace = true }

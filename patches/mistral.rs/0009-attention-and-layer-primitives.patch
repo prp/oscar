@@ -1,0 +1,177 @@
+Subject: [mistral.rs] attention-and-layer-primitives
+
+  Shared layer primitives and the attention entry points the ports call.
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 1
+
+---
+diff --git c/mistralrs-core/src/layers.rs w/mistralrs-core/src/layers.rs
+index a1bd88e4..63c5f7fd 100644
+--- c/mistralrs-core/src/layers.rs
++++ w/mistralrs-core/src/layers.rs
+@@ -334,6 +334,9 @@ impl Module for F32RmsNorm {
+ pub struct QRmsNorm {
+     eps: f64,
+     weight: Tensor,
++    /// Lazy cast of `weight` to the input dtype; one slot suffices since the
++    /// residual-stream dtype is constant within a forward pass.
++    weight_alt: std::sync::Arc<std::sync::Mutex<Option<Tensor>>>,
+ }
+ 
+ impl QRmsNorm {
+@@ -342,11 +345,66 @@ impl QRmsNorm {
+         Ok(Self {
+             eps: eps as f64,
+             weight: scale,
++            weight_alt: std::sync::Arc::new(std::sync::Mutex::new(None)),
+         })
+     }
+ 
++    /// The weight in `dtype`, and in F32 for the fused kernels (the cast `weight_for` would otherwise make in
++    /// the first forward), both built on the host from a host `scale` and placed once on `device`.
++    pub fn new_with_dtype(
++        scale: QTensor,
++        eps: f32,
++        dtype: candle_core::DType,
++        device: &candle_core::Device,
++    ) -> Result<Self> {
++        let scale = scale.dequantize(&candle_core::Device::Cpu)?.to_dtype(dtype)?;
++        let alt = (dtype != candle_core::DType::F32)
++            .then(|| scale.to_dtype(candle_core::DType::F32)?.to_device_kept(device))
++            .transpose()?;
++        Ok(Self {
++            eps: eps as f64,
++            weight: scale.to_device_kept(device)?,
++            weight_alt: std::sync::Arc::new(std::sync::Mutex::new(alt)),
++        })
++    }
++
++    /// This norm on another device, its cast cache empty, so taking its weight never touches the live norm's.
++    pub fn to_device(&self, device: &candle_core::Device, dtype: candle_core::DType) -> Result<Self> {
++        Ok(Self {
++            eps: self.eps,
++            weight: self.weight.to_device(device)?.to_dtype(dtype)?,
++            weight_alt: std::sync::Arc::new(std::sync::Mutex::new(None)),
++        })
++    }
++
++    /// Pick (and lazily cache) a weight matching `dtype`; fused `rms_norm` requires `xs.dtype() == alpha.dtype()`.
++    fn weight_for(&self, dtype: candle_core::DType) -> Result<Tensor> {
++        if self.weight.dtype() == dtype {
++            return Ok(self.weight.clone());
++        }
++        let mut cache = self.weight_alt.lock().unwrap();
++        if let Some(ref t) = *cache {
++            if t.dtype() == dtype {
++                return Ok(t.clone());
++            }
++        }
++        let cast = self.weight.to_dtype(dtype)?;
++        *cache = Some(cast.clone());
++        Ok(cast)
++    }
++
+     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+-        candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32)
++        let weight = self.weight_for(x.dtype())?;
++        candle_nn::ops::rms_norm(&x.contiguous()?, &weight, self.eps as f32)
++    }
++
++    /// Public access to the dtype-matched weight (for fused Metal kernels).
++    pub fn weight_for_dtype(&self, dtype: candle_core::DType) -> Result<Tensor> {
++        self.weight_for(dtype)
++    }
++
++    pub fn eps_f32(&self) -> f32 {
++        self.eps as f32
+     }
+ }
+ 
+@@ -1264,7 +1322,7 @@ impl Qwen3VLRotaryEmbedding {
+             .map(|i| 1f32 / base.powf(i as f32 / head_dim as f32))
+             .collect();
+         let inv_freq_len = inv_freq.len();
+-        let inv_freq = Tensor::from_vec(inv_freq, (inv_freq_len,), device)?.to_dtype(DType::F32)?;
++        let inv_freq = Tensor::from_vec(inv_freq, (inv_freq_len,), &Device::Cpu)?.to_device_kept(device)?;
+ 
+         // Precompute interleave index tensors for H (dim=1, offset=1) and W (dim=2, offset=2)
+         // to avoid CPU->GPU sync from Tensor::from_vec on every decode step.
+@@ -1279,7 +1337,7 @@ impl Qwen3VLRotaryEmbedding {
+                 .collect();
+             if !indices.is_empty() {
+                 let num = indices.len();
+-                let idx_tensor = Tensor::from_vec(indices, (num,), device)?;
++                let idx_tensor = Tensor::from_vec(indices, (num,), &Device::Cpu)?.to_device_kept(device)?;
+                 interleave_indices.push((idx_tensor, dim_idx));
+             }
+         }
+@@ -1312,13 +1370,14 @@ impl Qwen3VLRotaryEmbedding {
+         let mut freqs_t = freqs.i(0)?.contiguous()?;
+         let (batch, seq_len, _) = freqs_t.dims3()?;
+ 
+-        // For H (dim=1) and W (dim=2), overwrite interleaved positions using precomputed indices
++        // broadcast_as + contiguous: one copy for `.repeat`'s `seq_len`; gather/scatter need a contiguous index.
+         for (idx_tensor, dim_idx) in &self.interleave_indices {
+             let freqs_dim = freqs.i(*dim_idx)?.contiguous()?;
+             let num_indices = idx_tensor.dim(0)?;
+             let idx_expanded = idx_tensor
+                 .reshape((1, 1, num_indices))?
+-                .repeat((batch, seq_len, 1))?;
++                .broadcast_as((batch, seq_len, num_indices))?
++                .contiguous()?;
+             let src_vals = freqs_dim.gather(&idx_expanded, D::Minus1)?;
+             freqs_t = freqs_t.scatter(&idx_expanded, &src_vals, D::Minus1)?;
+         }
+@@ -2181,6 +2240,7 @@ pub struct RotaryEmbedding {
+ }
+ 
+ impl RotaryEmbedding {
++    /// The cos and sin tables over the whole window, kept for the model's life: built on the host, placed once.
+     pub fn new(
+         base: f32,
+         head_dim: usize,
+@@ -2194,13 +2254,13 @@ impl RotaryEmbedding {
+             .map(|i| 1f32 / base.powf(i as f32 / head_dim as f32))
+             .collect();
+         let inv_freq_len = inv_freq.len();
+-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?;
+-        let t = Tensor::arange(0u32, max_position_embeddings as u32, device)?
++        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), &Device::Cpu)?;
++        let t = Tensor::arange(0u32, max_position_embeddings as u32, &Device::Cpu)?
+             .to_dtype(DType::F32)?
+             .reshape((max_position_embeddings, 1))?;
+         let freqs = t.matmul(&inv_freq)?;
+-        let sin = freqs.sin()?.to_dtype(dtype)?;
+-        let cos = freqs.cos()?.to_dtype(dtype)?;
++        let sin = freqs.sin()?.to_dtype(dtype)?.to_device_kept(device)?;
++        let cos = freqs.cos()?.to_dtype(dtype)?.to_device_kept(device)?;
+ 
+         Ok(Self {
+             cos,
+@@ -2221,24 +2281,7 @@ impl RotaryEmbedding {
+         is_gpt_neox: bool,
+         dtype: DType,
+     ) -> Result<Self> {
+-        let inv_freq: Vec<_> = (0..rot_dim)
+-            .step_by(2)
+-            .map(|i| 1f32 / base.powf(i as f32 / rot_dim as f32))
+-            .collect();
+-        let inv_freq_len = inv_freq.len();
+-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), device)?;
+-        let t = Tensor::arange(0u32, max_position_embeddings as u32, device)?
+-            .to_dtype(DType::F32)?
+-            .reshape((max_position_embeddings, 1))?;
+-        let freqs = t.matmul(&inv_freq)?;
+-        let sin = freqs.sin()?.to_dtype(dtype)?;
+-        let cos = freqs.cos()?.to_dtype(dtype)?;
+-
+-        Ok(Self {
+-            cos,
+-            sin,
+-            is_gpt_neox,
+-        })
++        Self::new(base, rot_dim, max_position_embeddings, device, is_gpt_neox, dtype)
+     }
+ 
+     pub fn forward(

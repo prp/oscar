@@ -1,0 +1,93 @@
+Subject: [mistral.rs] a-request-seeds-its-own-sampling
+
+  An OpenAI `seed` on a request seeds a sampler RNG of the sequence's own, so the same request draws the same tokens and a served reply can be banked byte for byte; unseeded, a sequence draws from the engine's shared RNG as before
+  `SamplingParams` carries the field, so every literal of it names it — here, the crates oscar does not build, so the workspace stays whole.
+
+Applies to: 962112d18ea5729fe7acaae5085ce54c2fb66dab
+Files: 5
+
+---
+diff --git c/mistralrs-bench/src/main.rs w/mistralrs-bench/src/main.rs
+index 8d67f149..d7c549c0 100644
+--- c/mistralrs-bench/src/main.rs
++++ w/mistralrs-bench/src/main.rs
+@@ -67,6 +67,7 @@ async fn run_bench(
+         logits_bias: None,
+         n_choices: 1,
+         dry_params: Some(DrySamplingParams::default()),
++        seed: None,
+     };
+     let sender = mistralrs.get_sender(None).unwrap();
+     let (tx, mut rx) = channel(10_000);
+diff --git c/mistralrs-cli/src/commands/bench.rs w/mistralrs-cli/src/commands/bench.rs
+index 51b8886b..2ef35ac3 100644
+--- c/mistralrs-cli/src/commands/bench.rs
++++ w/mistralrs-cli/src/commands/bench.rs
+@@ -207,6 +207,7 @@ async fn run_single_bench(
+         logits_bias: None,
+         n_choices: 1,
+         dry_params: Some(DrySamplingParams::default()),
++        seed: None,
+     };
+ 
+     let sender = mistralrs.get_sender(None).unwrap();
+diff --git c/mistralrs-cli/src/commands/run/interactive.rs w/mistralrs-cli/src/commands/run/interactive.rs
+index 3e0f6243..d44cd72d 100644
+--- c/mistralrs-cli/src/commands/run/interactive.rs
++++ w/mistralrs-cli/src/commands/run/interactive.rs
+@@ -473,6 +473,7 @@ fn interactive_fallback_sample_parameters() -> SamplingParams {
+         logits_bias: None,
+         n_choices: 1,
+         dry_params: Some(DrySamplingParams::default()),
++        seed: None,
+     }
+ }
+ 
+diff --git c/mistralrs-pyo3/src/lib.rs w/mistralrs-pyo3/src/lib.rs
+index e5b217a3..30f929fc 100644
+--- c/mistralrs-pyo3/src/lib.rs
++++ w/mistralrs-pyo3/src/lib.rs
+@@ -1266,6 +1266,7 @@ impl Runner {
+                     n_choices: request.n_choices,
+                     min_p: request.min_p,
+                     dry_params,
++                    seed: None,
+                 },
+                 response: tx,
+                 return_logprobs: request.logprobs,
+@@ -1460,6 +1461,7 @@ impl Runner {
+                     n_choices: request.n_choices,
+                     min_p: request.min_p,
+                     dry_params,
++                    seed: None,
+                 },
+                 response: tx,
+                 return_logprobs: false,
+@@ -2040,6 +2042,7 @@ impl Runner {
+                     n_choices: request.n_choices,
+                     min_p: request.min_p,
+                     dry_params,
++                    seed: None,
+                 },
+                 response: tx,
+                 return_logprobs: request.logprobs,
+@@ -2143,6 +2146,7 @@ impl Runner {
+                     n_choices: request.n_choices,
+                     min_p: request.min_p,
+                     dry_params,
++                    seed: None,
+                 },
+                 response: tx,
+                 return_logprobs: false,
+diff --git c/mistralrs-server/src/interactive_mode.rs w/mistralrs-server/src/interactive_mode.rs
+index 07124750..299c4df3 100644
+--- c/mistralrs-server/src/interactive_mode.rs
++++ w/mistralrs-server/src/interactive_mode.rs
+@@ -170,6 +170,7 @@ fn interactive_sample_parameters() -> SamplingParams {
+         logits_bias: None,
+         n_choices: 1,
+         dry_params: Some(DrySamplingParams::default()),
++        seed: None,
+     }
+ }
+ 

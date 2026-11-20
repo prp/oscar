@@ -1,0 +1,126 @@
+Subject: [candle] deterministic-random-seed
+
+  A random draw is a function of its seed alone: the seed advances in a dispatch of its own behind the draw (stored from inside it, the next seed was read by the threads scheduled after the store), and a thread past the half writes nothing (the grid is rounded up to whole threadgroups, and those threads wrote the middle a second time).
+
+Applies to: 0.10.2
+Files: 2
+
+---
+diff --git c/candle-metal-kernels/src/metal_src/random.metal w/candle-metal-kernels/src/metal_src/random.metal
+index b94ba453..f02a53de 100644
+--- c/candle-metal-kernels/src/metal_src/random.metal
++++ w/candle-metal-kernels/src/metal_src/random.metal
+@@ -137,7 +137,9 @@ template<typename T> METAL_FUNC void rand_uniform(
+     device T *out,
+     uint tid [[thread_position_in_grid]]
+ ) {
+-    if (tid >= size) {
++    // Each thread writes an element and its mirror; the grid is rounded up to whole threadgroups, and a
++    // thread past the half would write the middle a second time.
++    if (tid >= (size + 1) / 2) {
+         return;
+     }
+ 
+@@ -147,12 +149,9 @@ template<typename T> METAL_FUNC void rand_uniform(
+     ulong s = atomic_load_seed(sb);
+     HybridTaus rng = HybridTaus::init({s, tid, 1, 1});
+     out[tid] = static_cast<T>(rng.rand() * diff + min);
+-    if (tid == 0) {
+-        atomic_store_seed(sb, rng.rand() * UNIF01_NORM32);
+-        // Return early if tid == 0 && off == 0, otherwise we will write to out[size].
+-        if (off == 0)
+-            return;
+-    }
++    // Thread 0 mirrors no element of an even vector: out[size] is past the end.
++    if (tid == 0 && off == 0)
++        return;
+     // Use symmetry to fill the other half of the array.
+     out[size - off - tid] = static_cast<T>(rng.rand() * diff + min);
+ }
+@@ -167,7 +166,9 @@ template<typename T> METAL_FUNC void normal(
+     device T *out,
+     uint tid [[thread_position_in_grid]]
+ ) {
+-    if (tid >= size) {
++    // Each thread writes an element and its mirror; the grid is rounded up to whole threadgroups, and a
++    // thread past the half would write the middle a second time.
++    if (tid >= (size + 1) / 2) {
+         return;
+     }
+     // Evenly sized vectors need an offset when writing the mirror element.
+@@ -185,16 +186,24 @@ template<typename T> METAL_FUNC void normal(
+ 
+     out[tid] = static_cast<T>(z0);
+ 
+-    if (tid == 0) {
+-        atomic_store_seed(sb, rng.rand() * UNIF01_NORM32);
+-        // Return early if tid == 0 && off == 0, otherwise we will write to out[size].
+-        if (off == 0)
+-            return;
+-    }
++    // Thread 0 mirrors no element of an even vector: out[size] is past the end.
++    if (tid == 0 && off == 0)
++        return;
+     // Use symmetry to fill the other half of the array.
+     out[size - off - tid] = static_cast<T>(z1);
+ }
+ 
++// The seed advances in a dispatch of its own, behind the draw's on the encoder. Stored from inside the draw, the
++// next seed was read by the draw's threads scheduled after the store, so a fixed seed drew a different vector each run.
++kernel void rand_next_seed(device seed_buffer *sb, uint tid [[thread_position_in_grid]]) {
++    if (tid != 0)
++        return;
++    HybridTaus rng = HybridTaus::init({atomic_load_seed(sb), 0, 1, 1});
++    rng.rand();
++    rng.rand();
++    atomic_store_seed(sb, rng.rand() * UNIF01_NORM32);
++}
++
+ #define UNIFORM_OP(NAME, T)                             \
+ kernel void rand_uniform_##NAME(                        \
+     constant size_t &size,                              \
+diff --git c/candle-metal-kernels/src/kernels/random.rs w/candle-metal-kernels/src/kernels/random.rs
+index 4d3a766d..4d7e75e5 100644
+--- c/candle-metal-kernels/src/kernels/random.rs
++++ w/candle-metal-kernels/src/kernels/random.rs
+@@ -1,7 +1,23 @@
+ use crate::linear_split;
+ use crate::utils::EncoderProvider;
+ use crate::{set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError, Source};
+-use objc2_metal::MTLResourceUsage;
++use objc2_metal::{MTLResourceUsage, MTLSize};
++
++/// The seed's advance is a dispatch behind the draw's on the same encoder, so
++/// every thread of the draw reads the seed it was dispatched with.
++fn advance_seed(
++    device: &Device,
++    kernels: &Kernels,
++    encoder: &ComputeCommandEncoder,
++    seed: &Buffer,
++) -> Result<(), MetalKernelError> {
++    let pipeline = kernels.load_pipeline(device, Source::Random, "rand_next_seed")?;
++    encoder.set_compute_pipeline_state(&pipeline);
++    set_params!(encoder, (seed));
++    let one = MTLSize { width: 1, height: 1, depth: 1 };
++    encoder.dispatch_thread_groups(one, one);
++    Ok(())
++}
+ 
+ #[allow(clippy::too_many_arguments)]
+ pub fn call_random_uniform(
+@@ -34,7 +50,7 @@ pub fn call_random_uniform(
+     encoder.use_resource(seed, MTLResourceUsage::Read | MTLResourceUsage::Write);
+     encoder.use_resource(buffer, MTLResourceUsage::Write);
+     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+-    Ok(())
++    advance_seed(device, kernels, encoder, seed)
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -63,5 +79,5 @@ pub fn call_random_normal(
+     encoder.use_resource(seed, MTLResourceUsage::Read | MTLResourceUsage::Write);
+     encoder.use_resource(buffer, MTLResourceUsage::Write);
+     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+-    Ok(())
++    advance_seed(device, kernels, encoder, seed)
+ }
