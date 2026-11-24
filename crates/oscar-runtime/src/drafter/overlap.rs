@@ -30,6 +30,12 @@ pub fn set_held(held: bool) {
 }
 
 static SHED_NOW: AtomicBool = AtomicBool::new(false);
+static POOL_MOVED: AtomicBool = AtomicBool::new(false);
+
+/// The pool's shape moved (its launch, a crossing's move): the controller's verdict was the old shape's.
+pub fn note_pool_moved() {
+    POOL_MOVED.store(true, Ordering::Relaxed);
+}
 
 /// The eval's fixed `(on, off)` boundary schedule in place of the verdicts; `None` outside the eval.
 fn pinned() -> Option<(u64, u64)> {
@@ -47,8 +53,10 @@ struct Control {
     shed: Shed,
     last_boundary: Option<std::time::Instant>,
     pinned_boundaries: u64,
-    /// The pool's count of demand accesses that found no resident expert, at the last boundary.
-    demand_seen: u64,
+    /// The drafted window's depths summed, at the last boundary.
+    depth_seen: u64,
+    /// Decode boundaries since the last prompt.
+    decoded: u32,
 }
 
 static CONTROL: std::sync::Mutex<Option<Control>> = std::sync::Mutex::new(None);
@@ -65,11 +73,12 @@ pub(super) fn boundary(decoding: bool, context: usize) {
         .map(|prev| now.duration_since(prev).as_secs_f64() * 1e3)
         .filter(|&ms| ms < 2_000.0);
     c.last_boundary = decoding.then_some(now);
-    // The experts this token asked for that were not resident, rescued by a prefetch or not: what a drafter can serve.
-    let counters = &crate::pool::COUNTERS;
-    let demand_seen =
-        [&counters.misses, &counters.waits, &counters.prefetch_saves].iter().map(|c| c.load(Ordering::Relaxed)).sum();
-    let demand = demand_seen - std::mem::replace(&mut c.demand_seen, demand_seen);
+    c.decoded = if decoding { c.decoded + 1 } else { 0 };
+    // A reply's first tokens run while the pool follows the prompt, as a block's do after a switch: not pace.
+    let pace = ms.filter(|_| c.decoded > Shed::SKIP);
+    // Whether this token began with a draft ahead of it.
+    let depth = super::DRAFT.depth_sum.load(Ordering::Relaxed);
+    let ahead = depth != std::mem::replace(&mut c.depth_seen, depth);
     let Some(drafter) = DRAFTER.get().filter(|_| decoding) else { return };
     let was = !SHED_NOW.load(Ordering::Relaxed);
     // Nothing to draft while sealed.
@@ -80,7 +89,10 @@ pub(super) fn boundary(decoding: bool, context: usize) {
         c.pinned_boundaries += 1;
         (c.pinned_boundaries - 1) % (on + off) < on
     } else {
-        if let Some((switched, said)) = c.shed.observe(ms, demand, context) {
+        if POOL_MOVED.swap(false, Ordering::Relaxed) {
+            c.shed.rearm();
+        }
+        if let Some((switched, said)) = c.shed.observe(pace, ahead, context) {
             if switched {
                 tracing::info!(target: "oscar::drafter", "{said}");
             } else {
@@ -105,9 +117,9 @@ pub(super) fn boundary(decoding: bool, context: usize) {
     }
 }
 
-/// Drafting only while it makes decode faster. A hold whose tokens asked for experts not resident keeps the drafter: it
-/// has those to prefetch. One that asked for none measures: a probe runs one block in the other state, judged against
-/// the hold's last tokens before it and a block in the current state after, so the text's own drift cancels.
+/// Drafting only while it makes decode faster. A drafter whose drafts are not ahead of decode is shed at once. At a
+/// hold's end a probe runs one block in the other state, judged against the hold's last tokens before it and a block
+/// in the current state after, so the text's own drift cancels.
 #[derive(Default)]
 struct Shed {
     shed: bool,
@@ -121,9 +133,9 @@ struct Shed {
     sum: f64,
     sumsq: f64,
     /// The hold's last measured tokens, four blocks' worth: their ms (the last block the probe's first reference,
-    /// the blocks' spread its noise) and the pool's demand a token.
+    /// the blocks' spread its noise), and whether each of the drafting hold's last tokens began with a draft ahead.
     recent: std::collections::VecDeque<f64>,
-    recent_demand: std::collections::VecDeque<u64>,
+    ahead: std::collections::VecDeque<bool>,
     /// The hold's spread block to block: a slow stretch is the hold's, not a state's time.
     block_sd: f64,
     current: Option<Block>,
@@ -132,10 +144,8 @@ struct Shed {
     diffs: Vec<(f64, f64)>,
     /// The next hold's tokens, doubled by each standing verdict.
     hold: u32,
-    /// The verdict holds while the context stays within a hold's tokens of where its probe began, and the demand a
-    /// token within half and twice the hold's own first reading of it.
+    /// The verdict holds while the context stays within a hold's tokens of where its probe began.
     verdict_context: usize,
-    verdict_demand: Option<f64>,
     probe_context: usize,
 }
 
@@ -185,40 +195,31 @@ impl Shed {
         self.shed == other
     }
 
-    /// One boundary's time (`None` for a request's first), the pool's demand this token and the context; a verdict,
-    /// whether it switched and its console line.
-    fn observe(&mut self, ms: Option<f64>, demand: u64, context: usize) -> Option<(bool, String)> {
+    /// One boundary's time (`None` for a request's first), whether its token began with a draft ahead and the
+    /// context; a verdict, whether it switched and its console line.
+    fn observe(&mut self, ms: Option<f64>, ahead: bool, context: usize) -> Option<(bool, String)> {
         if self.verdict_context > 0 && context.abs_diff(self.verdict_context) > self.hold as usize {
             self.rearm();
         }
         self.tokens += 1;
         if self.phase == ShedPhase::Hold {
+            self.probe_context = context;
+            if !self.shed {
+                // Behind for most of its last tokens, the drafter prefetches nothing in time: no probe is needed.
+                push(&mut self.ahead, ahead);
+                let behind = self.ahead.iter().filter(|a| !**a).count();
+                if behind > Self::RECENT / 2 {
+                    let why = format!("{behind} of the last {} tokens began with no draft ahead", self.ahead.len());
+                    return Some(self.settle(true, why));
+                }
+            }
             if let Some(ms) = ms {
                 push(&mut self.recent, ms);
-                push(&mut self.recent_demand, demand);
             }
-            if self.recent.len() < Self::RECENT {
-                return None;
-            }
-            let asked: u64 = self.recent_demand.iter().sum();
-            let seen = asked as f64 / self.recent_demand.len() as f64;
-            // The demand against the hold's first reading (the states' demands differ, and a crossing's wake inflates
-            // a hold's first tokens): doubled or halved, at least one expert a token, the regime has moved.
-            match self.verdict_demand {
-                None if self.verdict_context > 0 => self.verdict_demand = Some(seen),
-                Some(v) if !(0.5..2.0).contains(&((seen + 1.0) / (v + 1.0))) => self.rearm(),
-                _ => {}
-            }
-            if self.tokens < self.hold.max(Self::HOLD_FIRST) {
+            if self.recent.len() < Self::RECENT || self.tokens < self.hold.max(Self::HOLD_FIRST) {
                 return None;
             }
             let recent: Vec<f64> = self.recent.drain(..).collect();
-            self.recent_demand.clear();
-            self.probe_context = context;
-            if asked > 0 {
-                let why = format!("{asked} experts not resident asked over the last {} tokens", Self::RECENT);
-                return Some(self.settle(self.shed, why));
-            }
             let means: Vec<f64> =
                 recent.chunks(Self::MEASURED).map(|c| c.iter().sum::<f64>() / c.len() as f64).collect();
             let tail = &recent[Self::RECENT - Self::MEASURED..];
@@ -231,6 +232,17 @@ impl Shed {
         }
         if let Some(ms) = ms.filter(|_| self.tokens > Self::SKIP) {
             (self.measured, self.sum, self.sumsq) = (self.measured + 1, self.sum + ms, self.sumsq + ms * ms);
+        }
+        let rates = |off: f64, on: f64| format!("decode {:.1} tok/s without it, {:.1} with it", 1e3 / off, 1e3 / on);
+        // Half a block without the drafter already slower than the drafted tokens before it, by more than two standard
+        // errors: the drafter pays, and the rest of the probe would spend its gain.
+        if self.block % 2 == 1 && !self.shed && self.tokens == Self::SKIP + Self::MEASURED as u32 / 2 {
+            if let (Some(on), Some(off)) = (self.current, Block::of(self.measured, self.sum, self.sumsq)) {
+                let se = (off.se2() + on.se2()).sqrt().max(self.block_sd * 3f64.sqrt());
+                if off.mean - on.mean > 2.0 * se {
+                    return Some(self.settle(false, rates(off.mean, on.mean)));
+                }
+            }
         }
         if self.tokens < Self::BLOCK {
             return None;
@@ -254,18 +266,19 @@ impl Shed {
         if n < Self::PAIRS_MAX && !(n >= 1 && m.abs() > 3.0 * se) {
             return None;
         }
-        // Switch when the other state is faster by more than two standard errors, the measurement's own noise; `m` is
-        // the other state's excess over the current one's.
-        let switch = m + 2.0 * se < 0.0;
+        // The drafter must pay: it comes on, and stays on, only where decode is faster with it by more than two
+        // standard errors, the measurement's own noise; `m` is the other state's excess over the current one's.
+        let switch = if self.shed { m + 2.0 * se < 0.0 } else { m - 2.0 * se <= 0.0 };
         let cur = self.current.map_or(0.0, |b| b.mean);
         let (off, on) = if self.shed { (cur, cur + m) } else { (cur + m, cur) };
-        Some(self.settle(switch, format!("decode {:.1} tok/s without it, {:.1} with it", 1e3 / off, 1e3 / on)))
+        Some(self.settle(switch, rates(off, on)))
     }
 
     /// A verdict at the hold's end: the next hold, doubled by a standing one; its line names the state and the why.
     fn settle(&mut self, switch: bool, why: String) -> (bool, String) {
         self.hold = if switch || self.hold < Self::HOLD { Self::HOLD } else { (2 * self.hold).min(Self::HOLD_MAX) };
-        (self.verdict_context, self.verdict_demand) = (self.probe_context, None);
+        self.verdict_context = self.probe_context;
+        self.ahead.clear();
         (self.phase, self.tokens) = (ShedPhase::Hold, 0);
         super::DRAFT.verdicts.fetch_add(1, Ordering::Relaxed);
         super::DRAFT.switches.fetch_add(u64::from(switch), Ordering::Relaxed);
@@ -613,7 +626,7 @@ mod tests {
             x ^= x << 17;
             let wobble = noise * ((x >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0);
             let ms = if shed.drafting() { drafting_ms } else { shed_ms } + wobble + drift(i);
-            if shed.observe(Some(ms), 0, 1000).is_some_and(|(switched, _)| switched) {
+            if shed.observe(Some(ms), true, 1000).is_some_and(|(switched, _)| switched) {
                 turns.push(shed.shed);
             }
         }
@@ -655,95 +668,59 @@ mod tests {
         assert_eq!(holds, [2048, 4096, 8192, 16384, 32768, 32768, 32768]);
         shed.rearm();
         assert_eq!(shed.hold, Shed::HOLD_FIRST);
+        // Half a block without the drafter clearly slower ends the probe there: the drafter's gain is not spent on it.
+        let mut shed = Shed::default();
+        assert!(run(&mut shed, Shed::HOLD_FIRST + Shed::SKIP + Shed::MEASURED as u32 / 2, 30.0, 38.0, 1.0).is_empty());
+        assert_eq!((shed.phase, shed.hold, shed.drafting()), (ShedPhase::Hold, Shed::HOLD, true));
     }
 
-    /// The demand a token doubled or halved since the hold's own first reading re-arms it (a verdict from the counts
-    /// at once, the hold back at its first length); less keeps the hold; the first hold has no reading, and a hold's
-    /// first reading sets nothing off. Within the hold, a long reply and the next request probe nothing; a context
-    /// moved by more than the hold measures again.
+    /// Within the hold, a long reply and the next request probe nothing; a context moved by more than the hold
+    /// measures again.
     #[test]
-    fn a_demand_or_a_context_moved_past_the_hold_since_its_first_reading_measures_again() {
-        let feed = |shed: &mut Shed, demand: u64| {
-            (0..Shed::RECENT).for_each(|_| _ = shed.observe(Some(40.0), demand, 1000));
-        };
-        let after_a_verdict = || Shed { hold: 8 * Shed::HOLD, verdict_context: 1000, ..Default::default() };
-        for (demand, hold) in
-            [(100, 8 * Shed::HOLD), (150, 8 * Shed::HOLD), (60, 8 * Shed::HOLD), (250, Shed::HOLD), (40, Shed::HOLD)]
-        {
-            let mut shed = Shed { verdict_demand: Some(100.0), ..after_a_verdict() };
-            feed(&mut shed, demand);
-            assert_eq!(shed.hold, hold, "demand {demand} a token against a reading of 100");
-        }
-        // The hold's first full ring is its reading: a switch into a state with another demand re-arms nothing.
-        let mut shed = after_a_verdict();
-        feed(&mut shed, 300);
-        assert_eq!((shed.verdict_demand, shed.hold), (Some(300.0), 8 * Shed::HOLD));
-        feed(&mut shed, 700);
-        assert_eq!(shed.hold, Shed::HOLD);
-        // The first hold has no verdict to hold: no reading, no re-arm.
-        let mut shed = Shed { hold: 8 * Shed::HOLD, ..Default::default() };
-        feed(&mut shed, 300);
-        feed(&mut shed, 5);
-        assert_eq!((shed.verdict_demand, shed.hold), (None, 8 * Shed::HOLD));
-        // A reading of 0 (every expert resident): one expert a token is the least count, so 1 a token is a doubling.
-        let mut shed = Shed { verdict_demand: Some(0.0), ..after_a_verdict() };
-        feed(&mut shed, 1);
-        assert_eq!(shed.hold, Shed::HOLD);
-        // The context.
+    fn a_context_moved_past_the_hold_measures_again() {
         for (hold, near, far) in [(Shed::HOLD, 2_500, 3_100), (8 * Shed::HOLD, 12_000, 17_500)] {
             let mut shed = Shed { hold, verdict_context: 1000, ..Default::default() };
-            shed.observe(Some(40.0), 100, near);
+            shed.observe(Some(40.0), true, near);
             assert_eq!(shed.hold, hold, "a context within the hold of the verdict's keeps the hold");
-            shed.observe(Some(40.0), 100, far);
+            shed.observe(Some(40.0), true, far);
             assert_eq!(shed.hold, Shed::HOLD_FIRST);
         }
         let mut shed = Shed { hold: 8 * Shed::HOLD, verdict_context: 20_000, ..Default::default() };
-        shed.observe(Some(40.0), 100, 1_000);
+        shed.observe(Some(40.0), true, 1_000);
         assert_eq!(shed.hold, Shed::HOLD_FIRST, "a request far below the verdict's context measures again");
-        // A reply to an 817-token prompt: the verdict comes at 945, and the next request's 818 is within the hold.
+        // A reply to an 817-token prompt: the probe begins at 945, and the next request's 818 is within the hold.
         let mut shed = Shed::default();
         let mut context = 817;
-        for _ in 0..Shed::HOLD_FIRST {
+        for _ in 0..Shed::HOLD_FIRST + probe(Shed::PAIRS_MAX) {
             context += 1;
-            shed.observe(Some(40.0), 100, context);
+            shed.observe(Some(40.0), true, context);
         }
         assert_eq!((shed.phase, shed.verdict_context), (ShedPhase::Hold, 817 + Shed::HOLD_FIRST as usize));
-        shed.observe(Some(40.0), 100, 818);
+        shed.observe(Some(40.0), true, 818);
         assert_eq!(shed.hold, Shed::HOLD, "the next request keeps the hold");
     }
 
-    /// A hold whose tokens asked for experts not resident keeps the drafter at its end with no probe: the verdict
-    /// stands at once (a shed drafter comes back), the hold doubles as a standing verdict's does, and a moved demand
-    /// re-arms it to answer from the counts again. A hold that asked for none measures.
+    /// A drafter most of whose last tokens began with no draft ahead is shed with no probe, and probed a hold on as
+    /// any shed drafter is; one ahead for half its tokens stays for the probe.
     #[test]
-    fn a_hold_with_experts_to_prefetch_keeps_the_drafter_unmeasured() {
-        let feed = |shed: &mut Shed, n: u32, demand: u64| -> Vec<(bool, String)> {
-            (0..n).filter_map(|_| shed.observe(Some(40.0), demand, 1000)).collect()
+    fn a_drafter_whose_drafts_are_not_ahead_is_shed_unmeasured() {
+        let feed = |shed: &mut Shed, n: u32, ahead: bool| -> Vec<(bool, String)> {
+            (0..n).filter_map(|_| shed.observe(Some(40.0), ahead, 1000)).collect()
         };
-        let mut shed = Shed { shed: true, ..Default::default() };
-        let line = (true, "on - 12800 experts not resident asked over the last 128 tokens".to_string());
-        assert_eq!(feed(&mut shed, Shed::HOLD_FIRST, 100), [line], "shed by a measurement, back once there is work");
-        assert_eq!((shed.phase, shed.hold, shed.verdict_context), (ShedPhase::Hold, Shed::HOLD, 1000));
-        assert!(feed(&mut shed, Shed::HOLD - 1, 100).is_empty());
-        assert_eq!(feed(&mut shed, 1, 100).len(), 1);
-        assert_eq!((shed.hold, shed.diffs.len()), (2 * Shed::HOLD, 0), "a standing verdict doubles the hold");
-        assert!(feed(&mut shed, Shed::RECENT as u32, 100).is_empty(), "the hold's first reading");
-        assert_eq!(
-            feed(&mut shed, Shed::RECENT as u32, 40).len(),
-            1,
-            "the demand halved: answered from the counts again"
-        );
-        assert_eq!((shed.phase, shed.hold, shed.drafting()), (ShedPhase::Hold, Shed::HOLD, true));
         let mut shed = Shed::default();
-        assert!(feed(&mut shed, Shed::HOLD_FIRST - 1, 0).is_empty());
-        assert_eq!(feed(&mut shed, 1, 1).len(), 1, "one expert asked in the hold's tail is enough");
+        assert!(feed(&mut shed, Shed::RECENT as u32 / 2, false).is_empty());
+        let line = (true, "off - 65 of the last 65 tokens began with no draft ahead".to_string());
+        assert_eq!(feed(&mut shed, 1, false), [line]);
+        assert_eq!((shed.phase, shed.hold, shed.drafting()), (ShedPhase::Hold, Shed::HOLD, false));
+        assert!(feed(&mut shed, Shed::HOLD, false).is_empty());
+        assert_eq!((shed.phase, shed.drafting()), (ShedPhase::Probe, true), "shed, it is judged by the probe alone");
         let mut shed = Shed::default();
-        assert!(feed(&mut shed, Shed::HOLD_FIRST, 0).is_empty());
-        assert_eq!(shed.phase, ShedPhase::Probe, "nothing to prefetch: measured");
+        assert!((0..Shed::HOLD_FIRST - 1).all(|i| shed.observe(Some(40.0), i % 2 == 0, 1000).is_none()));
+        assert_eq!((shed.phase, shed.drafting()), (ShedPhase::Hold, true));
     }
 
     /// A slow stretch in the hold's tail is the hold's own spread, not the other state's gain, and a difference inside
-    /// the tokens' own spread is not decided at one pair; noise inside the margin changes nothing, and a request's
+    /// the tokens' own spread is not decided at one pair; a drafter not faster beyond the noise is shed, and a request's
     /// first boundary measures nothing; the text's drift, a ramp ten times the states' difference, cancels in a pair.
     #[test]
     fn a_pair_decides_nothing_under_the_holds_own_spread_noise_or_drift() {
@@ -757,17 +734,24 @@ mod tests {
         assert_eq!((shed.phase, shed.diffs.len()), (ShedPhase::Probe, 1), "one pair in, undecided");
         run(&mut shed, probe(Shed::PAIRS_MAX), 40.0, 39.5, 3.0);
         assert_eq!(shed.phase, ShedPhase::Hold, "decided by the cap");
+        // A drafter that does not pay beyond the noise is shed, and does not come back on the same evidence.
         let mut shed = Shed::default();
-        assert!(run(&mut shed, 4 * (Shed::HOLD + probe(Shed::PAIRS_MAX)), 40.0, 39.9, 6.0).is_empty());
-        assert!(shed.drafting());
+        assert_eq!(run(&mut shed, 4 * (Shed::HOLD + probe(Shed::PAIRS_MAX)), 40.0, 39.9, 6.0), [true]);
+        assert!(!shed.drafting());
         let mut shed = Shed::default();
-        let quiet = (0..Shed::HOLD_FIRST + probe(1)).all(|_| shed.observe(None, 100, 1000).is_none());
+        let quiet = (0..Shed::HOLD_FIRST + probe(1)).all(|_| shed.observe(None, true, 1000).is_none());
         assert_eq!((quiet, shed.phase, shed.diffs.len()), (true, ShedPhase::Hold, 0), "no boundary measured: no probe");
         let ramp = |i: u32| f64::from(i % 1024) * 0.03;
         let first = Shed::HOLD_FIRST + probe(Shed::PAIRS_MAX);
         let found = run_with(&mut Shed::default(), first, 40.0, 38.0, 1.0, ramp);
         assert_eq!(found, [true], "a 5% cost is found under the drift");
-        assert!(run_with(&mut Shed::default(), first, 40.0, 40.0, 1.0, ramp).is_empty(), "no difference is invented");
+        assert_eq!(
+            run_with(&mut Shed::default(), first, 40.0, 40.0, 1.0, ramp),
+            [true],
+            "no gain: the drafter is shed"
+        );
+        let mut off = Shed { shed: true, ..Default::default() };
+        assert!(run_with(&mut off, first, 40.0, 40.0, 1.0, ramp).is_empty(), "no difference is invented");
         // An idle of the live epoch retires its session and owes a snapshot; a cancelled session's retire nothing.
         for (r, inflight, grounding) in [
             (DraftResult::idle(7), 0, true),

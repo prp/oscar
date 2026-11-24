@@ -1,17 +1,22 @@
 //! One formatter, `HH:MM:SS [component]  message`; `WARN:` marks trouble that is no defect, `ERROR:` a code defect.
-//! The terminal has one writer, this module's thread, so a terminal that is not reading stops the writer alone.
+//! The terminal has one writer, this module's thread, so a terminal that is not reading stops the writer alone; the
+//! log of a model's run, `~/.oscar/oscar.log`, has another.
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
 struct Console;
 
@@ -22,6 +27,7 @@ fn component(target: &str) -> String {
     match target {
         t if t.starts_with("oscar::") => t["oscar::".len()..].replace('_', " "),
         t if t.starts_with("oscar_runtime::serve") => "serve".into(),
+        t if t.starts_with("oscar_runtime::chat") => "chat".into(),
         t if t.starts_with("oscar_runtime::kv_store") => "store".into(),
         t if t.starts_with("oscar_") => "runtime".into(),
         _ => "engine".into(),
@@ -107,7 +113,7 @@ where
     fn format_event(&self, ctx: &FmtContext<'_, S, N>, mut w: Writer<'_>, event: &Event<'_>) -> fmt::Result {
         let meta = event.metadata();
         write!(w, "{}", Head(&component(meta.target())))?;
-        let tint = tint(meta.level());
+        let tint = tint(meta.level()).filter(|_| w.has_ansi_escapes());
         if *meta.level() <= Level::WARN {
             write!(w, "{}{}: ", tint.unwrap_or(""), meta.level().as_str())?;
         }
@@ -118,23 +124,28 @@ where
 
 /// Below `-v` the runtime's lines and the engine's warnings, with `records` serve's records, without them no line
 /// of a memory change (a conversation shows it on the bar); `-v` all; `-vv` the memory-side trace lines too;
-/// `RUST_LOG` wins.
-pub fn install(verbose: u8, records: bool) {
+/// `RUST_LOG` wins. With `logged` the lines are kept for [`open_log`], serve's records where the terminal shows less.
+pub fn install(verbose: u8, records: bool, logged: bool) {
+    const RECORDS: &str = "warn,oscar=info,oscar_runtime=warn,oscar_runtime::serve=info,oscar_runtime::chat=info,\
+                           oscar_runtime::kv_store=info";
+    const CONVERSATION: &str = "warn,oscar=info,oscar_runtime=warn,oscar_runtime::kv_store=warn,\
+                                oscar::controller=warn,oscar::crossing=warn,oscar::experts=warn,oscar::kv_pool=warn";
     VERBOSE.store(verbose > 0, Ordering::Relaxed);
     if verbose > 1 {
         MEMORY_TRACE.store(true, Ordering::Relaxed);
     }
-    let default = if verbose > 0 {
+    let shown = if verbose > 0 {
         "info"
     } else if std::env::var("MISTRALRS_DEBUG").unwrap_or_default().contains('1') {
         "debug"
     } else if records {
-        "warn,oscar=info,oscar_runtime=warn,oscar_runtime::serve=info,oscar_runtime::kv_store=info"
+        RECORDS
     } else {
-        "warn,oscar=info,oscar_runtime=warn,oscar_runtime::kv_store=warn,\
-         oscar::controller=warn,oscar::crossing=warn,oscar::experts=warn,oscar::kv_pool=warn"
+        CONVERSATION
     };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    let kept = if shown == CONVERSATION { RECORDS } else { shown };
+    let filter = |default| EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    let logged = LOGGED.fetch_and(logged, Ordering::Relaxed) && logged;
     static WRITER: std::sync::Once = std::sync::Once::new();
     WRITER.call_once(|| {
         let spawned = std::thread::Builder::new()
@@ -142,11 +153,93 @@ pub fn install(verbose: u8, records: bool) {
             .spawn(|| TERMINAL.run(&mut std::io::stderr(), &mut std::io::stdout(), stderr_is_terminal()));
         RUNNING.store(spawned.is_ok(), Ordering::Release);
     });
-    let _ = tracing_subscriber::fmt()
-        .event_format(Console)
-        .with_env_filter(filter)
-        .with_writer(|| Line(Vec::new()))
-        .try_init();
+    let log = logged.then(|| layer(keep, false, filter(kept)));
+    let _ = tracing_subscriber::registry().with(layer(show, true, filter(shown))).with(log).try_init();
+}
+
+/// The lines `filter` lets through, formatted and handed `to` a writer.
+fn layer<S>(to: fn(Vec<u8>), tinted: bool, filter: EnvFilter) -> impl Layer<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let lines = tracing_subscriber::fmt::layer().event_format(Console).with_ansi(tinted);
+    lines.with_writer(move || Line(Vec::new(), to)).with_filter(filter)
+}
+
+/// The most one log file holds, and how many are kept: `oscar.log` the run's own, `oscar.log.1` to `.9` those before.
+const LOG_BYTES: u64 = 16 << 20;
+const LOGS: u32 = 10;
+
+/// Off for the eval, whose runs keep their own records, and wherever [`install`] was told so.
+static LOGGED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_logged(on: bool) {
+    LOGGED.store(on, Ordering::Relaxed);
+}
+
+static LOG: Terminal = Terminal::new("the disk was not writing");
+/// The log's descriptor once its writer runs, the same for the process's life.
+static LOG_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// A log file, appended to; a full one starts the next.
+pub struct Log {
+    path: PathBuf,
+    file: std::fs::File,
+    written: u64,
+}
+
+impl Log {
+    /// A run's own, empty: the ones before it move up a number and the oldest goes.
+    pub fn start(path: &Path) -> std::io::Result<Self> {
+        let numbered = |n| if n == 0 { path.to_path_buf() } else { path.with_extension(format!("log.{n}")) };
+        (0..LOGS - 1).rev().for_each(|n| drop(std::fs::rename(numbered(n), numbered(n + 1))));
+        Self::resume(path)
+    }
+
+    /// The current one, as it stands.
+    pub fn resume(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new().append(true).create(true).open(path)?;
+        Ok(Self { path: path.to_path_buf(), written: file.metadata()?.len(), file })
+    }
+}
+
+impl Write for Log {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.written + bytes.len() as u64 > LOG_BYTES {
+            let next = Self::start(&self.path)?;
+            // SAFETY: both descriptors are open files of this process; the next file takes this one's number, which
+            // [`urgent`] may hold.
+            if unsafe { libc::dup2(next.file.as_raw_fd(), self.file.as_raw_fd()) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            self.written = 0;
+        }
+        self.file.write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A model's run keeps its lines in `~/.oscar/oscar.log` from here on, those said before included.
+pub fn open_log() {
+    if !LOGGED.load(Ordering::Relaxed) {
+        return;
+    }
+    let path = super::settings::dir().join("oscar.log");
+    match std::fs::create_dir_all(super::settings::dir()).and_then(|_| Log::start(&path)) {
+        Ok(mut log) => {
+            let fd = log.file.as_raw_fd();
+            let spawned = std::thread::Builder::new()
+                .name("oscar-log".into())
+                .spawn(move || LOG.run(&mut log, &mut std::io::sink(), false));
+            LOG_FD.store(if spawned.is_ok() { fd } else { -1 }, Ordering::Release);
+        }
+        Err(e) => tracing::warn!(target: "oscar::loader", "No log is kept: {}: {e}", path.display()),
+    }
 }
 
 /// A paint of the status bar, run by the writer against stdout.
@@ -158,14 +251,15 @@ const HELD: usize = 1 << 20;
 /// The wait for the writer at the end: a reading terminal takes a full queue in milliseconds, an unread one never will.
 const ENDING: Duration = Duration::from_secs(1);
 
-static TERMINAL: Terminal = Terminal::new();
+static TERMINAL: Terminal = Terminal::new("the terminal was not reading");
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// What the writer has been handed.
+/// What a writer has been handed, and why it may fall behind.
 struct Terminal {
     queue: Mutex<Queue>,
     work: Condvar,
     idle: Condvar,
+    held_up: &'static str,
 }
 
 struct Queue {
@@ -184,7 +278,7 @@ struct Queue {
 }
 
 impl Terminal {
-    const fn new() -> Self {
+    const fn new(held_up: &'static str) -> Self {
         let queue = Queue {
             lines: VecDeque::new(),
             bytes: 0,
@@ -195,7 +289,7 @@ impl Terminal {
             prompt_due: false,
             busy: false,
         };
-        Self { queue: Mutex::new(queue), work: Condvar::new(), idle: Condvar::new() }
+        Self { queue: Mutex::new(queue), work: Condvar::new(), idle: Condvar::new(), held_up }
     }
 
     fn lock(&self) -> MutexGuard<'_, Queue> {
@@ -272,12 +366,9 @@ impl Terminal {
                 let _ = err.write_all(b"\r\x1b[2K");
             }
             if dropped > 0 {
-                let (on, off) = tint(&Level::WARN).map_or(("", ""), |t| (t, "\x1b[0m"));
-                let head = Head(&component("oscar_runtime"));
-                let _ = writeln!(
-                    err,
-                    "{head}{on}WARN: Log lines were dropped: {dropped} not shown, the terminal was not reading{off}"
-                );
+                let (on, off) = tint(&Level::WARN).filter(|_| clear).map_or(("", ""), |t| (t, "\x1b[0m"));
+                let (head, why) = (Head(&component("oscar_runtime")), self.held_up);
+                let _ = writeln!(err, "{head}{on}WARN: Log lines were dropped: {dropped} not shown, {why}{off}");
             }
             if let Some(line) = line {
                 let _ = err.write_all(&line);
@@ -295,8 +386,8 @@ impl Terminal {
     }
 }
 
-/// One record on its way to the writer, written whole and handed over on drop.
-struct Line(Vec<u8>);
+/// One record on its way to a writer, written whole and handed over on drop.
+struct Line(Vec<u8>, fn(Vec<u8>));
 
 impl Write for Line {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -311,7 +402,7 @@ impl Write for Line {
 
 impl Drop for Line {
     fn drop(&mut self) {
-        say(std::mem::take(&mut self.0));
+        (self.1)(std::mem::take(&mut self.0));
     }
 }
 
@@ -321,12 +412,25 @@ fn writer() -> Option<&'static Terminal> {
 }
 
 /// Hand the writer bytes for stderr; with no writer running, write them here.
-pub fn say(bytes: Vec<u8>) {
+fn show(bytes: Vec<u8>) {
     match writer() {
         _ if bytes.is_empty() => {}
         Some(w) => w.push(bytes),
         None => drop(std::io::stderr().write_all(&bytes)),
     }
+}
+
+/// Hand the log's writer bytes, where a log is kept.
+pub fn keep(bytes: Vec<u8>) {
+    if LOGGED.load(Ordering::Relaxed) && !bytes.is_empty() {
+        LOG.push(bytes);
+    }
+}
+
+/// Bytes for stderr and the log.
+pub fn say(bytes: Vec<u8>) {
+    keep(bytes.clone());
+    show(bytes);
 }
 
 /// Hand the writer the bar's next paint; with no writer running it runs here.
@@ -369,30 +473,37 @@ pub fn close(last: Paint) {
     }
 }
 
-/// Wait at most [`ENDING`] for the writer, so an ending process's last lines reach the terminal.
+/// Wait at most [`ENDING`] for each writer, so an ending process's last lines reach the terminal and the log.
 pub fn drain() {
     if let Some(w) = writer() {
         w.drain(ENDING);
     }
+    if LOG_FD.load(Ordering::Acquire) >= 0 {
+        LOG.drain(ENDING);
+    }
 }
 
-/// A line that cannot block, for a process about to end: built on the stack, written once with stderr non-blocking.
-/// `eprintln!` allocates and locks stderr, either of which a starved machine can block on for ever.
+/// A line that cannot block, for a process about to end: built on the stack, written once with stderr non-blocking,
+/// then once to the log. `eprintln!` allocates and locks stderr, either of which a starved machine can block on for
+/// ever.
 pub fn urgent(head: &str, error: bool, what: fmt::Arguments) {
-    let (on, off) = tint(&Level::ERROR).filter(|_| error).map_or(("", ""), |on| (on, "\x1b[0m"));
-    let mut buf = [0u8; 256];
-    let mut line = std::io::Cursor::new(&mut buf[..]);
-    let _ = writeln!(line, "{}{on}{}{what}{off}", Head(head), if error { "ERROR: " } else { "" });
-    let len = line.position() as usize;
-    // SAFETY: fcntl on this process's own descriptor 2 and one write of a buffer on this stack; nothing is read back.
-    unsafe {
-        let flags = libc::fcntl(2, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(2, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-        libc::write(2, buf.as_ptr().cast(), len);
-        if flags >= 0 {
-            libc::fcntl(2, libc::F_SETFL, flags);
+    let tinted = tint(&Level::ERROR).filter(|_| error).map_or(("", ""), |on| (on, "\x1b[0m"));
+    for (fd, (on, off)) in [(2, tinted), (LOG_FD.load(Ordering::Acquire), ("", ""))] {
+        let mut buf = [0u8; 256];
+        let mut line = std::io::Cursor::new(&mut buf[..]);
+        let _ = writeln!(line, "{}{on}{}{what}{off}", Head(head), if error { "ERROR: " } else { "" });
+        let len = line.position() as usize;
+        // SAFETY: fcntl on this process's own descriptor and one write of a buffer on this stack; nothing is read
+        // back, and a descriptor of -1 (no log) fails both.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            libc::write(fd, buf.as_ptr().cast(), len);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags);
+            }
         }
     }
 }
@@ -444,7 +555,7 @@ mod tests {
 
     /// A writer thread on its own terminal, its stderr stalled until the gate unless `reading`; what both received.
     fn writer(reading: bool, clear: bool) -> (&'static Terminal, Arc<Barrier>, impl Fn() -> String) {
-        let terminal: &'static Terminal = Box::leak(Box::new(Terminal::new()));
+        let terminal: &'static Terminal = Box::leak(Box::new(Terminal::new("the terminal was not reading")));
         let (gate, seen) = (Arc::new(Barrier::new(2)), Arc::new(Mutex::new(Vec::new())));
         let mut err = Stalled(gate.clone(), seen.clone(), reading);
         let mut out = Stalled(gate.clone(), seen.clone(), true);
@@ -502,5 +613,26 @@ mod tests {
         secs.into_iter()
             .zip(said)
             .for_each(|(s, said)| assert_eq!(mistralrs_core::live::duration_text(s), said, "{s}"));
+    }
+
+    /// Each run's log moves the ones before it up a number, the tenth going; a full file starts the next on the same
+    /// descriptor, and a resumed one is appended to.
+    #[test]
+    fn ten_logs_are_kept_and_none_grows_past_its_bound() {
+        let dir = crate::model_store::fixtures::TempDir::new("log");
+        let path = dir.0.join("oscar.log");
+        let read = |n: u32| std::fs::read_to_string(dir.0.join(format!("oscar.log.{n}"))).ok();
+        for run in 0..12 {
+            Log::start(&path).unwrap().write_all(format!("run {run}\n").as_bytes()).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "run 11\n");
+        assert_eq!((read(1).as_deref(), read(9).as_deref(), read(10)), (Some("run 10\n"), Some("run 2\n"), None));
+        let mut log = Log::resume(&path).unwrap();
+        let (fd, line) = (log.file.as_raw_fd(), [b'x'; 1 << 20]);
+        (0..17).for_each(|_| log.write_all(&line).unwrap());
+        assert_eq!((log.file.as_raw_fd(), log.written), (fd, 2 << 20));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 2 << 20);
+        assert_eq!(read(1).map(|s| s.len()), Some("run 11\n".len() + (15 << 20)));
+        assert_eq!((read(2).as_deref(), read(9).as_deref()), (Some("run 10\n"), Some("run 3\n")));
     }
 }

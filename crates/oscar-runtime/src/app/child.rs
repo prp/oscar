@@ -113,7 +113,7 @@ impl Child {
         lines("oscar-status", stdout, move |line| {
             *latest.lock().unwrap_or_else(|e| e.into_inner()) = line.and_then(|l| serde_json::from_str(&l).ok());
         })?;
-        let mut file = std::fs::OpenOptions::new().append(true).create(true).open(log)?;
+        let mut file = crate::cli::console::Log::resume(log)?;
         let trouble = Arc::new(Mutex::new(None));
         let port = Arc::new(Mutex::new(None));
         let (kept, bound) = (trouble.clone(), port.clone());
@@ -123,7 +123,7 @@ impl Child {
             if let Some(p) = ready_port(&line) {
                 *bound.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
             }
-            let _ = writeln!(file, "{line}");
+            let _ = file.write_all(format!("{line}\n").as_bytes());
         })?;
         Ok(Self { process, status, trouble, port })
     }

@@ -63,6 +63,8 @@ pub fn main(args: Vec<String>) -> Result<()> {
             _ => 0,
         },
         matches!(cmd, Cmd::Serve(_)),
+        // The app keeps its child's lines itself.
+        matches!(&cmd, Cmd::Chat(_)) || matches!(&cmd, Cmd::Serve(a) if !a.status_lines),
     );
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let ended = runtime.block_on(async {
@@ -76,7 +78,10 @@ pub fn main(args: Vec<String>) -> Result<()> {
             Cmd::Delete(args) => download::delete_main(args),
         }
     });
-    // The console's last lines are said before an error's own.
+    // The console's last lines are said before an error's own, which the log keeps too.
+    if let Err(e) = &ended {
+        crate::cli::console::keep(format!("Error: {e:?}\n").into_bytes());
+    }
     crate::cli::console::drain();
     ended
 }

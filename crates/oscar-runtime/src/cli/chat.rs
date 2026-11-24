@@ -20,7 +20,7 @@ struct Delta {
     usage: Option<Use>,
 }
 
-/// A reply's usage, for the session's line.
+/// A reply's usage, or a session's summed.
 struct Use {
     prompt: f64,
     cached: f64,
@@ -28,6 +28,20 @@ struct Use {
     prompt_s: f64,
     completion_s: f64,
     total_s: f64,
+}
+
+/// The prompt's and the completion's figures, as serve's record states each request's.
+impl std::fmt::Display for Use {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Use { prompt, cached, completion, .. } = self;
+        write!(
+            f,
+            "prompt {prompt} = {cached} cached + {} new @ {:.0} tok/s | completion {completion} @ {:.1} tok/s",
+            prompt - cached,
+            (prompt - cached) / self.prompt_s.max(1e-9),
+            completion / self.completion_s.max(1e-9),
+        )
+    }
 }
 
 type Failed = (String, bool);
@@ -275,7 +289,7 @@ pub async fn chat_main(args: ChatArgs) -> Result<()> {
 
         let mut thinking_since = Instant::now();
         let mut last_think = Instant::now();
-        let mut decoded = false;
+        let (mut decoded, mut used) = (false, false);
 
         const CLOCK: Duration = Duration::from_millis(200);
         // A failed reply ends its partial line, then says why: an error for a defect, a warning for a refused request.
@@ -341,6 +355,7 @@ pub async fn chat_main(args: ChatArgs) -> Result<()> {
                 }
                 if let Some(u) = d.usage {
                     usages.push(u);
+                    used = true;
                 }
                 if d.finish.is_some() {
                     finish_reason = d.finish;
@@ -378,14 +393,17 @@ pub async fn chat_main(args: ChatArgs) -> Result<()> {
             }
             print!("{PROMPT}\x1b[2m{note}\x1b[0m");
         }
-        // The turn's record at -v, the window serve prints per request.
-        if finish_reason.is_some() && decoded && args.common.verbose >= 1 {
-            if let Some(w) = built.as_ref().and_then(|b| b.dispatcher.pool().decode_window()) {
-                print!("\n\x1b[2m{w}\x1b[0m");
-            }
-        }
         println!();
         stdout.flush().ok();
+        // The reply's record over a model of our own, as serve's per request: in the log, on the terminal at -v.
+        if let (Some(b), Some(u), Some(finish), true) = (&built, usages.last(), &finish_reason, used) {
+            let duration = mistralrs_core::live::duration_text;
+            tracing::info!(target: "oscar_runtime::chat",
+                "reply        | {} | TTFT {} | {u} | {finish}", duration(u.total_s), duration(u.prompt_s));
+            if let Some(w) = b.dispatcher.pool().decode_window().filter(|_| decoded) {
+                tracing::info!(target: "oscar_runtime::chat", "{w}");
+            }
+        }
         history.push((TextMessageRole::Assistant, assistant_text, reasoning_text));
     }
 
@@ -394,16 +412,16 @@ pub async fn chat_main(args: ChatArgs) -> Result<()> {
     // The session's rates, its replies' figures summed as serve's record states each request's.
     if !usages.is_empty() {
         let sum = |f: fn(&Use) -> f64| usages.iter().map(f).sum::<f64>();
-        let (cached, prompt, completion) = (sum(|u| u.cached), sum(|u| u.prompt), sum(|u| u.completion));
-        tracing::info!(target: "oscar::chat",
-            "session - {} replies in {} | prompt {prompt} = {cached} cached + {} new @ {:.0} tok/s \
-             | completion {completion} @ {:.1} tok/s",
-            usages.len(),
-            mistralrs_core::live::duration_text(sum(|u| u.total_s)),
-            prompt - cached,
-            (prompt - cached) / sum(|u| u.prompt_s).max(1e-9),
-            completion / sum(|u| u.completion_s).max(1e-9),
-        );
+        let all = Use {
+            prompt: sum(|u| u.prompt),
+            cached: sum(|u| u.cached),
+            completion: sum(|u| u.completion),
+            prompt_s: sum(|u| u.prompt_s),
+            completion_s: sum(|u| u.completion_s),
+            total_s: sum(|u| u.total_s),
+        };
+        let total = mistralrs_core::live::duration_text(all.total_s);
+        tracing::info!(target: "oscar::chat", "session - {} replies in {total} | {all}", usages.len());
     }
 
     // Ctrl-D: persist the store's dirty tail so the next run can resume.

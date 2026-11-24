@@ -179,6 +179,7 @@ impl OffloadDispatcher {
     pub(super) fn note_pool_regime(&self) {
         let carriers = self.pool.carrier_count() > 0;
         PAGING_LIVE.store(carriers, Ordering::Relaxed);
+        crate::drafter::note_pool_moved();
         if carriers && crate::config::drafter_on() && self.launched() {
             self.arm_draft_window();
         }

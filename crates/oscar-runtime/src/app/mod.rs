@@ -554,10 +554,8 @@ pub fn main() -> anyhow::Result<()> {
     let mtm = MainThreadMarker::new().context("the app starts on the main thread")?;
     let dir = settings::dir();
     std::fs::create_dir_all(&dir)?;
-    // The last launch's log stays as oscar.log.1.
     let log = dir.join("oscar.log");
-    let _ = std::fs::rename(&log, dir.join("oscar.log.1"));
-    std::fs::write(&log, b"")?;
+    drop(crate::cli::console::Log::start(&log)?);
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     if setup::relocate(mtm)? {

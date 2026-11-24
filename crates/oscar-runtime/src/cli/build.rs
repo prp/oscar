@@ -23,6 +23,7 @@ pub struct BuiltModel {
 /// At serve's planned sequence or chat's; the status bar, entered before the load, counts it where there is a
 /// terminal, and says it on stdout under `status_lines`.
 pub async fn build_model(args: &ModelArgs, serve: bool, status_lines: bool) -> Result<BuiltModel> {
+    crate::cli::console::open_log();
     let bar = StatusBar::default();
     bar.watch_resizes();
     let guard = StatusBarGuard(bar.clone());

@@ -3614,14 +3614,14 @@ dependencies = [
 
 [[package]]
 name = "oscar-app"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "oscar-kernels"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -3634,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "oscar-models"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3649,7 +3649,7 @@ dependencies = [
 
 [[package]]
 name = "oscar-offload"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -3662,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "oscar-runtime"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",

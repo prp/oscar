@@ -59,7 +59,7 @@ pub fn register_round() {
     mistralrs_core::set_step_round(Arc::new(round::DraftRound));
 }
 
-pub use overlap::{drafting, in_session, quiesce, set_held};
+pub use overlap::{drafting, in_session, note_pool_moved, quiesce, set_held};
 
 /// Whether this batch takes the round; others take `Pipeline::step`.
 fn eligible(this: &mut dyn Pipeline, seqs: &mut [&mut Sequence], return_raw_logits: bool) -> bool {
